@@ -102,8 +102,10 @@ calibrant à la main. **Obligatoire pour faire fonctionner la VOIP.**
 Pour calibrer manuellement, vous devez prendre la 1ʳᵉ ligne du
 `r_displayinfo 1` comme l'image ci-dessous :
 
-![Zone OCR correcte](ocr_ok.png)
-![Zone OCR incorrecte](ocr_ko.png)
+![Zone OCR correcte](docs/ocr_ok.png)
+![Zone OCR incorrecte](docs/ocr_ko.png)
+
+Il faut prendre une zone vide sur la gauche pour anticiper les zones avec les noms longs, conseillé de prendre un peu plus que la longueur du solarsystem
 
 ### Touches radio et profil
 Dans les paramètres du client, définissez :
@@ -130,7 +132,7 @@ Le serveur expose deux services WebSocket distincts :
    │          │ ◀─▶│  │ Audio      :8889 │  │
    └──────────┘     │  └──────────────────┘  │
                     └────────────────────────┘
-   ┌──────────┐             ▲   ▲
+   ┌──────────┐             ▲    ▲
    │ Client B │ ◀───────────┘───┘
    └──────────┘
 ```

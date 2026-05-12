@@ -46,7 +46,7 @@ portée réglable. La position est lue par OCR sur le HUD du jeu.
 Communication longue distance par-dessus la proximité.
 L'admin du serveur crée des canaux (ex : « Combat », « Marchand »,
 « Général »), chaque joueur en choisit un, et la **touche radio (PTT)**
-émet vers tous les joueurs du même canal — peu importe la distance en
+émet vers tous les joueurs du même canal, peu importe la distance en
 jeu. Une touche dédiée permet aussi de **cycler entre les canaux**
 rapidement en plein combat.
 
@@ -63,7 +63,7 @@ choses :
 Quand activé, le filtre radio est appliqué sur la voip de proximité
 **uniquement si les deux joueurs portent leur casque dans Star
 Citizen**. Si l'un des deux porte un casque, le filtre radio est
-toujours là — il faut que vous et le joueur en face de vous ne portiez
+toujours là, il faut que vous et le joueur en face de vous ne portiez
 pas de casque pour enlever le filtre radio.
 La détection du casque se fait par OCR du HUD et lecture du gamelog.
 

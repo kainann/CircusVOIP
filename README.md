@@ -14,16 +14,33 @@ Lancez l'installeur, configurez votre micro, configurez la zone OCR,
 définissez les raccourcis radio et profil, connectez-vous au serveur de
 votre groupe et c'est parti.
 
-## Pour héberger un serveur
+## Pour le serveur
 
 Un groupe a besoin d'**un seul serveur**, hébergé soit :
 
-- **Sur le PC d'un joueur** (le plus simple) :
-  ➡️ **[Télécharger CircusVOIP_Server_Setup_v0.1.0.exe](../../releases/tag/server-v0.1.0)**
+### Sur le PC d'un joueur (le plus simple)
 
-- **Sur une machine dédiée** (VPS, PC secondaire, etc.) :
-  utiliser directement les sources Python du dossier [`server/`](./server/).
-  Voir [`server/README.md`](./server/README.md).
+➡️ **[Télécharger CircusVOIP_Server_Setup_v0.1.0.exe](../../releases/tag/server-v0.1.0)**
+
+Lancez l'installeur, le serveur démarre et génère un mot de passe
+automatiquement. Communiquez l'IP de la machine + le mot de passe aux
+joueurs.
+
+### Sur une machine dédiée (VPS, PC secondaire, etc.)
+
+Python 3.10+ recommandé. Cloner le repo et lancer les sources :
+
+```bash
+git clone https://github.com/kainann/CircusVOIP.git
+cd CircusVOIP/server
+pip install websockets
+python circusvoip_server.py       # serveur positions (port 8888)
+python circusvoip_audio_server.py # serveur audio (port 8889)
+```
+
+Le mot de passe d'accès est généré automatiquement au premier
+lancement dans `circusvoip_server_config.json`. Communiquez-le aux
+joueurs avec l'IP publique de la machine.
 
 ## Configuration requise
 

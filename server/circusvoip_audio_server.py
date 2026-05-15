@@ -42,6 +42,10 @@ except ImportError:
 
 from circusvoip_server_config import get_token
 
+# [SECURITE] Module commun (lockout, rate limiting, registre de tickets,
+# helper TLS). Doit etre present dans le meme dossier que ce fichier.
+from circusvoip_security import AuthLockout, RateLimiter, AuthRegistry
+
 # ---------------------------------------------
 #  Config
 # ---------------------------------------------
@@ -53,6 +57,22 @@ SERVER_TOKEN = get_token()  # meme token que serveur positions
 # attaquant ouvre des milliers de WS et sature la machine (broadcast O(N)).
 # 64 = large pour une communaute de 10-50, sans laisser la porte ouverte.
 MAX_AUDIO_CLIENTS = 64
+
+# [P2 - lockout brute-force] Le serveur audio n'avait AUCUNE protection
+# anti-bruteforce (contrairement au serveur positions). Une IP qui rate
+# le token 5 fois en 60s est maintenant bannie 600s.
+_auth_lockout = AuthLockout(max_failures=5, window_sec=60, ban_sec=600)
+
+# [P5 - rate limiting] Quota de trames audio par client authentifie.
+# L'audio tourne a ~50 trames/s en regime normal (20 ms/trame) : on
+# tolere 60/s en permanent et 120 de reserve pour absorber les a-coups.
+_audio_rate = RateLimiter(rate=60.0, burst=120.0)
+
+# [P4 - auth partagee] Registre de tickets partage avec le serveur
+# positions. Un client doit presenter un ticket emis par le serveur
+# positions pour etre accepte ici. Meme fichier des deux cotes.
+_AUTH_REGISTRY_FILE = Path(__file__).resolve().parent / "circusvoip_auth_tickets.json"
+_auth_registry = AuthRegistry(_AUTH_REGISTRY_FILE, ttl_sec=120.0)
 
 # Format audio utilise par les clients (pour info, pas enforced)
 # - 48000 Hz
@@ -100,6 +120,16 @@ async def handler(ws, ui):
         peer_ip = ws.remote_address[0] if ws.remote_address else "?"
     except Exception:
         peer_ip = "?"
+
+    # [P2 - lockout brute-force] Refus immediat si l'IP est bannie.
+    if _auth_lockout.is_banned(peer_ip):
+        ui.log(f"REFUSE audio : IP {peer_ip} bannie temporairement")
+        try:
+            await ws.close(code=1008, reason="banned")
+        except Exception:
+            pass
+        return
+
     try:
         async for msg in ws:
             # Les messages sont soit du JSON (controle), soit du binaire (audio)
@@ -114,6 +144,11 @@ async def handler(ws, ui):
                            f"(ip {peer_ip})")
                     await ws.close(code=1008, reason="not_authenticated")
                     return
+                # [P5 - rate limiting] Jette les trames excedentaires d'un
+                # client qui flood. On ne ferme pas la connexion : un pic
+                # ponctuel ne doit pas couper un joueur legitime.
+                if not _audio_rate.allow(ws):
+                    continue
                 # Trame audio : relayer a tous les autres clients
                 state.bytes_total  += len(msg)
                 state.frames_total += 1
@@ -139,8 +174,13 @@ async def handler(ws, ui):
                     # timing attack pour deduire le token caractere par
                     # caractere via mesure de latence reseau.
                     if not secrets.compare_digest(token, current_token):
+                        # [P2] Comptabilise l'echec : 5 echecs en 60s -> ban.
+                        banned_now = _auth_lockout.record_failure(peer_ip)
                         ui.log(f"REFUSE audio : token invalide "
                                f"(client: {data.get('name', '?')}, ip: {peer_ip})")
+                        if banned_now:
+                            ui.log(f"BAN audio : {peer_ip} pour 600s "
+                                   f"(5 echecs en 60s)")
                         try:
                             await ws.send(json.dumps({
                                 "type": "error",
@@ -150,6 +190,30 @@ async def handler(ws, ui):
                         except Exception:
                             pass
                         await ws.close(code=1008, reason="invalid_token")
+                        return
+
+                    # [P4 - auth partagee] Exiger un ticket emis par le
+                    # serveur positions. Empeche un client d'arriver sur
+                    # l'audio sans etre passe par le serveur principal.
+                    ticket = data.get("audio_ticket", "")
+                    ticket_name = _auth_registry.verify(ticket)
+                    if ticket_name is None:
+                        banned_now = _auth_lockout.record_failure(peer_ip)
+                        ui.log(f"REFUSE audio : ticket invalide ou expire "
+                               f"(client: {data.get('name', '?')}, ip: {peer_ip})")
+                        if banned_now:
+                            ui.log(f"BAN audio : {peer_ip} pour 600s "
+                                   f"(5 echecs en 60s)")
+                        try:
+                            await ws.send(json.dumps({
+                                "type": "error",
+                                "reason": "invalid_ticket",
+                                "message": "Ticket invalide - reconnecte-toi "
+                                           "au serveur principal d'abord"
+                            }))
+                        except Exception:
+                            pass
+                        await ws.close(code=1008, reason="invalid_ticket")
                         return
 
                     # [P3] Cap du nombre de clients audio. Une fois plein,
@@ -169,7 +233,13 @@ async def handler(ws, ui):
                         await ws.close(code=1013, reason="server_full")
                         return
 
-                    name = data.get("name", "Anonymous")
+                    # [P2] Auth reussie : reset le compteur d'echecs de l'IP.
+                    _auth_lockout.record_success(peer_ip)
+
+                    # [P4] Nom autoritaire : on utilise le nom lie au ticket
+                    # (emis par le serveur positions), pas celui que le
+                    # client annonce. Ferme l'usurpation de pseudo cote audio.
+                    name = ticket_name
                     state.clients[ws] = name
                     ui.log(f"JOIN audio : {name}  ({len(state.clients)} client(s))")
                     ui.refresh_clients()
@@ -182,6 +252,8 @@ async def handler(ws, ui):
     except Exception as e:
         ui.log(f"Erreur handler: {e}")
     finally:
+        # [P5] Libere le bucket de rate limiting de ce client.
+        _audio_rate.forget(ws)
         if ws in state.clients:
             n = state.clients.pop(ws)
             ui.log(f"LEAVE audio : {n}  ({len(state.clients)} client(s))")
@@ -218,10 +290,35 @@ async def _report_stats(ui):
 
 async def _serve(ui):
     state.running = True
+
+    # ─────────────────────────────────────────────
+    #  [P1 - TLS] Chiffrement de la connexion audio (auto)
+    # ─────────────────────────────────────────────
+    # Le serveur audio ecoute en wss:// (chiffre), avec le MEME certificat
+    # que le serveur positions (cert.pem / key.pem partages dans le meme
+    # dossier). Si circusvoip_server.py a deja demarre, le cert existe ;
+    # sinon ensure_self_signed_cert le cree.
+    #
+    # En cas d'echec de generation, le serveur audio REFUSE de demarrer
+    # plutot que d'accepter en clair (la VoIP serait alors lisible par
+    # quiconque ecoute le reseau).
+    from circusvoip_security import ensure_self_signed_cert, build_ssl_context
+    _base_dir = Path(__file__).resolve().parent
+    _cert_file = _base_dir / "cert.pem"
+    _key_file = _base_dir / "key.pem"
+    _ok, _detail = ensure_self_signed_cert(_cert_file, _key_file, common_name="circusvoip-audio")
+    if not _ok:
+        ui.log(f"[FATAL] Impossible de generer le certificat TLS. Detail : {_detail}")
+        state.running = False
+        return
+    _ssl_ctx = build_ssl_context(str(_cert_file), str(_key_file))
+    ui.log(f"TLS active : serveur audio en wss:// (cert {_detail})")
+
     async with websockets.serve(
         lambda ws: handler(ws, ui),
         "0.0.0.0",
         AUDIO_PORT,
+        ssl=_ssl_ctx,
         max_size=2 * 1024 * 1024   # trames audio pas enormes mais marge de securite
     ):
         ui.log(f"Serveur AUDIO demarre sur port {AUDIO_PORT}")

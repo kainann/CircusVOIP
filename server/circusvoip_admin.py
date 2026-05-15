@@ -123,9 +123,17 @@ def _ws_send_safe(payload: dict) -> bool:
 # ---------------------------------------------
 
 async def _ws_client(ui):
-    uri = f"ws://{state.server_ip}:{SERVER_PORT}"
+    # [P1 - TLS] Connexion CHIFFREE en wss://.
+    # Le serveur positions utilise un certificat auto-signe (genere
+    # automatiquement). build_client_ssl_context_insecure() construit un
+    # contexte SSL qui accepte ce cert sans verifier l'identite : connexion
+    # chiffree mais pas d'authentification stricte. L'admin s'authentifie
+    # ensuite via le token admin dans le message "auth_admin".
+    from circusvoip_security import build_client_ssl_context_insecure
+    uri = f"wss://{state.server_ip}:{SERVER_PORT}"
+    _ssl_ctx = build_client_ssl_context_insecure()
     try:
-        async with websockets.connect(uri) as ws:
+        async with websockets.connect(uri, ssl=_ssl_ctx) as ws:
             state.ws        = ws
             state.ws_loop   = asyncio.get_event_loop()
             state.connected = True

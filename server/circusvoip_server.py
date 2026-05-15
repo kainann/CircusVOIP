@@ -47,10 +47,18 @@ import websockets
 
 from circusvoip_server_config import get_token, set_password
 
+# [SECURITE] Module commun (lockout, rate limiting, registre de tickets,
+# helper TLS). Doit etre present dans le meme dossier que ce fichier.
+from circusvoip_security import AuthRegistry, RateLimiter
+
 # ─────────────────────────────────────────────
 #  Config
 # ─────────────────────────────────────────────
 
+# [P1 - TLS] HOST reste en 0.0.0.0 pour un usage LAN classique.
+# Si tu mets un reverse proxy (Caddy/nginx) devant pour le TLS, passe
+# cette valeur a "127.0.0.1" pour que SEUL le proxy local puisse parler
+# au serveur (voir le bloc TLS commente dans _server_main()).
 HOST = "0.0.0.0"
 PORT = 8888
 CLIENT_TIMEOUT = 30.0
@@ -72,6 +80,18 @@ _DEBUG_DIR      = _BASE_DIR / "circusvoip_debug"
 DEBUG_LOG_FILE  = _DEBUG_DIR / "circusvoip_server_debug.log"
 _debug_log_fp   = None
 _last_pos_time: dict = {}  # dernier timestamp par joueur (pour dt)
+
+# [P4 - auth partagee] Registre de tickets partage avec le serveur audio.
+# A chaque joueur authentifie, le serveur positions emet un ticket court
+# (TTL 120s) ecrit dans circusvoip_auth_tickets.json. Le serveur audio lit
+# ce fichier pour verifier qu'un client est bien passe par ici d'abord.
+_AUTH_REGISTRY_FILE = _BASE_DIR / "circusvoip_auth_tickets.json"
+_auth_registry = AuthRegistry(_AUTH_REGISTRY_FILE, ttl_sec=120.0)
+
+# [P5 - rate limiting] Quota de messages par client deja authentifie.
+# 50 messages/s en regime permanent, 100 de reserve pour les rafales.
+# Protege contre un membre malveillant qui flood pos/ping/etc.
+_msg_rate = RateLimiter(rate=50.0, burst=100.0)
 
 # Token admin (distinct du token joueur, pour qu'un joueur ne puisse pas
 # devenir admin avec son seul mdp). Stocke dans un fichier separe.
@@ -654,6 +674,17 @@ async def handler(ws):
 
             msg_type = data.get("type")
 
+            # [P5 - rate limiting] Pour les clients DEJA authentifies, on
+            # applique un quota de messages. Le tout premier message
+            # (join/auth_admin) n'est pas limite ici : il est deja couvert
+            # par le lockout brute-force par IP plus bas.
+            if ws in clients:
+                if not _msg_rate.allow(ws):
+                    # Quota depasse : on jette ce message. On ne FERME PAS
+                    # la connexion - un pic ponctuel ne doit pas kicker un
+                    # joueur legitime, juste ignorer le surplus.
+                    continue
+
             # Premier message : on distingue connexion admin vs joueur.
             if msg_type == "auth_admin":
                 token = data.get("token", "")
@@ -714,6 +745,13 @@ async def handler(ws):
                 _record_auth_success(peer_ip)
 
                 name = data.get("name", f"Player_{len(clients)+1}")
+
+                # [P4 - auth partagee] Genere un ticket court pour ce
+                # joueur. Le client le recevra dans le welcome et devra le
+                # presenter au serveur audio. Sans ce ticket, le serveur
+                # audio refusera la connexion.
+                audio_ticket = secrets.token_hex(16)
+
                 # Canal initial : celui demande par le client si valide, sinon None.
                 requested_ch = data.get("channel")
                 if requested_ch in _channels:
@@ -728,7 +766,10 @@ async def handler(ws):
                     "channel": initial_channel,
                     "assigned_profile": None,
                     "prox_short": False,
+                    "audio_ticket": audio_ticket,
                 }
+                # Enregistre le ticket dans le fichier partage avec l'audio.
+                _auth_registry.issue(name, audio_ticket)
                 _log(f"JOIN : {name}  ({len(clients)} connecté(s))", GREEN)
                 if _ui:
                     _ui.add_player(name)
@@ -754,6 +795,8 @@ async def handler(ws):
                     "profiles": list(_profiles),
                     "my_channel": initial_channel,
                     "my_profile": None,
+                    # [P4] Ticket a renvoyer au serveur audio lors du join audio.
+                    "audio_ticket": audio_ticket,
                 }))
                 # Annoncer aux autres l'arrivee du nouveau
                 await _broadcast(ws, json.dumps({
@@ -852,7 +895,15 @@ async def handler(ws):
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
+        # [P5] Libere le bucket de rate limiting (que le ws soit un joueur
+        # authentifie ou non - forget est sans effet si la cle est absente).
+        _msg_rate.forget(ws)
         if ws in clients:
+            # [P4] Revoque le ticket audio du joueur qui part, pour qu'il
+            # ne puisse plus etre utilise sur le serveur audio.
+            _leaving = clients.get(ws)
+            if _leaving and _leaving.get("audio_ticket"):
+                _auth_registry.revoke(_leaving["audio_ticket"])
             clients.pop(ws)
             _log(f"LEAVE : {name}  ({len(clients)} connecté(s))", ORANGE)
             if _ui:
@@ -889,7 +940,40 @@ async def _server_main():
     except Exception:
         pass
     cleanup_task = asyncio.create_task(_cleanup_loop())
-    async with websockets.serve(handler, HOST, PORT):
+
+    # ─────────────────────────────────────────────
+    #  [P1 - TLS] Chiffrement de la connexion (auto)
+    # ─────────────────────────────────────────────
+    # Le serveur ecoute en wss:// (chiffre). Au premier demarrage,
+    # ensure_self_signed_cert() genere automatiquement cert.pem et key.pem
+    # a cote du fichier server.py. Aux demarrages suivants, ces fichiers
+    # sont reutilises.
+    #
+    # Le certificat est auto-signe, donc les clients ne verifient pas
+    # l'identite du serveur (impossible sans CA publique). Mais la
+    # connexion est CHIFFREE : un attaquant qui ecoute le reseau ne peut
+    # plus lire le token ni les positions.
+    #
+    # En cas d'echec de generation (lib cryptography absente, disque
+    # plein, droits insuffisants), le serveur REFUSE de demarrer plutot
+    # que de tomber en clair (ws://) silencieusement.
+    #
+    # Pour utiliser un VRAI certificat valide CA (Let's Encrypt) :
+    # remplace cert.pem et key.pem par les tiens dans le dossier du
+    # serveur. Idealement avec un reverse proxy Caddy/nginx devant qui
+    # gere les renouvellements.
+    from circusvoip_security import ensure_self_signed_cert, build_ssl_context
+    _cert_file = _BASE_DIR / "cert.pem"
+    _key_file = _BASE_DIR / "key.pem"
+    _ok, _detail = ensure_self_signed_cert(_cert_file, _key_file, common_name="circusvoip-server")
+    if not _ok:
+        _log(f"[FATAL] Impossible de generer le certificat TLS. Detail : {_detail}", RED)
+        _server_running = False
+        return
+    _ssl_ctx = build_ssl_context(str(_cert_file), str(_key_file))
+    _log(f"TLS active : serveur en wss:// (cert {_detail})", GREEN)
+
+    async with websockets.serve(handler, HOST, PORT, ssl=_ssl_ctx):
         await _stop_event.wait()
     cleanup_task.cancel()
     try:

@@ -39,14 +39,16 @@ Python 3.10+ recommandé. Cloner le repo et lancer les sources :
 ```bash
 git clone https://github.com/kainann/CircusVOIP.git
 cd CircusVOIP/server
-pip install websockets
-python circusvoip_server.py       # serveur positions (port 8888)
-python circusvoip_audio_server.py # serveur audio (port 8889)
+pip install websockets cryptography
+python circusvoip_server.py       # serveur positions (port 8888, wss://)
+python circusvoip_audio_server.py # serveur audio (port 8889, wss://)
 ```
 
 Le mot de passe d'accès est généré automatiquement au premier
 lancement dans `circusvoip_server_config.json`. Communiquez-le aux
 joueurs avec l'IP publique de la machine.
+Le certificat TLS (`cert.pem` et `key.pem`) est également généré
+automatiquement au premier lancement et réutilisé ensuite.
 
 ## Configuration requise
 

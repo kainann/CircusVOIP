@@ -26,6 +26,12 @@ Lancez l'installeur, le serveur démarre et génère un mot de passe
 automatiquement. Communiquez l'IP de la machine + le mot de passe aux
 joueurs.
 
+⚠️ **Ouvrir les ports 8888 et 8889 sur Internet expose le serveur aux
+scans automatiques.** Le code utilise un certificat TLS auto-signé
+généré au premier lancement (chiffrement actif par défaut), mais si tu
+veux limiter l'exposition, héberger sur un VPS dédié (3-5 €/mois) est
+plus prudent que sur ton PC perso.
+
 ### Sur une machine dédiée (VPS, PC secondaire, etc.)
 
 Python 3.10+ recommandé. Cloner le repo et lancer les sources :

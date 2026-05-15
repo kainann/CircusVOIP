@@ -8,7 +8,7 @@ calculée à partir de la position lue par OCR sur l'écran du joueur.
 
 La plupart des joueurs ont uniquement besoin de l'installeur **client** :
 
-➡️ **[Télécharger CircusVOIP_Client_Setup_v0.1.0.exe](../../releases/tag/client-v0.1.0)**
+➡️ **[Télécharger CircusVOIP_Client_Setup_v0.1.2.exe](https://github.com/kainann/CircusVOIP/releases/tag/client-v0.1.2)**
 
 Lancez l'installeur, configurez votre micro, configurez la zone OCR,
 définissez les raccourcis radio et profil, connectez-vous au serveur de
@@ -20,7 +20,7 @@ Un groupe a besoin d'**un seul serveur**, hébergé soit :
 
 ### Sur le PC d'un joueur (le plus simple)
 
-➡️ **[Télécharger CircusVOIP_Server_Setup_v0.1.0.exe](../../releases/tag/server-v0.1.0)**
+➡️ **[Télécharger CircusVOIP_Server_Setup_v0.1.1.exe](https://github.com/kainann/CircusVOIP/releases/tag/server-v0.1.1)**
 
 Lancez l'installeur, le serveur démarre et génère un mot de passe
 automatiquement. Communiquez l'IP de la machine + le mot de passe aux

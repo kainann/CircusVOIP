@@ -75,9 +75,6 @@ docker compose exec positions cat /data/circusvoip_server_config.json
 docker compose exec positions cat /data/circusvoip_admin_token.json
 ```
 
-Le client n'est **pas** conteneurisable (GUI Windows + capture
-d'écran + OCR sur Star Citizen actif).
-
 ## Configuration requise
 
 - **Windows 10 ou 11** (côté client uniquement ; le serveur tourne

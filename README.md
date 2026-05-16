@@ -34,15 +34,19 @@ plus prudent que sur ton PC perso.
 
 ### Sur une machine dédiée (VPS, PC secondaire, etc.)
 
-Python 3.10+ recommandé. Cloner le repo et lancer les sources :
+**Python 3.10 ou supérieur requis.** Cloner le repo et lancer les
+sources :
 
 ```bash
 git clone https://github.com/kainann/CircusVOIP.git
 cd CircusVOIP/server
-pip install websockets cryptography
+pip install -e .                  # installe websockets + cryptography
 python circusvoip_server.py       # serveur positions (port 8888, wss://)
 python circusvoip_audio_server.py # serveur audio (port 8889, wss://)
 ```
+
+Sur un VPS Linux sans GUI, ajouter `--headless` aux deux commandes
+pour eviter la dependance a tkinter.
 
 Le mot de passe d'accès est généré automatiquement au premier
 lancement dans `circusvoip_server_config.json`. Communiquez-le aux
@@ -50,15 +54,53 @@ joueurs avec l'IP publique de la machine.
 Le certificat TLS (`cert.pem` et `key.pem`) est également généré
 automatiquement au premier lancement et réutilisé ensuite.
 
+### Avec Docker (serveur)
+
+Le serveur peut être lancé en conteneurs Docker. Depuis `server/` :
+
+```bash
+docker compose up -d
+```
+
+Les deux serveurs (positions et audio) tournent dans des conteneurs
+distincts qui partagent un volume Docker nommé `state`. Le
+certificat TLS, le token joueur, le token admin et les tickets
+d'auth y sont stockés et persistent entre redémarrages.
+
+Pour récupérer le mot de passe et le token admin générés au premier
+lancement :
+
+```bash
+docker compose exec positions cat /data/circusvoip_server_config.json
+docker compose exec positions cat /data/circusvoip_admin_token.json
+```
+
+Le client n'est **pas** conteneurisable (GUI Windows + capture
+d'écran + OCR sur Star Citizen actif).
+
 ## Configuration requise
 
-- **Windows 10 ou 11**
+- **Windows 10 ou 11** (côté client uniquement ; le serveur tourne
+  aussi sous Linux dans Docker)
+- **Python 3.10 ou supérieur** pour les installations à partir des
+  sources
 - **Star Citizen** lancé pour l'OCR (le client peut tourner sans, mais
   sans position ni proximité ni radio fonctionnels)
 - **Un micro**
 - **Carte graphique NVIDIA recommandée** : l'OCR (EasyOCR) tourne
   nettement plus vite avec CUDA. Sans GPU NVIDIA, ça fonctionne en CPU
   mais c'est plus lent et plus gourmand.
+
+### Dépendances Python
+
+- **Serveur** : `websockets`, `cryptography`.
+- **Client** : `PySide6`, `websockets`, `numpy`, `scipy`, `mss`,
+  `opencv-python`, `easyocr` (qui installe `torch` automatiquement),
+  `sounddevice`, `cryptography`, `pynput`.
+
+Les dépendances exactes sont déclarées dans `server/pyproject.toml`
+et `client/pyproject.toml`. Pour l'installation en mode développement
+côté client : `pip install -e client/`.
 
 ## Fonctionnalités
 

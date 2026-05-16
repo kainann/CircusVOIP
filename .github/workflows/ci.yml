@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: ruff (non-bloquant)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff==0.12.0
+
+      # --exit-zero : on remonte les warnings dans la UI GitHub Actions
+      # mais on ne fait pas echouer la CI tant que le codebase n'a pas ete
+      # nettoye. A retirer une fois la dette de lint resorbee.
+      - name: ruff check
+        run: ruff check . --output-format=github --exit-zero
+
+      - name: ruff format check
+        run: ruff format --check . || true
+
+  server-import:
+    name: server import (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install server package
+        working-directory: server
+        run: pip install -e .
+
+      # Le serveur tourne en --headless sur un VPS Linux : on simule cet
+      # argv pour eviter le import tkinter conditionnel.
+      - name: Smoke import
+        working-directory: server
+        run: |
+          python -c "import sys; sys.argv = ['x', '--headless']; \
+            import circusvoip_server_config, circusvoip_security, \
+                   circusvoip_server, circusvoip_audio_server; \
+            print('all server modules import OK')"

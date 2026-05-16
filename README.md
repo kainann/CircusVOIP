@@ -75,6 +75,13 @@ docker compose exec positions cat /data/circusvoip_server_config.json
 docker compose exec positions cat /data/circusvoip_admin_token.json
 ```
 
+> ℹ️ **Sous Git Bash (Windows)**, MSYS réécrit les chemins commençant
+> par `/` et les commandes ci-dessus échouent avec
+> `cat: 'C:/Program Files/Git/data/...': No such file or directory`.
+> Préfixer avec `MSYS_NO_PATHCONV=1` ou lancer depuis PowerShell, CMD
+> ou WSL. Pas de souci sur Linux (la cible normale du déploiement
+> Docker).
+
 ## Configuration requise
 
 - **Windows 10 ou 11** (côté client uniquement ; le serveur tourne

@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Etat runtime (ne doit JAMAIS finir dans l'image)
+cert.pem
+key.pem
+circusvoip_auth_tickets.json
+circusvoip_admin_token.json
+circusvoip_server_config.json
+circusvoip_channels.json
+circusvoip_profiles.json
+circusvoip_broadcasters.json
+circusvoip_admin_config.json
+circusvoip_debug/
+
+# Icones Windows (l'image Docker n'en a pas besoin)
+*.ico

@@ -1,0 +1,41 @@
+# =============================================
+#  CircusVOIP Server - docker-compose
+# =============================================
+# Lance les deux serveurs (positions:8888, audio:8889) dans deux
+# containers qui partagent un volume `state` pour le cert TLS, le token,
+# les tickets d'auth, et la liste des canaux/profils.
+#
+# Quickstart :
+#   docker compose up -d
+#
+# Le mot de passe et le token admin sont generes au 1er lancement. Pour
+# les recuperer :
+#   docker compose exec positions cat /data/circusvoip_server_config.json
+#   docker compose exec positions cat /data/circusvoip_admin_token.json
+# =============================================
+
+services:
+  positions:
+    build: .
+    container_name: circusvoip-positions
+    command: ["python", "circusvoip_server.py", "--headless"]
+    ports:
+      - "8888:8888"
+    volumes:
+      - state:/data
+    restart: unless-stopped
+
+  audio:
+    build: .
+    container_name: circusvoip-audio
+    command: ["python", "circusvoip_audio_server.py", "--headless"]
+    ports:
+      - "8889:8889"
+    volumes:
+      - state:/data
+    restart: unless-stopped
+    depends_on:
+      - positions
+
+volumes:
+  state:

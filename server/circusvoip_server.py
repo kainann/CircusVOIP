@@ -74,8 +74,11 @@ AUTH_MAX_FAILURES = 5
 AUTH_WINDOW_SEC   = 60
 AUTH_BAN_SEC      = 600
 
-# Log debug serveur (meme dossier que le client)
-_BASE_DIR       = Path(__file__).resolve().parent
+# Dossier des donnees runtime (token, cert TLS, tickets, canaux, profils).
+# Surchargeable via CIRCUSVOIP_DATA_DIR pour les deploiements Docker
+# (cf. circusvoip_server_config.get_data_dir).
+from circusvoip_server_config import get_data_dir as _get_data_dir
+_BASE_DIR       = _get_data_dir()
 _DEBUG_DIR      = _BASE_DIR / "circusvoip_debug"
 DEBUG_LOG_FILE  = _DEBUG_DIR / "circusvoip_server_debug.log"
 _debug_log_fp   = None

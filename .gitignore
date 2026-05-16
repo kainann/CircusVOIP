@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Build artefacts
+dist/
+build/
+*.egg-info/
+
+# Tooling
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Distribution
+*.exe
+
+# Server secrets / runtime state (generated at first launch)
+cert.pem
+key.pem
+circusvoip_auth_tickets.json
+circusvoip_admin_token.json
+circusvoip_server_config.json
+circusvoip_channels.json
+circusvoip_profiles.json
+circusvoip_broadcasters.json
+circusvoip_admin_config.json
+
+# Client runtime state
+client/circusvoip_client_config.json
+client/sounds/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Claude Code workspace state (local-only)
+.claude/

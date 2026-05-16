@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "circusvoip-server"
+version = "0.1.1"
+description = "Serveur WebSocket pour CircusVOIP - positions + audio relay."
+requires-python = ">=3.10"
+dependencies = [
+    "websockets>=12,<14",
+    "cryptography>=42",
+]
+
+[tool.setuptools]
+py-modules = [
+    "circusvoip_server",
+    "circusvoip_audio_server",
+    "circusvoip_security",
+    "circusvoip_server_config",
+    "circusvoip_admin",
+]

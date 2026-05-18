@@ -164,6 +164,14 @@ RED     = "#f85149"
 
 class State:
     clients = {}   # websocket -> name
+    # [BROADCAST_ALL] Capabilities par-client extraites du ticket positions.
+    # Dict separe (plutot que de transformer clients en {ws: {name,caps}})
+    # pour ne pas casser les lecteurs existants qui parcourent clients comme
+    # un simple ws -> name.
+    client_caps = {}   # websocket -> {"can_broadcast": bool}
+    # [BROADCAST_ALL] Dernier timestamp ou un refus 0x03 a ete loggue, par ws.
+    # Sert a limiter le spam de logs si un client malveillant tient la touche.
+    _last_refusal_log = {}
     running = False
     bytes_total     = 0
     frames_total    = 0
@@ -180,6 +188,13 @@ class State:
     rate_limit_first_drop_logged: dict = {} # {pseudo: monotonic_ts}
 
 state = State()
+
+# [BROADCAST_ALL] Flag audio reserve a la PTT diffusion globale (tous canaux).
+# Le serveur impose can_broadcast=True (lu dans le ticket) pour relayer
+# une trame portant ce flag. Sinon la trame est jetee silencieusement (avec
+# un log rate-limite pour aider au debug sans flooder).
+FLAG_BROADCAST_ALL = 0x03
+_BROADCAST_REFUSAL_LOG_INTERVAL_SEC = 60.0
 
 # ---------------------------------------------
 #  Serveur WebSocket
@@ -243,6 +258,18 @@ async def handler(ws, ui):
                         )
                         state.rate_limit_first_drop_logged[name] = now_log
                     continue
+                # [BROADCAST_ALL] Drop des trames flag 0x03 si l'emetteur
+                # n'a pas la capability. Sans ce filtre, n'importe quel
+                # client pourrait fabriquer une trame 0x03 et etre entendu
+                # sur tous les canaux radio simultanement (cf filtrage
+                # cote receveur dans circusvoip_core.py qui accepte 0x03
+                # sans verifier le canal). On enforce ici parce que c'est
+                # le seul endroit ou on a a la fois la trame ET l'identite
+                # authentifiee de l'emetteur (via le ticket).
+                if (len(msg) >= 1 and msg[0] == FLAG_BROADCAST_ALL
+                        and not state.client_caps.get(ws, {}).get("can_broadcast")):
+                    _maybe_log_broadcast_refusal(ws, name, peer_ip, ui)
+                    continue
                 # Trame audio : relayer a tous les autres clients
                 state.bytes_total  += len(msg)
                 state.frames_total += 1
@@ -289,8 +316,11 @@ async def handler(ws, ui):
                     # [P4 - auth partagee] Exiger un ticket emis par le
                     # serveur positions. Empeche un client d'arriver sur
                     # l'audio sans etre passe par le serveur principal.
+                    # verify_full() retourne aussi les capabilities embarquees
+                    # dans le ticket (cf. AuthRegistry.issue(can_broadcast=)).
                     ticket = data.get("audio_ticket", "")
-                    ticket_name = _auth_registry.verify(ticket)
+                    ticket_entry = _auth_registry.verify_full(ticket)
+                    ticket_name = (ticket_entry or {}).get("name")
                     if ticket_name is None:
                         banned_now = _auth_lockout.record_failure(peer_ip)
                         ui.log(f"REFUSE audio : ticket invalide ou expire "
@@ -335,6 +365,14 @@ async def handler(ws, ui):
                     # client annonce. Ferme l'usurpation de pseudo cote audio.
                     name = ticket_name
                     state.clients[ws] = name
+                    # [BROADCAST_ALL] Stocke la capability au moment du join.
+                    # Pas de re-evaluation pendant la session : si l'admin
+                    # revoke pendant qu'un broadcaster est connecte, la
+                    # revocation s'applique au prochain ticket (apres son
+                    # prochain join au serveur positions).
+                    state.client_caps[ws] = {
+                        "can_broadcast": bool(ticket_entry.get("can_broadcast")),
+                    }
                     ui.log(f"JOIN audio : {name}  ({len(state.clients)} client(s))")
                     ui.refresh_clients()
 
@@ -348,10 +386,26 @@ async def handler(ws, ui):
     finally:
         # [P5] Libere le bucket de rate limiting de ce client.
         _audio_rate.forget(ws)
+        # [BROADCAST_ALL] Libere la capability stockee + l'etat du log
+        # rate-limit pour ce ws. Sans pop, accumulation lente en memoire.
+        state.client_caps.pop(ws, None)
+        state._last_refusal_log.pop(ws, None)
         if ws in state.clients:
             n = state.clients.pop(ws)
             ui.log(f"LEAVE audio : {n}  ({len(state.clients)} client(s))")
             ui.refresh_clients()
+
+
+def _maybe_log_broadcast_refusal(ws, name: str, peer_ip: str, ui):
+    """Loggue le refus d'une trame 0x03 (PTT diffusion globale) d'un client
+    non-broadcaster, en limitant a 1 log par minute par ws pour ne pas
+    flooder si un client tient la touche en continu (50 trames/s)."""
+    now = time.time()
+    last = state._last_refusal_log.get(ws, 0.0)
+    if now - last < _BROADCAST_REFUSAL_LOG_INTERVAL_SEC:
+        return
+    state._last_refusal_log[ws] = now
+    ui.log(f"REFUSE broadcast_all : {name} (ip {peer_ip}) - pas de role broadcaster")
 
 async def _broadcast_binary(data: bytes, exclude=None):
     """Envoie une trame audio a tous les clients sauf l'emetteur."""

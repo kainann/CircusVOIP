@@ -427,6 +427,13 @@ _channels: list = []
 _PROFILES_FILE = _BASE_DIR / "circusvoip_profiles.json"
 _profiles: list = []
 
+# Liste des broadcasters : joueurs autorises a parler simultanement sur TOUS
+# les canaux radio (PTT diffusion globale, flag audio 0x03). L'admin gere la
+# liste via grant_broadcaster / revoke_broadcaster. La capability est
+# propagee au serveur audio via le ticket (cf. AuthRegistry.issue(can_broadcast=)).
+_BROADCASTERS_FILE = _BASE_DIR / "circusvoip_broadcasters.json"
+_broadcasters: set = set()
+
 
 def _load_channels() -> list:
     """Charge la liste des canaux depuis le fichier JSON (liste de strings).
@@ -625,9 +632,33 @@ def _build_my_profile_msg(profile_name) -> dict:
     return msg
 
 
+def _load_broadcasters() -> set:
+    """Charge la liste des broadcasters depuis circusvoip_broadcasters.json.
+    Retourne un set vide si absent (la capability est opt-in)."""
+    try:
+        if _BROADCASTERS_FILE.exists():
+            with open(_BROADCASTERS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return {n.strip() for n in data if isinstance(n, str) and n.strip()}
+    except Exception as e:
+        print(f"[BROADCASTERS] Echec chargement {_BROADCASTERS_FILE.name} : {e}")
+    return set()
+
+
+def _save_broadcasters():
+    """Persiste la liste des broadcasters dans circusvoip_broadcasters.json."""
+    try:
+        with open(_BROADCASTERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(_broadcasters), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[BROADCASTERS] Echec sauvegarde {_BROADCASTERS_FILE.name} : {e}")
+
+
 # Initialisation : charger au demarrage du module
 _channels = _load_channels()
 _profiles = _load_profiles()
+_broadcasters = _load_broadcasters()
 if _profiles and not _PROFILES_FILE.exists():
     _save_profiles()
 
@@ -1361,6 +1392,23 @@ async def _admin_handle_cmd(ws, cmd: str, data: dict) -> tuple:
             except Exception:
                 pass
             return (True, "")
+        if cmd == "grant_broadcaster":
+            ok = grant_broadcaster(data.get("name", ""))
+            return (ok, "" if ok else "nom vide")
+        if cmd == "revoke_broadcaster":
+            ok = revoke_broadcaster(data.get("name", ""))
+            return (ok, "" if ok else "nom vide")
+        if cmd == "list_broadcasters":
+            try:
+                await ws.send(json.dumps({
+                    "type": "admin_response",
+                    "cmd": "list_broadcasters",
+                    "ok": True,
+                    "broadcasters": list_broadcasters(),
+                }))
+            except Exception:
+                pass
+            return (True, "")
         if cmd == "set_anonymous_mode":
             target = bool(data.get("active", False))
             global _anonymous_mode
@@ -1553,7 +1601,15 @@ async def handler(ws):
                 # [P4] Enregistre le ticket dans le fichier partage avec
                 # le serveur audio. Le serveur audio relira ce fichier au
                 # moment du join audio pour valider le ticket presente.
-                _auth_registry.issue(name, audio_ticket)
+                # can_broadcast est lu cote audio pour autoriser les frames
+                # avec flag 0x03 (PTT diffusion globale). Si le role est
+                # revoque pendant que le joueur est connecte, la revocation
+                # ne s'applique qu'au prochain ticket (TTL <= 120s).
+                _auth_registry.issue(
+                    name,
+                    audio_ticket,
+                    can_broadcast=(name in _broadcasters),
+                )
                 _log(f"JOIN : {name}  ({len(clients)} connecté(s))", GREEN)
                 if _ui:
                     _ui.add_player(name)
@@ -1585,6 +1641,15 @@ async def handler(ws):
                     "my_profile": None,
                     # [P4] Ticket a renvoyer au serveur audio lors du join audio.
                     "audio_ticket": audio_ticket,
+                    # Capabilities serveur. Permet au client de detecter
+                    # qu'il parle a un serveur recent et d'activer/desactiver
+                    # les fonctionnalites correspondantes (ex: griser la
+                    # touche PTT diffusion globale sur les vieux serveurs).
+                    "server_caps": ["broadcast_all"],
+                    # Indique si CE joueur a actuellement le role broadcaster.
+                    # Le client peut ainsi activer/desactiver son UI sans avoir
+                    # a interroger un admin.
+                    "is_broadcaster": (name in _broadcasters),
                 }
                 # Ajout des permissions a False (cf. _build_my_profile_msg
                 # qui renvoie False pour profile=None).
@@ -2517,6 +2582,43 @@ def remove_profile(name: str) -> bool:
             pass
     _log(f"Profil supprime : {name} (joueurs concernes : {len(affected)})", ORANGE)
     return True
+
+
+def grant_broadcaster(player_name: str) -> bool:
+    """Accorde le role broadcaster a `player_name`. Idempotent : renvoie
+    True meme si deja accorde, False uniquement sur nom vide. La
+    capability ne devient effective qu'au prochain ticket emis : si le
+    joueur est deja connecte, il devra se reconnecter au serveur positions
+    pour que son ticket audio porte can_broadcast=True (TTL ticket = 120s
+    + cycle reconnect, donc effectif sous ~2 min en pratique)."""
+    player_name = (player_name or "").strip()
+    if not player_name:
+        return False
+    if player_name not in _broadcasters:
+        _broadcasters.add(player_name)
+        _save_broadcasters()
+        _log(f"Broadcaster accorde : {player_name}", GREEN)
+    return True
+
+
+def revoke_broadcaster(player_name: str) -> bool:
+    """Retire le role broadcaster a `player_name`. Idempotent : renvoie
+    True meme si deja absent, False uniquement sur nom vide. Comme
+    grant_broadcaster, la revocation n'est effective qu'au prochain
+    ticket (TTL <= 120s)."""
+    player_name = (player_name or "").strip()
+    if not player_name:
+        return False
+    if player_name in _broadcasters:
+        _broadcasters.discard(player_name)
+        _save_broadcasters()
+        _log(f"Broadcaster revoque : {player_name}", ORANGE)
+    return True
+
+
+def list_broadcasters() -> list:
+    """Retourne la liste triee des broadcasters actuels."""
+    return sorted(_broadcasters)
 
 
 def assign_profile(player_name: str, profile_name) -> bool:

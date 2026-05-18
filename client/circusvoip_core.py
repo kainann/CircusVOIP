@@ -430,6 +430,11 @@ class State:
     ws_loop     = None   # event loop du thread WebSocket (pour envoi thread-safe)
     zone_coords = None
     server_token = ""
+    # [P4 - auth partagee] Ticket emis par le serveur positions dans le
+    # message welcome. A renvoyer au serveur audio lors du join audio.
+    # Le serveur audio refuse la connexion sans ce ticket. Rafraichi a
+    # chaque welcome (donc a chaque reconnexion au serveur positions).
+    audio_ticket = ""
     # Audio
     audio_io         = None   # instance AudioIO
     audio_ws         = None   # WebSocket audio
@@ -1753,10 +1758,19 @@ async def _audio_ws_loop(ui):
             except Exception:
                 break
 
-        uri = f"ws://{ip}:{AUDIO_PORT}"
+        # [P1 - TLS] Connexion CHIFFREE en wss://.
+        # Le serveur audio utilise un certificat auto-signe (genere
+        # automatiquement au demarrage du serveur). build_client_ssl_context_insecure
+        # construit un contexte SSL qui accepte ce certificat sans
+        # verifier l'identite du serveur : connexion chiffree mais pas
+        # d'authentification stricte. C'est acceptable ici car l'auth
+        # se fait via le token + le ticket dans le join (cf [P4]).
+        from circusvoip_security import build_client_ssl_context_insecure
+        uri = f"wss://{ip}:{AUDIO_PORT}"
+        _ssl_ctx = build_client_ssl_context_insecure()
         auth_failed = False
         try:
-            async with websockets.connect(uri, max_size=2*1024*1024) as ws:
+            async with websockets.connect(uri, ssl=_ssl_ctx, max_size=2*1024*1024) as ws:
                 state.audio_ws        = ws
                 state.audio_connected = True
                 ui.set_audio_status(True, "")
@@ -1764,6 +1778,11 @@ async def _audio_ws_loop(ui):
                     "type": "join",
                     "name": state.my_name,
                     "token": state.server_token,
+                    # [P4 - auth partagee] Ticket emis par le serveur
+                    # positions (recu dans le welcome). Sans ce ticket, ou
+                    # avec un ticket expire, le serveur audio refuse la
+                    # connexion (reason="invalid_ticket").
+                    "audio_ticket": getattr(state, "audio_ticket", "") or "",
                 }))
 
                 # Lancer le task d'envoi en parallele de la reception
@@ -1858,9 +1877,29 @@ async def _audio_ws_loop(ui):
                             except Exception:
                                 continue
                             if data.get("type") == "error":
-                                if data.get("reason") == "invalid_token":
+                                reason = data.get("reason")
+                                if reason == "invalid_token":
                                     auth_failed = True
                                     ui.set_audio_status(False, "Mot de passe invalide")
+                                    break
+                                if reason == "invalid_ticket":
+                                    # [P4] Ticket absent / expire / invalide.
+                                    # On NE retente PAS en boucle ici : il
+                                    # faut d'abord se reconnecter au serveur
+                                    # positions pour obtenir un ticket frais.
+                                    auth_failed = True
+                                    ui.set_audio_status(
+                                        False,
+                                        "Reconnecte-toi au serveur principal"
+                                    )
+                                    try:
+                                        _dbg_log(
+                                            "[AUDIO] Ticket refuse par le "
+                                            "serveur audio : reconnexion au "
+                                            "serveur positions necessaire"
+                                        )
+                                    except Exception:
+                                        pass
                                     break
                 finally:
                     sender_task.cancel()
@@ -1869,10 +1908,23 @@ async def _audio_ws_loop(ui):
                     except Exception:
                         pass
         except websockets.exceptions.ConnectionClosedError as e:
-            # Code 1008 = token refuse par le serveur
+            # Code 1008 = connexion refusee par le serveur (token OU ticket).
             if getattr(e, "code", None) == 1008:
                 auth_failed = True
-                ui.set_audio_status(False, "Mot de passe invalide")
+                # [P4] Distinguer token invalide et ticket invalide pour
+                # afficher un message utile. Le serveur audio met la raison
+                # dans le champ 'reason' de la fermeture.
+                close_reason = (getattr(e, "reason", "") or "")
+                if close_reason == "invalid_ticket":
+                    ui.set_audio_status(
+                        False, "Reconnecte-toi au serveur principal"
+                    )
+                elif close_reason == "banned":
+                    ui.set_audio_status(
+                        False, "Trop de tentatives - reessaie plus tard"
+                    )
+                else:
+                    ui.set_audio_status(False, "Mot de passe invalide")
             else:
                 ui.set_audio_status(False, f"Deconnecte ({e.code})")
         except Exception as e:
@@ -2581,7 +2633,7 @@ def _ocr_loop_inner(ui: "ClientUI"):
                             _mem = _sco_mod._sign_memory_per_container.setdefault(_cid, {})
                             for _ax in ("x", "y", "z"):
                                 _v = pos.get(_ax)
-                                if _v is not None and abs(_v) >= SIGN_NEAR_ZERO:
+                                if _v is not None and abs(_v) >= _sco_mod.SIGN_NEAR_ZERO:
                                     _mem[_ax] = -1 if _v < 0 else +1
                                 # Reset le streak pour cet axe : la memoire
                                 # vient d'etre re-validee par bascule de vote

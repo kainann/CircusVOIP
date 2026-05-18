@@ -582,9 +582,15 @@ def _load_version_info() -> dict:
     """Charge le fichier circusvoip_version.json a cote du script.
     Retourne un dict avec 'version' (X.Y.Z), 'channel' (alpha/beta/rc/stable),
     'build' (entier). Si le fichier n'existe pas ou est invalide, retourne
-    une version par defaut '0.0.0 alpha 000' (signal qu'il y a un probleme)."""
+    une version par defaut '0.0.0 alpha 000' (signal qu'il y a un probleme).
+
+    encoding="utf-8-sig" : tolere un BOM UTF-8 optionnel en tete de fichier.
+    Necessaire car certains outils (notamment ISPP SaveStringToFile avec
+    UTF8=1) ajoutent un BOM, et "utf-8" brut ne le consomme pas -> exception
+    "Unexpected character" -> tombe sur le default "0.0.0 alpha 000".
+    "utf-8-sig" lit indifferemment avec ou sans BOM."""
     try:
-        with open(VERSION_FILE, "r", encoding="utf-8") as f:
+        with open(VERSION_FILE, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         return {
             "version": str(data.get("version", "0.0.0")),
@@ -596,10 +602,22 @@ def _load_version_info() -> dict:
 
 
 def _format_version_string(info: dict = None) -> str:
-    """Retourne la version sous forme lisible : '0.1.0 alpha 001'.
-    Le numero de build est zero-padde sur 3 chiffres."""
+    """Retourne la version sous forme lisible.
+
+    Deux formats selon le canal :
+      - channel = 'stable' : version seule, ex. '0.1.2'
+                             (pour les releases publiques sur GitHub : pas
+                             besoin d'exposer le numero de build interne)
+      - autres channels    : version complete, ex. '0.1.2 alpha 035'
+        (alpha/beta/rc...)   (pour le dev : on veut savoir quel build precis
+                             on teste, et identifier rapidement un canal
+                             pre-release)
+
+    Le numero de build est zero-padde sur 3 chiffres dans le format complet."""
     if info is None:
         info = _load_version_info()
+    if info.get('channel') == 'stable':
+        return info['version']
     return f"{info['version']} {info['channel']} {info['build']:03d}"
 
 
@@ -1376,10 +1394,19 @@ class NetWorker(QObject):
             self.sig_log.emit("[NET] pip install websockets")
             return
 
-        uri = f"ws://{server_ip}:{SERVER_PORT}"
+        # [P1 - TLS] Connexion CHIFFREE en wss://.
+        # Le serveur positions utilise un certificat auto-signe (genere
+        # automatiquement). build_client_ssl_context_insecure() construit
+        # un contexte SSL qui accepte ce cert sans verifier l'identite :
+        # connexion chiffree mais pas d'authentification stricte. C'est
+        # acceptable car l'auth client se fait ensuite via le token dans
+        # le message "join" (compare_digest cote serveur, cf [P1]).
+        from circusvoip_security import build_client_ssl_context_insecure
+        uri = f"wss://{server_ip}:{SERVER_PORT}"
+        _ssl_ctx = build_client_ssl_context_insecure()
         self.sig_log.emit(f"[NET] Connexion a {uri} (nom={name})...")
         try:
-            async with websockets.connect(uri) as ws:
+            async with websockets.connect(uri, ssl=_ssl_ctx) as ws:
                 self._ws = ws
                 state.ws = ws
                 # asyncio.get_running_loop() au lieu de get_event_loop()
@@ -1508,6 +1535,13 @@ class NetWorker(QObject):
                 state.profiles_list = list(data.get("profiles", []))
                 state.my_channel = data.get("my_channel")
                 state.my_profile = data.get("my_profile")
+                # [P4 - auth partagee] Recuperer le ticket audio emis par
+                # le serveur positions. On le stocke dans state pour que
+                # _audio_ws_loop (dans core.py) puisse le presenter au
+                # serveur audio. Rafraichi a chaque welcome : si on se
+                # reconnecte, on obtient un nouveau ticket et l'ancien est
+                # ecrase (l'ancien ne vaut plus rien cote serveur).
+                state.audio_ticket = data.get("audio_ticket", "") or ""
             except Exception as e:
                 if _CORE_AVAILABLE:
                     try:
@@ -4293,7 +4327,10 @@ class MainWindow(QMainWindow):
         # de skipper le disconnect au 1er appel (sinon RuntimeWarning).
         self._audio_signals_connected: bool = False
 
-        self.setWindowTitle("CircusVOIP Client — 0.1")
+        # Titre dynamique : lit _VERSION_STRING qui vient de circusvoip_version.json
+        # (format "0.1.2 alpha 035"). Avant, la version etait hardcodee en
+        # "0.1" et ne refletait jamais la version reelle.
+        self.setWindowTitle(f"CircusVOIP Client — {_VERSION_STRING}")
         # Appliquer le theme sombre global. On le met sur la
         # QApplication pour que toutes les dialogs creees plus tard
         # (QMessageBox, QFileDialog, etc.) heritent automatiquement.
@@ -4605,14 +4642,14 @@ class MainWindow(QMainWindow):
         v_mutes.addWidget(self.btn_mute)
 
         # MUTE proximité
-        self.btn_mute_prox = QPushButton("MUTE PROXIMITE")
+        self.btn_mute_prox = QPushButton("MUTE AUDIO PROXIMITE")
         self.btn_mute_prox.setCheckable(True)
         self.btn_mute_prox.setMinimumHeight(32)
         self.btn_mute_prox.clicked.connect(self._on_mute_prox_toggled)
         v_mutes.addWidget(self.btn_mute_prox)
 
         # MUTE radio
-        self.btn_mute_radio = QPushButton("MUTE RADIO")
+        self.btn_mute_radio = QPushButton("MUTE AUDIO RADIO")
         self.btn_mute_radio.setCheckable(True)
         self.btn_mute_radio.setMinimumHeight(32)
         self.btn_mute_radio.clicked.connect(self._on_mute_radio_toggled)
@@ -4839,8 +4876,8 @@ class MainWindow(QMainWindow):
         self.lbl_radio_key      = _make_key_row(v_radio, "Radio canal (PTT) :",      "radio")
         self.lbl_profile_key    = _make_key_row(v_radio, "Radio profil (PTT) :",     "profile")
         self.lbl_mute_mic_key   = _make_key_row(v_radio, "Mute micro :",             "mute_mic")
-        self.lbl_mute_prox_key  = _make_key_row(v_radio, "Mute proximite :",         "mute_prox")
-        self.lbl_mute_radio_key = _make_key_row(v_radio, "Mute radio :",             "mute_radio")
+        self.lbl_mute_prox_key  = _make_key_row(v_radio, "Mute audio proximite :",   "mute_prox")
+        self.lbl_mute_radio_key = _make_key_row(v_radio, "Mute audio radio :",       "mute_radio")
         self.lbl_mute_all_key   = _make_key_row(v_radio, "Mute tout :",              "mute_all")
         self.lbl_prox_short_key = _make_key_row(v_radio, "Proximite 30m / 5m :",     "prox_short")
         self.lbl_cycle_ch_key   = _make_key_row(v_radio, "Cycle canal radio :",      "cycle_channel")
@@ -5693,8 +5730,8 @@ class MainWindow(QMainWindow):
             "radio":         ("Radio canal (PTT)",     "radio_key",           "radio_key"),
             "profile":       ("Radio profil (PTT)",    "profile_radio_key",   "profile_radio_key"),
             "mute_mic":      ("Mute micro (toggle)",   "mute_mic_key",        "mute_mic_key"),
-            "mute_prox":     ("Mute proximite",        "mute_prox_key",       "mute_prox_key"),
-            "mute_radio":    ("Mute radio",            "mute_radio_key",      "mute_radio_key"),
+            "mute_prox":     ("Mute audio proximite",  "mute_prox_key",       "mute_prox_key"),
+            "mute_radio":    ("Mute audio radio",      "mute_radio_key",      "mute_radio_key"),
             "mute_all":      ("Mute tout",              "mute_all_key",        "mute_all_key"),
             "prox_short":    ("Proximite 30m / 5m",    "proximity_short_key", "proximity_short_key"),
             "cycle_channel": ("Cycle canal radio",     "cycle_channel_key",   "cycle_channel_key"),
@@ -6182,10 +6219,10 @@ class MainWindow(QMainWindow):
                 self.cb_mic.setCurrentIndex(idx)
         else:
             # Defaut : device par defaut systeme
-            matched = False
             try:
                 default_id = default_input_device()
                 if default_id is not None:
+                    matched = False
                     for i in range(self.cb_mic.count()):
                         if self.cb_mic.itemData(i) == default_id:
                             self.cb_mic.setCurrentIndex(i)
@@ -6219,36 +6256,15 @@ class MainWindow(QMainWindow):
                         )
                     except Exception:
                         pass
-
-            # Fallback : si le default Windows n'est pas trouvable (None
-            # ou absent de l'enumeration), prendre le 1er micro valide
-            # de la liste pour eviter que le client demarre sans micro
-            # et bloque l'utilisateur. Cas typique : nouvelle install
-            # sur un PC ou le casque par defaut Windows est eteint /
-            # absent au moment du lancement, ou ou WASAPI filtre le
-            # device par defaut.
-            if not matched:
-                for i in range(self.cb_mic.count()):
-                    if self.cb_mic.itemData(i) is not None and self.cb_mic.itemData(i) >= 0:
-                        self.cb_mic.setCurrentIndex(i)
-                        if _CORE_AVAILABLE:
-                            try:
-                                _core._dbg_log(
-                                    f"[AUDIO] fallback mic : {self.cb_mic.itemText(i)} "
-                                    f"(id={self.cb_mic.itemData(i)})"
-                                )
-                            except Exception:
-                                pass
-                        break
         if saved_out:
             idx = self.cb_out.findText(saved_out)
             if idx >= 0:
                 self.cb_out.setCurrentIndex(idx)
         else:
-            matched = False
             try:
                 default_id = default_output_device()
                 if default_id is not None:
+                    matched = False
                     for i in range(self.cb_out.count()):
                         if self.cb_out.itemData(i) == default_id:
                             self.cb_out.setCurrentIndex(i)
@@ -6277,22 +6293,6 @@ class MainWindow(QMainWindow):
                         )
                     except Exception:
                         pass
-
-            # Fallback : meme principe que pour le micro. Si le default
-            # Windows n'est pas trouvable, prendre la 1ere sortie valide.
-            if not matched:
-                for i in range(self.cb_out.count()):
-                    if self.cb_out.itemData(i) is not None and self.cb_out.itemData(i) >= 0:
-                        self.cb_out.setCurrentIndex(i)
-                        if _CORE_AVAILABLE:
-                            try:
-                                _core._dbg_log(
-                                    f"[AUDIO] fallback out : {self.cb_out.itemText(i)} "
-                                    f"(id={self.cb_out.itemData(i)})"
-                                )
-                            except Exception:
-                                pass
-                        break
 
         # Connecter les signaux APRES restauration (eviter callbacks inutiles
         # pendant le populate). Au premier appel, currentIndexChanged n'est

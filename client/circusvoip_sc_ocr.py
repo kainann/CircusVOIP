@@ -201,8 +201,14 @@ def auto_ocr_zone(monitor: Optional[dict] = None) -> dict:
     is_ultrawide = aspect_ratio > 2.0  # 21:9 ~= 2.33, 32:9 ~= 3.55
 
     if sh >= 1800:
-        # 4K et au-dela : formule relative
-        width = int(sw * 0.35)
+        # 4K et au-dela : formule relative.
+        # 0.307 = 1179 px en 4K (3840) → ajuste suite a retour utilisateur
+        # 12/05/2026 (Kainan), qui a mesure pile la largeur de la ligne
+        # "Zone: ... Pos : ..." du DisplayInfo SC. Avant : 0.35 = 1344 px,
+        # mais ca debordait a gauche du HUD reel (le masque DisplayInfo
+        # qui s'aligne sur la zone OCR depassait visuellement).
+        # Marge de securite : si l'OCR rate des parses, remonter a 0.32.
+        width = int(sw * 0.307)
         height = int(sh * 0.0135)   # ~29 px en 4K
     elif sh >= 1300:
         # 1440p : QHD 2560x1440 (16:9) OU ultrawide 3440x1440 (21:9)
@@ -311,7 +317,15 @@ _OCR_CHAR_EQUIV = {
     "2": "2z",
     # 6 <-> g : confusion observee sur "pyro6" lu "pyrog" (cf commentaires
     # historiques dans la liste _KNOWN_ZONES_STATIONS).
-    "6": "6g",
+    # 6 <-> b : confusion observee 15/05/2026 sur "pyro6" lu "pyrob" en boucle
+    # (logs Kainan, session 09:52-12:16, 137 lectures dont 22 mal canonicalisees
+    # vers "pyro1" et 3 vers "pyro5" parce que distance Levenshtein egale a 1
+    # vers chacun de ces noms et "pyro1" arrivait en premier dans la liste.
+    # Le rattrapage CID SIMILAIRE compensait partiellement mais creait des
+    # cercles vicieux quand last_pos devenait pyro1. Pas de collision avec
+    # pyro5b : "pyrob" matche pyro6 a distance 0 (avec equivalence) et bat
+    # pyro5b a distance 1 (insertion du 5).
+    "6": "6gb",
     # 7 <-> z : confusion observee 09/05/2026 sur "ANVL_Hornet_F7CM_Mk2"
     # lu "anvl_hornet_fzcm_mk2" en boucle (16 variantes du meme vaisseau
     # dans une session de test). Le 7 et le Z se ressemblent dans le HUD
@@ -590,6 +604,12 @@ _KNOWN_ZONES_INTERIORS = [
     "levski_v2_middeck",
     "levski_v2_topdeck",
     "levski_v2_lowerdeck",
+    "levski_v2_bottomdeck",       # deck du bas - ajoute 14/05/2026 : sans
+                                  # cette entree le fuzzy matcher ne pouvait
+                                  # canonicaliser aucune variante OCR
+                                  # ("bottondeck", "vz", "tevski"...), d'ou des
+                                  # container_id incoherents entre clients et
+                                  # des joueurs "hors de portee" a tort.
     "levski_v2_refindeck",        # refinery deck
     # Hangars Levski Nyx (tailles : small/medium/large/xl - top/front)
     "hangar_xltop_levski_nyx",
@@ -670,6 +690,15 @@ _KNOWN_ZONES_INTERIORS = [
     "tsg_gascloud_002",
     "tsg_gascloud_003",
     "tsg_gascloud_004",
+    # Encounters Pyro - harvestable object containers (rencontres aleatoires
+    # dans l'espace Pyro, type epaves/conteneurs). Le suffixe "_001" est un
+    # numero d'instance ; SC peut spawner _002, _003 etc. Ajoute 15/05/2026
+    # apres observation logs Kainan : 11 variantes OCR de ce nom long sur
+    # 32 lectures, "cid_similar" ne rattrapait qu'1 fois sur 32 faute
+    # d'ancre canonique dans _KNOWN_ZONES. Memes consequences potentielles
+    # que pour levski_v2_bottomdeck (joueurs "hors de portee" a tort si
+    # leurs OCR convergent vers des variantes differentes).
+    "locationharvestableobjectcontainer_ab_pyro_int_enctr_001",
     # Stations/outposts sur planetes/lunes
     "keeger_segment_social_001",   # outpost type Keeger
     "keeger_segment_social_002",
@@ -3163,11 +3192,70 @@ def set_log_system_metrics(fn: Callable[[str], None]) -> None:
     global _log_system_metrics
     _log_system_metrics = fn
 
+# ----------------------------------------------------------------------
+# Callbacks pre/post capture (v0.2 alpha 009)
+# ----------------------------------------------------------------------
+# Permettent au client d'agir juste avant et juste apres CHAQUE capture
+# MSS faite par capture_region(). Use case : cacher le masque DisplayInfo
+# pendant la capture pour que MSS voie l'image SC pure (sinon le masque
+# pollue la capture et casse l'OCR). Reactiver immediatement apres.
+#
+# Les callbacks sont optionnels. Si None, capture_region marche comme
+# avant. Le client les set via set_capture_callbacks(pre_cb, post_cb).
+#
+# IMPORTANT : ces callbacks tournent dans le THREAD OCR (pas le thread
+# Qt). Si le callback doit toucher a l'UI Qt, il doit utiliser
+# QMetaObject.invokeMethod avec BlockingQueuedConnection pour synchroniser
+# avec le thread Qt principal. Le client gere ce detail dans son
+# implementation. Ici on appelle juste le callback en sync.
+#
+# Tout est en try/except : si un callback plante, on continue la capture
+# normalement (l'OCR ne doit JAMAIS etre casse par une feature secondaire
+# comme le masque).
+_pre_capture_cb = None   # callable() ou None
+_post_capture_cb = None  # callable() ou None
+
+
+def set_capture_callbacks(pre_cb, post_cb):
+    """Branche des callbacks appeles autour de chaque capture_region().
+    Passer (None, None) pour les debrancher."""
+    global _pre_capture_cb, _post_capture_cb
+    _pre_capture_cb = pre_cb
+    _post_capture_cb = post_cb
+
+
 def capture_region(region):
-    with _mss.mss() as sct:
-        raw = sct.grab(region)
-        img = _np.frombuffer(raw.bgra, dtype=_np.uint8).reshape(raw.height, raw.width, 4)
-        return _cv2.cvtColor(img, _cv2.COLOR_BGRA2BGR)
+    # Hook pre-capture (v0.2). Typiquement : cacher le masque DisplayInfo
+    # le temps de la capture pour que MSS voie l'image SC sans pollution.
+    # En cas d'echec du callback, on log mais on continue : la capture
+    # doit avoir lieu, quitte a etre polluee, sinon on casse l'OCR.
+    pre_cb = _pre_capture_cb
+    if pre_cb is not None:
+        try:
+            pre_cb()
+        except Exception as e:
+            try:
+                _logger(f"[CAPTURE] pre_cb KO (ignore) : {e}")
+            except Exception:
+                pass
+    try:
+        with _mss.mss() as sct:
+            raw = sct.grab(region)
+            img = _np.frombuffer(raw.bgra, dtype=_np.uint8).reshape(raw.height, raw.width, 4)
+            return _cv2.cvtColor(img, _cv2.COLOR_BGRA2BGR)
+    finally:
+        # Hook post-capture : reactiver le masque, MEME si grab a leve.
+        # Le finally garantit qu'on ne laisse jamais le masque cache si
+        # une exception survient pendant la capture.
+        post_cb = _post_capture_cb
+        if post_cb is not None:
+            try:
+                post_cb()
+            except Exception as e:
+                try:
+                    _logger(f"[CAPTURE] post_cb KO (ignore) : {e}")
+                except Exception:
+                    pass
 
 
 # ----------------------------------------------------------------------

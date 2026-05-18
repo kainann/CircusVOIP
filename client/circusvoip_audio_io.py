@@ -19,7 +19,10 @@
 
 import threading
 import queue
+import shutil
 import time
+import wave
+from pathlib import Path
 
 import numpy as np
 
@@ -186,10 +189,16 @@ PLC_GAIN = 0.5
 # app/sounds/<nom>.wav. C'est compatible avec le packaging par l'installateur
 # Inno Setup ([Files] embarque app/* recursivement).
 import os as _os_for_sounds
-_SOUNDS_DIR = _os_for_sounds.path.join(
-    _os_for_sounds.path.dirname(_os_for_sounds.path.abspath(__file__)),
-    "sounds",
-)
+# Dossier .wav partage : sonneries telephone bundlees (ring/dial/notif) +
+# bips PTT custom de l'utilisateur (ptt_press.wav / ptt_release.wav).
+# Path object pour pouvoir faire .mkdir / .unlink directement cote bips
+# custom ; reste compatible avec os.path.join/exists des sonneries.
+_SOUNDS_DIR = Path(__file__).resolve().parent / "sounds"
+
+# Duree maximale autorisee pour un WAV custom de bip PTT (en secondes).
+# Au-dela on refuse le fichier : un bip de plusieurs secondes serait
+# penible et chargerait un buffer disproportionne dans la chaine audio.
+_MAX_BEEP_DURATION_SEC = 5.0
 
 
 def _load_wav_as_float32(path: str) -> "np.ndarray | None":
@@ -303,6 +312,92 @@ def _load_wav_calibrated_or_synth(
             f"{len(wav)/SAMPLE_RATE:.2f}s, gain={gain:.3f}, peak={peak:.3f})")
 
     return wav_calibrated
+
+
+# ---------------------------------------------
+#  Bips PTT personnalisables (custom WAV utilisateur)
+# ---------------------------------------------
+# Cf load_custom_beep / clear_custom_beep dans AudioIO. Le loader est
+# volontairement plus permissif que _load_wav_as_float32 ci-dessus :
+#   - accepte 8/16/24/32 bits
+#   - mono-downmix automatique si stereo
+#   - resample vers 48 kHz si necessaire (np.interp lineaire, suffisant
+#     pour des bips de <100 ms)
+#   - rejet si duree > _MAX_BEEP_DURATION_SEC
+
+def _load_wav_as_mono_48k(path: "str | Path") -> "np.ndarray | None":
+    """Charge un WAV PCM, le convertit en mono float32 a 48 kHz.
+
+    Pipeline :
+      1) Lecture brute via stdlib `wave` (PCM 8/16/24/32 bits supporte)
+      2) Conversion en float32 normalise dans [-1, 1]
+      3) Mono-downmix par moyenne si stereo
+      4) Resampling lineaire vers SAMPLE_RATE si la source est a un autre taux
+      5) Rejet si duree > _MAX_BEEP_DURATION_SEC ou si lecture echoue
+
+    Retourne le numpy array (float32) ou None en cas d'echec / fichier
+    invalide. Pas de raise : on veut un code d'erreur exploitable par
+    l'UI pour afficher un message clair plutot qu'une exception.
+    """
+    try:
+        with wave.open(str(path), "rb") as wf:
+            n_channels = wf.getnchannels()
+            sampwidth  = wf.getsampwidth()
+            framerate  = wf.getframerate()
+            n_frames   = wf.getnframes()
+            if framerate <= 0 or n_frames <= 0:
+                return None
+            duration = n_frames / float(framerate)
+            if duration > _MAX_BEEP_DURATION_SEC:
+                return None
+            raw = wf.readframes(n_frames)
+    except (wave.Error, FileNotFoundError, OSError):
+        return None
+
+    # Conversion PCM brut -> float32 [-1, 1]
+    if sampwidth == 1:
+        # PCM unsigned 8 bits, biais 128
+        arr = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+        arr = (arr - 128.0) / 128.0
+    elif sampwidth == 2:
+        arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sampwidth == 3:
+        # PCM 24 bits little-endian : pas de dtype natif numpy, on assemble
+        # en int32 par tranches de 3 octets puis on extend le bit de signe.
+        b = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
+        a32 = (b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16))
+        # Extension de signe : si le bit 23 est a 1, on remplit les bits 24-31
+        a32 = np.where(a32 & 0x800000, a32 | ~0xFFFFFF, a32)
+        arr = a32.astype(np.float32) / 8388608.0
+    elif sampwidth == 4:
+        arr = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        return None
+
+    # Mono-downmix : moyenne des canaux
+    if n_channels > 1:
+        arr = arr.reshape(-1, n_channels).mean(axis=1)
+
+    # Resampling lineaire vers 48 kHz. La qualite est suffisante pour des
+    # bips courts (<100ms typiquement) ; pas la peine d'embarquer scipy
+    # juste pour ca.
+    if framerate != SAMPLE_RATE:
+        n_in  = arr.shape[0]
+        n_out = int(round(n_in * SAMPLE_RATE / framerate))
+        if n_out <= 0:
+            return None
+        # np.interp attend des x croissants : on construit x_in [0..n_in-1]
+        # et x_out [0..n_in-1] resampled a n_out points.
+        x_out = np.linspace(0.0, n_in - 1, num=n_out, dtype=np.float32)
+        arr = np.interp(x_out, np.arange(n_in, dtype=np.float32),
+                        arr.astype(np.float32)).astype(np.float32)
+    else:
+        arr = arr.astype(np.float32)
+
+    # Clip defensif (eviter les debordements > 1.0 dus a une conversion
+    # imprecise sur certains WAV exotiques).
+    np.clip(arr, -1.0, 1.0, out=arr)
+    return arr
 
 
 # ---------------------------------------------
@@ -978,6 +1073,27 @@ class AudioIO:
                                                   fade_ms=8, amplitude=0.0875)
         self._beep_release = self._generate_beep(freq_hz=440.0, duration_ms=60,
                                                   fade_ms=8, amplitude=0.125)
+        # Bips PTT personnalisables : si l'utilisateur a choisi des WAV
+        # custom via l'UI, ils sont stockes dans <client_dir>/sounds/
+        # et auto-charges au boot. Si None, on retombe sur les bips
+        # synthetiques ci-dessus. _beep_volume est un multiplicateur global
+        # 0.0-1.0 applique a la lecture (sur synth comme sur custom).
+        self._beep_press_custom:   "np.ndarray | None" = None
+        self._beep_release_custom: "np.ndarray | None" = None
+        self._beep_volume = 1.0
+        # Auto-load des fichiers presents dans <client_dir>/sounds/ a l'init.
+        # Echec silencieux : si un WAV est corrompu, on le laisse de cote et
+        # on retombe sur le synth. L'UI peut detecter via has_custom_beep().
+        for kind, fname in (("press", "ptt_press.wav"),
+                            ("release", "ptt_release.wav")):
+            p = _SOUNDS_DIR / fname
+            if p.exists():
+                arr = _load_wav_as_mono_48k(p)
+                if arr is not None and arr.size > 0:
+                    if kind == "press":
+                        self._beep_press_custom = arr
+                    else:
+                        self._beep_release_custom = arr
 
         # Soundboard (v0.2 alpha 029). Joue un fichier WAV local mixe dans
         # le flux de sortie (comme le bip), avec son propre buffer et son
@@ -2080,16 +2196,29 @@ class AudioIO:
         """Joue un bip local (entendu uniquement par l'utilisateur dans son
         casque). Utilise pour le feedback PTT : confirme que la touche radio
         est bien prise en compte.
-          kind = "press"   -> bip aigu (880 Hz, 80ms)
-          kind = "release" -> bip grave (440 Hz, 60ms)
+          kind = "press"   -> bip aigu (880 Hz, 80ms) ou WAV custom
+          kind = "release" -> bip grave (440 Hz, 60ms) ou WAV custom
         Le bip est mixe dans le flux de sortie audio par _on_output_block.
         Si un bip est deja en cours, le nouveau l'ecrase (pas de file d'attente).
+        Si un WAV custom a ete charge pour ce kind (cf load_custom_beep),
+        il est joue a la place du synth. Le volume global _beep_volume est
+        applique a la lecture (multiplicateur sur l'amplitude).
         """
         with self._lock:
             if kind == "release":
-                self._beep_buffer = self._beep_release
+                src = self._beep_release_custom \
+                    if self._beep_release_custom is not None \
+                    else self._beep_release
             else:
-                self._beep_buffer = self._beep_press
+                src = self._beep_press_custom \
+                    if self._beep_press_custom is not None \
+                    else self._beep_press
+            # Multiplier in-place serait dangereux (modifierait le synth
+            # source). On copie. Cout = quelques milliers de floats, OK.
+            if self._beep_volume == 1.0:
+                self._beep_buffer = src
+            else:
+                self._beep_buffer = (src * self._beep_volume).astype(np.float32)
             self._beep_idx = 0
 
     # -----------------------------------------
@@ -2305,6 +2434,84 @@ class AudioIO:
     def is_capture_muted(self) -> bool:
         """Retourne True si le micro est actuellement coupe par l'overlay."""
         return self._capture_muted
+
+    # -----------------------------------------
+    # Bips PTT custom (WAV utilisateur + volume global)
+    # -----------------------------------------
+    # Permet de remplacer les bips synthetiques par defaut par un WAV
+    # choisi via l'UI ("Sons PTT" dans l'onglet Audio). Le buffer est
+    # decode et resample une fois au chargement ; play_local_beep() pioche
+    # dans _beep_<kind>_custom si present, sinon dans le synth. _beep_volume
+    # est un multiplicateur additionnel applique a la lecture, en sus du
+    # slider "Bip radio" (_beep_volume_factor) qui agit cote mixage output.
+
+    def load_custom_beep(self, kind: str, src_path: "str | Path") -> bool:
+        """Charge un WAV en bip PTT custom pour `kind` ('press' ou 'release').
+
+        Effets de bord :
+          - Decode et resample le WAV (cf _load_wav_as_mono_48k).
+          - Copie le fichier source vers <client_dir>/sounds/ptt_<kind>.wav
+            pour qu'il survive aux redemarrages (auto-charge a l'init).
+          - Met a jour self._beep_<kind>_custom avec le buffer en memoire.
+
+        Retourne True si le chargement reussit, False sinon (WAV invalide,
+        trop long, format non supporte, ecriture impossible). L'UI doit
+        afficher un message d'erreur generique en cas d'echec, sans details
+        (le test "fichier corrompu" du QA renvoie False sans crasher)."""
+        if kind not in ("press", "release"):
+            return False
+        arr = _load_wav_as_mono_48k(src_path)
+        if arr is None or arr.size == 0:
+            return False
+        try:
+            _SOUNDS_DIR.mkdir(parents=True, exist_ok=True)
+            dst = _SOUNDS_DIR / f"ptt_{kind}.wav"
+            # Copie atomique-ish : on ecrit le fichier dans son emplacement
+            # final. shutil.copyfile suffit ici (pas de rename pour eviter
+            # cross-device issues sur certaines configs Windows).
+            shutil.copyfile(str(src_path), str(dst))
+        except OSError:
+            return False
+        with self._lock:
+            if kind == "press":
+                self._beep_press_custom = arr
+            else:
+                self._beep_release_custom = arr
+        return True
+
+    def clear_custom_beep(self, kind: str) -> bool:
+        """Supprime le WAV custom pour `kind` ('press' ou 'release') et
+        revient au bip synthetique par defaut. Best-effort : retourne True
+        meme si le fichier sur disque n'existait pas."""
+        if kind not in ("press", "release"):
+            return False
+        try:
+            (_SOUNDS_DIR / f"ptt_{kind}.wav").unlink(missing_ok=True)
+        except OSError:
+            pass
+        with self._lock:
+            if kind == "press":
+                self._beep_press_custom = None
+            else:
+                self._beep_release_custom = None
+        return True
+
+    def has_custom_beep(self, kind: str) -> bool:
+        """True si un bip custom est actuellement charge pour `kind`."""
+        if kind == "press":
+            return self._beep_press_custom is not None
+        if kind == "release":
+            return self._beep_release_custom is not None
+        return False
+
+    def set_beep_volume(self, v: float):
+        """Definit le volume des bips PTT (synth ET custom).
+        Plage : 0.0 (muet) a 1.0 (volume natif). Hors plage : clampe."""
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return
+        self._beep_volume = max(0.0, min(1.0, v))
 
     def set_gate_hold_ms(self, hold_ms: int):
         """Duree en ms pendant laquelle le gate reste ouvert apres silence."""

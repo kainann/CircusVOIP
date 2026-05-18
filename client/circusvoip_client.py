@@ -14217,6 +14217,73 @@ class MainWindow(QMainWindow):
         self._refresh_audio_rx_log_info()
         v.addWidget(self.lbl_audio_rx_log_info)
 
+        # ─────────────────────────────────────────────
+        #  Bips PTT personnalisables (Sons PTT)
+        # ─────────────────────────────────────────────
+        # Permet a l'utilisateur de remplacer les bips synthetiques par
+        # ses propres WAV (un pour press, un pour release) et de regler
+        # le volume global des bips. Les WAV sont copies dans
+        # <client_dir>/sounds/ via AudioIO.load_custom_beep.
+        v.addSpacing(8)
+        lbl_section_sons = QLabel("<b>Sons PTT</b>")
+        v.addWidget(lbl_section_sons)
+
+        # Cache l'etat courant (nom de fichier affiche dans le label).
+        # Reli a self.lbl_beep_press_name / self.lbl_beep_release_name.
+        self.lbl_beep_press_name   = QLabel("(bip synthetique par defaut)")
+        self.lbl_beep_release_name = QLabel("(bip synthetique par defaut)")
+        for lbl in (self.lbl_beep_press_name, self.lbl_beep_release_name):
+            lbl.setStyleSheet("color: #888;")
+
+        # ---- Bip press ----
+        h_press = QHBoxLayout()
+        h_press.addWidget(QLabel("Bip press :"))
+        h_press.addWidget(self.lbl_beep_press_name, stretch=1)
+        btn_press_pick   = QPushButton("Parcourir...")
+        btn_press_reset  = QPushButton("Reinitialiser")
+        btn_press_test   = QPushButton("Tester")
+        btn_press_pick.clicked.connect(lambda: self._on_pick_beep("press"))
+        btn_press_reset.clicked.connect(lambda: self._on_reset_beep("press"))
+        btn_press_test.clicked.connect(lambda: self._on_test_beep("press"))
+        h_press.addWidget(btn_press_pick)
+        h_press.addWidget(btn_press_reset)
+        h_press.addWidget(btn_press_test)
+        v.addLayout(h_press)
+
+        # ---- Bip release ----
+        h_release = QHBoxLayout()
+        h_release.addWidget(QLabel("Bip release :"))
+        h_release.addWidget(self.lbl_beep_release_name, stretch=1)
+        btn_release_pick   = QPushButton("Parcourir...")
+        btn_release_reset  = QPushButton("Reinitialiser")
+        btn_release_test   = QPushButton("Tester")
+        btn_release_pick.clicked.connect(lambda: self._on_pick_beep("release"))
+        btn_release_reset.clicked.connect(lambda: self._on_reset_beep("release"))
+        btn_release_test.clicked.connect(lambda: self._on_test_beep("release"))
+        h_release.addWidget(btn_release_pick)
+        h_release.addWidget(btn_release_reset)
+        h_release.addWidget(btn_release_test)
+        v.addLayout(h_release)
+
+        # ---- Volume slider ----
+        # Plage UI 0..100 (%) ; on stocke en config 0.0..1.0. Defaut 100%
+        # (volume natif du WAV / synth). L'utilisateur peut couper en
+        # mettant 0, ou attenuer pour les bips qui paraissent trop forts.
+        h_vol = QHBoxLayout()
+        h_vol.addWidget(QLabel("Volume bips :"))
+        self.sl_beep_volume = QSlider(Qt.Horizontal)
+        self.sl_beep_volume.setRange(0, 100)
+        try:
+            initial_vol = int(float(self._cfg.get("beep_volume", 1.0)) * 100)
+        except (TypeError, ValueError):
+            initial_vol = 100
+        self.sl_beep_volume.setValue(max(0, min(100, initial_vol)))
+        self.lbl_beep_volume_val = QLabel(f"{self.sl_beep_volume.value()}%")
+        self.sl_beep_volume.valueChanged.connect(self._on_beep_volume_changed)
+        h_vol.addWidget(self.sl_beep_volume, stretch=1)
+        h_vol.addWidget(self.lbl_beep_volume_val)
+        v.addLayout(h_vol)
+
         parent_layout.addWidget(box)
 
     def _apply_vu_style(self, level_0_100: int):
@@ -14590,6 +14657,20 @@ class MainWindow(QMainWindow):
                         self._on_log(
                             f"[AUDIO RX LOG] Echec reactivation au boot : {e}"
                         )
+                # Volume des bips PTT (persiste dans la config). AudioIO
+                # auto-charge deja les WAV custom presents sur disque dans
+                # son __init__, donc rien d'autre a faire pour les bips.
+                try:
+                    saved_vol = float(self._cfg.get("beep_volume", 1.0))
+                    state.audio_io.set_beep_volume(saved_vol)
+                except (TypeError, ValueError):
+                    pass
+                # Rafraichir les labels "Sons PTT" maintenant qu'on connait
+                # l'etat reel des custom beeps cote audio_io.
+                try:
+                    self._refresh_beep_labels()
+                except Exception:
+                    pass
             except Exception as e:
                 self._on_log(f"[AUDIO] set_mic_gain/gate KO : {e}")
 
@@ -14748,6 +14829,107 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
         self._cfg["phone_ring_volume"] = value
+
+    # ─────────────────────────────────────────────
+    #  Bips PTT personnalisables
+    # ─────────────────────────────────────────────
+    def _on_pick_beep(self, kind: str):
+        """Ouvre un QFileDialog pour selectionner un WAV custom.
+        kind = 'press' ou 'release'."""
+        if state.audio_io is None:
+            QMessageBox.information(
+                self, "CircusVOIP",
+                "Le module audio n'est pas initialise."
+            )
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Choisir un bip {kind} (WAV)",
+            "",
+            "Fichiers WAV (*.wav)"
+        )
+        if not path:
+            return
+        try:
+            ok = state.audio_io.load_custom_beep(kind, path)
+        except Exception as e:
+            self._on_log(f"[BEEP] load KO ({kind}) : {e}")
+            ok = False
+        if not ok:
+            QMessageBox.warning(
+                self, "Bip invalide",
+                "Impossible de charger ce WAV.\n"
+                "Verifie qu'il s'agit d'un PCM mono ou stereo, duree <= 5s."
+            )
+            return
+        # Persist le flag pour qu'au prochain boot l'UI affiche le bon
+        # statut (le fichier sera reloade automatiquement par AudioIO).
+        self._cfg[f"beep_{kind}_custom"] = True
+        self._refresh_beep_labels()
+        self._on_log(f"[BEEP] {kind} custom charge depuis : {path}")
+
+    def _on_reset_beep(self, kind: str):
+        """Retire le WAV custom et revient au bip synthetique."""
+        if state.audio_io is not None:
+            try:
+                state.audio_io.clear_custom_beep(kind)
+            except Exception as e:
+                self._on_log(f"[BEEP] clear KO ({kind}) : {e}")
+        self._cfg[f"beep_{kind}_custom"] = False
+        self._refresh_beep_labels()
+        self._on_log(f"[BEEP] {kind} reinitialise (synth)")
+
+    def _on_test_beep(self, kind: str):
+        """Joue le bip selectionne (custom ou synth) pour audition."""
+        if state.audio_io is None:
+            QMessageBox.information(
+                self, "CircusVOIP",
+                "Le module audio n'est pas initialise."
+            )
+            return
+        try:
+            state.audio_io.play_local_beep(kind)
+        except Exception as e:
+            self._on_log(f"[BEEP] play KO ({kind}) : {e}")
+
+    def _on_beep_volume_changed(self, value: int):
+        """Slider 0..100 -> volume audio_io 0.0..1.0 + persistance config."""
+        vol = max(0, min(100, int(value))) / 100.0
+        if state.audio_io is not None:
+            try:
+                state.audio_io.set_beep_volume(vol)
+            except Exception as e:
+                self._on_log(f"[BEEP] set_volume KO : {e}")
+        if hasattr(self, "lbl_beep_volume_val"):
+            self.lbl_beep_volume_val.setText(f"{int(value)}%")
+        self._cfg["beep_volume"] = vol
+
+    def _refresh_beep_labels(self):
+        """Met a jour les labels 'bip press / release' selon l'etat actuel
+        de AudioIO.has_custom_beep()."""
+        if state.audio_io is None:
+            return
+        try:
+            press_custom   = bool(state.audio_io.has_custom_beep("press"))
+            release_custom = bool(state.audio_io.has_custom_beep("release"))
+        except Exception:
+            return
+        if hasattr(self, "lbl_beep_press_name"):
+            self.lbl_beep_press_name.setText(
+                "ptt_press.wav (custom)" if press_custom
+                else "(bip synthetique par defaut)"
+            )
+            self.lbl_beep_press_name.setStyleSheet(
+                "color: #c9d1d9;" if press_custom else "color: #888;"
+            )
+        if hasattr(self, "lbl_beep_release_name"):
+            self.lbl_beep_release_name.setText(
+                "ptt_release.wav (custom)" if release_custom
+                else "(bip synthetique par defaut)"
+            )
+            self.lbl_beep_release_name.setStyleSheet(
+                "color: #c9d1d9;" if release_custom else "color: #888;"
+            )
 
     @Slot(bool)
     def _on_mute_toggled(self, checked: bool):

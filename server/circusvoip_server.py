@@ -428,7 +428,7 @@ _PROFILES_FILE = _BASE_DIR / "circusvoip_profiles.json"
 _profiles: list = []
 
 # Liste des broadcasters : joueurs autorises a parler simultanement sur TOUS
-# les canaux radio (PTT diffusion globale, flag audio 0x03). L'admin gere la
+# les canaux radio (PTT diffusion globale, flag audio 0x04). L'admin gere la
 # liste via grant_broadcaster / revoke_broadcaster. La capability est
 # propagee au serveur audio via le ticket (cf. AuthRegistry.issue(can_broadcast=)).
 _BROADCASTERS_FILE = _BASE_DIR / "circusvoip_broadcasters.json"
@@ -1603,7 +1603,7 @@ async def handler(ws):
                 # le serveur audio. Le serveur audio relira ce fichier au
                 # moment du join audio pour valider le ticket presente.
                 # can_broadcast est lu cote audio pour autoriser les frames
-                # avec flag 0x03 (PTT diffusion globale). Si le role est
+                # avec flag 0x04 (PTT diffusion globale). Si le role est
                 # revoque pendant que le joueur est connecte, la revocation
                 # ne s'applique qu'au prochain ticket (TTL <= 120s).
                 _auth_registry.issue(

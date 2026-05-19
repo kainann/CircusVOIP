@@ -162,6 +162,21 @@ choses :
 - **Radio par profil** : une touche dédiée émet vers tous les joueurs
   ayant le même profil que vous, peu importe leur canal et leur position.
 
+### Diffusion globale (rôle broadcaster)
+Un joueur à qui l'admin a accordé le rôle **broadcaster** dispose d'une
+touche PTT supplémentaire qui diffuse sa voix sur **tous les canaux
+radio simultanément**, peu importe le canal des destinataires. Utile
+pour les modérateurs et organisateurs d'événements RP qui doivent
+adresser tout le serveur sans imposer un canal commun.
+
+L'admin gère la liste via la console admin (commandes
+`grant_broadcaster <nom>` / `revoke_broadcaster <nom>` /
+`list_broadcasters`). La capability est embarquée dans le ticket
+d'authentification audio : la révocation devient effective au prochain
+ticket (≤ 2 min en pratique). Un client connecté à un serveur trop
+ancien (sans `server_caps: ["broadcast_all"]` dans le welcome) voit
+simplement la touche sans effet — aucune trame n'est émise.
+
 ### Mode RP (Roleplay)
 Quand activé, le filtre radio est appliqué sur la voip de proximité
 **uniquement si les deux joueurs portent leur casque dans Star
@@ -221,6 +236,9 @@ Dans les paramètres du client, définissez :
 - **Touche radio (PTT)** : à maintenir pour parler sur votre canal radio
 - **Touche profile radio** : à maintenir pour parler à tous les joueurs
   de votre profil
+- **Touche diffusion globale (PTT)** : à maintenir pour diffuser à tous
+  les canaux (réservée aux broadcasters — sans le rôle, la touche reste
+  silencieuse côté serveur)
 - **Cycle channel key** : pour changer rapidement de canal sans alt-tab
 
 N'importe quelle touche ou combinaison de 2 touches clavier ou bouton

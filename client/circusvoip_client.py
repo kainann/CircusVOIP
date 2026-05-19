@@ -1748,8 +1748,8 @@ _CORE_MANAGED_CFG_KEYS = frozenset({
     "gamelog_path",
     # Mode RP
     "rp_mode",
-    # Hotkeys (8 raccourcis + 5 CircusPhone D4)
-    "radio_key", "profile_radio_key",
+    # Hotkeys (9 raccourcis + 5 CircusPhone D4)
+    "radio_key", "profile_radio_key", "broadcast_all_key",
     "mute_mic_key", "mute_prox_key", "mute_radio_key", "mute_all_key",
     "proximity_short_key", "cycle_channel_key",
     "phone_open_key", "phone_accept_key", "phone_decline_key",
@@ -2239,6 +2239,11 @@ else:
         last_radio_seen_ts: dict = {}
         profile_radio_key = None
         profile_radio_active = False
+        # [BROADCAST_ALL] PTT diffusion globale + capabilities serveur
+        broadcast_all_key    = None
+        broadcast_all_active = False
+        server_supports_broadcast_all = False
+        is_broadcaster                = False
         cycle_channel_key = None
         # Overlays
         overlays_show = False
@@ -2541,6 +2546,13 @@ class NetWorker(QObject):
                 sb_allowed = bool(data.get("soundboard_allowed", False))
                 state.my_profile_soundboard_allowed = sb_allowed
                 self.sig_my_perm_changed.emit("soundboard_allowed", sb_allowed)
+                # [BROADCAST_ALL] Capabilities serveur + role broadcaster.
+                # Le client n'active sa touche PTT diffusion globale que si
+                # le serveur l'annonce dans server_caps ET que l'admin a
+                # accorde le role a ce joueur. Sinon : touche grisee.
+                server_caps = data.get("server_caps") or []
+                state.server_supports_broadcast_all = "broadcast_all" in server_caps
+                state.is_broadcaster = bool(data.get("is_broadcaster", False))
             except Exception as e:
                 if _CORE_AVAILABLE:
                     try:
@@ -11093,9 +11105,10 @@ class MainWindow(QMainWindow):
             parent_layout.addLayout(h)
             return val_lbl
 
-        self.lbl_radio_key      = _make_key_row(v_radio, "Radio canal (PTT) :",      "radio")
-        self.lbl_profile_key    = _make_key_row(v_radio, "Radio profil (PTT) :",     "profile")
-        self.lbl_mute_mic_key   = _make_key_row(v_radio, "Mute micro :",             "mute_mic")
+        self.lbl_radio_key         = _make_key_row(v_radio, "Radio canal (PTT) :",         "radio")
+        self.lbl_profile_key       = _make_key_row(v_radio, "Radio profil (PTT) :",        "profile")
+        self.lbl_broadcast_all_key = _make_key_row(v_radio, "Diffusion globale (PTT) :",   "broadcast_all")
+        self.lbl_mute_mic_key      = _make_key_row(v_radio, "Mute micro :",                "mute_mic")
         self.lbl_mute_prox_key  = _make_key_row(v_radio, "Mute audio proximite :",   "mute_prox")
         self.lbl_mute_radio_key = _make_key_row(v_radio, "Mute audio radio :",       "mute_radio")
         self.lbl_mute_all_key   = _make_key_row(v_radio, "Mute tout :",              "mute_all")
@@ -13333,20 +13346,21 @@ class MainWindow(QMainWindow):
             return
         # Liste de tuples (attr_label, attr_state)
         rows = [
-            ("lbl_radio_key",      "radio_key"),
-            ("lbl_profile_key",    "profile_radio_key"),
-            ("lbl_mute_mic_key",   "mute_mic_key"),
-            ("lbl_mute_prox_key",  "mute_prox_key"),
-            ("lbl_mute_radio_key", "mute_radio_key"),
-            ("lbl_mute_all_key",   "mute_all_key"),
-            ("lbl_prox_short_key", "proximity_short_key"),
-            ("lbl_cycle_ch_key",   "cycle_channel_key"),
+            ("lbl_radio_key",          "radio_key"),
+            ("lbl_profile_key",        "profile_radio_key"),
+            ("lbl_broadcast_all_key",  "broadcast_all_key"),
+            ("lbl_mute_mic_key",       "mute_mic_key"),
+            ("lbl_mute_prox_key",      "mute_prox_key"),
+            ("lbl_mute_radio_key",     "mute_radio_key"),
+            ("lbl_mute_all_key",       "mute_all_key"),
+            ("lbl_prox_short_key",     "proximity_short_key"),
+            ("lbl_cycle_ch_key",       "cycle_channel_key"),
             # CircusPhone (D4 etape 4)
-            ("lbl_phone_open_key",    "phone_open_key"),
-            ("lbl_phone_accept_key",  "phone_accept_key"),
-            ("lbl_phone_decline_key", "phone_decline_key"),
-            ("lbl_phone_mute_key",    "phone_mute_key"),
-            ("lbl_phone_speaker_key", "phone_speaker_key"),
+            ("lbl_phone_open_key",     "phone_open_key"),
+            ("lbl_phone_accept_key",   "phone_accept_key"),
+            ("lbl_phone_decline_key",  "phone_decline_key"),
+            ("lbl_phone_mute_key",     "phone_mute_key"),
+            ("lbl_phone_speaker_key",  "phone_speaker_key"),
         ]
         for lbl_attr, state_attr in rows:
             lbl = getattr(self, lbl_attr, None)
@@ -13626,13 +13640,14 @@ class MainWindow(QMainWindow):
             return
         # kind -> (label dialog, attribut state, cle config)
         kinds = {
-            "radio":         ("Radio canal (PTT)",     "radio_key",           "radio_key"),
-            "profile":       ("Radio profil (PTT)",    "profile_radio_key",   "profile_radio_key"),
-            "mute_mic":      ("Mute micro (toggle)",   "mute_mic_key",        "mute_mic_key"),
-            "mute_prox":     ("Mute audio proximite",  "mute_prox_key",       "mute_prox_key"),
-            "mute_radio":    ("Mute audio radio",      "mute_radio_key",      "mute_radio_key"),
-            "mute_all":      ("Mute tout",              "mute_all_key",        "mute_all_key"),
-            "prox_short":    ("Proximite 30m / 5m",    "proximity_short_key", "proximity_short_key"),
+            "radio":         ("Radio canal (PTT)",            "radio_key",           "radio_key"),
+            "profile":       ("Radio profil (PTT)",           "profile_radio_key",   "profile_radio_key"),
+            "broadcast_all": ("Diffusion globale (PTT)",      "broadcast_all_key",   "broadcast_all_key"),
+            "mute_mic":      ("Mute micro (toggle)",          "mute_mic_key",        "mute_mic_key"),
+            "mute_prox":     ("Mute audio proximite",         "mute_prox_key",       "mute_prox_key"),
+            "mute_radio":    ("Mute audio radio",             "mute_radio_key",      "mute_radio_key"),
+            "mute_all":      ("Mute tout",                    "mute_all_key",        "mute_all_key"),
+            "prox_short":    ("Proximite 30m / 5m",           "proximity_short_key", "proximity_short_key"),
             "cycle_channel": ("Cycle canal radio",     "cycle_channel_key",   "cycle_channel_key"),
             # CircusPhone (D4 etape 4)
             "phone_open":    ("Ouvrir / Fermer telephone", "phone_open_key",   "phone_open_key"),
@@ -16033,6 +16048,7 @@ class MainWindow(QMainWindow):
                     return k  # fallback : laisser la valeur brute
             state.radio_key            = _canon(core_cfg.get("radio_key"))
             state.profile_radio_key    = _canon(core_cfg.get("profile_radio_key"))
+            state.broadcast_all_key    = _canon(core_cfg.get("broadcast_all_key"))
             state.mute_mic_key         = _canon(core_cfg.get("mute_mic_key"))
             state.mute_prox_key        = _canon(core_cfg.get("mute_prox_key"))
             state.mute_radio_key       = _canon(core_cfg.get("mute_radio_key"))
@@ -16575,6 +16591,7 @@ class MainWindow(QMainWindow):
                             "zone_source",
                             "radio_key",
                             "profile_radio_key",
+                            "broadcast_all_key",
                             "mute_mic_key",
                             "mute_prox_key",
                             "mute_radio_key",

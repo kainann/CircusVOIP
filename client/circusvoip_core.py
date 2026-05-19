@@ -738,6 +738,19 @@ class State:
     # Touche du PTT profil (similaire a radio_key)
     profile_radio_key    = None
     profile_radio_active = False
+    # Touche du PTT diffusion globale (broadcaster). Quand maintenue, la
+    # voix est emise avec flag audio 0x03, relayee par le serveur audio
+    # a TOUS les clients quels que soient leurs canaux. Reservee aux
+    # joueurs ayant le role broadcaster (cf welcome.is_broadcaster).
+    broadcast_all_key    = None
+    broadcast_all_active = False
+    # Etat negocie au welcome :
+    #   server_supports_broadcast_all : True si le serveur expose 'broadcast_all'
+    #     dans welcome.server_caps. Permet de griser la touche cote UI
+    #     sur les anciens serveurs.
+    #   is_broadcaster : True si l'admin a accorde le role au joueur courant.
+    server_supports_broadcast_all = False
+    is_broadcaster                = False
     # Touche pour cycler les canaux (descente, boucle en haut)
     cycle_channel_key    = None
     # CircusPhone (D4 etape 4) : 5 raccourcis configurables.
@@ -1256,6 +1269,9 @@ class RadioKeyListener:
         # Idem pour le PTT profil (independant du release_gen radio classique)
         self._profile_release_gen  = 0
         self._profile_release_lock = threading.Lock()
+        # Idem pour le PTT diffusion globale (broadcaster, flag 0x04)
+        self._broadcast_release_gen  = 0
+        self._broadcast_release_lock = threading.Lock()
 
     def _on_radio_pressed(self):
         """Appele quand la touche/bouton radio est enfonce.
@@ -1488,6 +1504,80 @@ class RadioKeyListener:
             except Exception:
                 pass
 
+    # ---- PTT diffusion globale (broadcaster, flag 0x04) ----
+    # Au press : active broadcast_all_active + radio_active (pour que les
+    #            trames audio sortent avec effet radio cote receveur).
+    # Au release : timer differe avec linger comme la radio classique.
+    # Pas de switch de canal, pas de callback UI metier : juste un beep et
+    # un flag d'etat. Le serveur audio enforce la capability ; le client
+    # n'envoie rien si server_supports_broadcast_all=False ou is_broadcaster=False
+    # (cf _on_audio_captured).
+
+    def _on_broadcast_pressed_impl(self):
+        """Press de la touche PTT diffusion globale."""
+        with self._broadcast_release_lock:
+            self._broadcast_release_gen += 1
+        state.broadcast_all_active = True
+        # Activer radio_active : le rendu local (effet radio sur les autres)
+        # depend de ce flag dans la chaine audio. Eviter qu'une diffusion
+        # globale arrive en proximity et perde l'effet radio.
+        state.radio_active = True
+        try:
+            _dbg_log(
+                f"[BROADCAST PTT] press "
+                f"(supported={state.server_supports_broadcast_all}, "
+                f"role={state.is_broadcaster})"
+            )
+        except Exception:
+            pass
+        if state.audio_io is not None:
+            try:
+                state.audio_io.set_gate_force_open(True)
+                state.audio_io.play_local_beep("press")
+            except Exception:
+                pass
+
+    def _on_broadcast_released_impl(self):
+        """Release de la touche PTT diffusion globale, avec linger pour
+        ne pas couper net en cas de re-press immediat."""
+        with self._broadcast_release_lock:
+            self._broadcast_release_gen += 1
+            my_gen = self._broadcast_release_gen
+        try:
+            _dbg_log("[BROADCAST PTT] release")
+        except Exception:
+            pass
+        if state.audio_io is not None:
+            try:
+                state.audio_io.set_gate_force_open(False)
+                state.audio_io.force_gate_close()
+                state.audio_io.play_local_beep("release")
+            except Exception:
+                pass
+        n_dropped = _flush_audio_send_queue()
+        if n_dropped > 0:
+            try:
+                _dbg_log(f"[BROADCAST PTT] release flush: {n_dropped} trames jetees")
+            except Exception:
+                pass
+
+        def _delayed_off():
+            time.sleep(RADIO_RELEASE_LINGER_MS / 1000.0)
+            with self._broadcast_release_lock:
+                if my_gen != self._broadcast_release_gen:
+                    return
+            state.broadcast_all_active = False
+            # Couper radio_active SAUF si une autre PTT est encore tenue
+            # (PTT radio classique ou PTT profil). Meme logique que pour
+            # le release du PTT profil.
+            rk = state.radio_key or ""
+            pk = state.profile_radio_key or ""
+            held_radio   = rk and _combo_matches_pressed(rk, self._currently_pressed)
+            held_profile = pk and _combo_matches_pressed(pk, self._currently_pressed)
+            if not (held_radio or held_profile):
+                state.radio_active = False
+        threading.Thread(target=_delayed_off, daemon=True).start()
+
     def _normalize_key(self, key):
         """Transforme un event pynput clavier en chaine comparable.
         Delegue a la fonction module-level _normalize_pynput_key pour que la
@@ -1602,6 +1692,11 @@ class RadioKeyListener:
         if pk and _combo_matches_pressed(pk, self._currently_pressed, key_str):
             if not state.profile_radio_active:
                 self._on_profile_radio_pressed_impl()
+        # PTT diffusion globale (broadcaster)
+        bk = state.broadcast_all_key or ""
+        if bk and _combo_matches_pressed(bk, self._currently_pressed, key_str):
+            if not state.broadcast_all_active:
+                self._on_broadcast_pressed_impl()
 
     def _check_ptt_release(self, key_str):
         """Verifie si une combo PTT vient d'etre rompue par le release
@@ -1630,6 +1725,11 @@ class RadioKeyListener:
         if pk and state.profile_radio_active and \
                 not _combo_matches_pressed(pk, self._currently_pressed):
             self._on_profile_radio_released_impl()
+        # PTT diffusion globale : si actif et combo plus satisfaite -> release
+        bk = state.broadcast_all_key or ""
+        if bk and state.broadcast_all_active and \
+                not _combo_matches_pressed(bk, self._currently_pressed):
+            self._on_broadcast_released_impl()
 
     def _on_press(self, key):
         n = self._normalize_key(key)
@@ -2287,11 +2387,16 @@ async def _audio_ws_loop(ui, my_gen: int = 0):
                             #   0x01 = radio classique (PTT canal)
                             #   0x02 = radio profil (PTT profil)
                             #   0x03 = voix telephone CircusPhone (D3)
+                            #   0x04 = diffusion globale (broadcaster, tous canaux)
                             flag = payload[0]
-                            is_radio_canal  = (flag == 1)
-                            is_radio_profil = (flag == 2)
-                            is_phone        = (flag == 3)
-                            is_radio = is_radio_canal or is_radio_profil  # alias pour audio_io
+                            is_radio_canal    = (flag == 1)
+                            is_radio_profil   = (flag == 2)
+                            is_phone          = (flag == 3)
+                            is_broadcast_all  = (flag == 4)
+                            # Pour le rendu local (effet radio, set_user_volume), une
+                            # diffusion globale est traitee comme une radio. Le seul
+                            # ecart : pas de filtrage par canal/profil cote receveur.
+                            is_radio = is_radio_canal or is_radio_profil or is_broadcast_all
                             frame    = payload[1:]
 
                             # ── CircusPhone (D3) : trame voix telephone ──
@@ -2322,7 +2427,7 @@ async def _audio_ws_loop(ui, my_gen: int = 0):
                                     )
                                 continue
 
-                            # Mute radio : coupe les 2 modes radio
+                            # Mute radio : coupe les 3 modes radio (canal/profil/broadcast)
                             if is_radio and state.mute_radio:
                                 continue
                             # Mute proximity : coupe seulement les trames proximity
@@ -2330,7 +2435,15 @@ async def _audio_ws_loop(ui, my_gen: int = 0):
                                 continue
 
                             # FILTRAGE selon le mode :
-                            if is_radio_canal:
+                            if is_broadcast_all:
+                                # Diffusion globale : pas de filtrage cote receveur.
+                                # Le serveur audio a deja verifie que l'emetteur a la
+                                # capability can_broadcast (cf circusvoip_audio_server.py
+                                # autour de FLAG_BROADCAST_ALL). On note quand meme
+                                # le timestamp pour dedup proximity (l'emetteur envoie
+                                # aussi une trame 0x00 a cote pour les joueurs proches).
+                                state.last_radio_seen_ts[sender] = time.monotonic()
+                            elif is_radio_canal:
                                 # Filtre par CANAL : meme canal sinon on jette
                                 sender_ch = state.player_channels.get(sender)
                                 if state.my_channel != sender_ch:
@@ -2526,23 +2639,30 @@ def _on_audio_captured(frame_np):
     On se contente de deposer la trame dans la queue ; l'envoi WS est
     fait par le task _audio_sender dans sa propre boucle asyncio.
 
-    3 modes de transmission selon les PTT actifs :
+    Modes de transmission selon les PTT actifs (priorite descendante) :
+      - CircusPhone (state.phone_in_call) : flag 0x03 (telephone)
+        Voir bloc CircusPhone plus bas pour les regles HP.
+      - PTT diffusion globale (state.broadcast_all_active) : flag 0x04
+        Reserve aux broadcasters. Si le serveur ne supporte pas la feature
+        (server_supports_broadcast_all=False) ou si le joueur n'a pas le
+        role (is_broadcaster=False), on ne tente pas : la trame serait
+        droppee par le serveur audio mais on evite le bruit reseau.
       - PTT profil (state.profile_radio_active)  : flag 0x02 (radio profil)
       - PTT radio  (state.radio_active sans profil) : flag 0x01 (radio canal)
       - Aucun                                       : flag 0x00 (proximity)
 
-    Quand on est en PTT radio OU PTT profil, on envoie en plus une trame
-    proximity (0x00) en parallele SI un joueur est a portee. Ca permet aux
-    joueurs a cote (mais pas sur le canal/profil) d'entendre ma voix en
-    proximite. Le receveur depulique via state.last_radio_seen_ts (50ms).
-    Optimisation : pas de 2e flux si personne a portee.
+    Quand on est en PTT radio / profil / diffusion globale, on envoie en
+    plus une trame proximity (0x00) en parallele SI un joueur est a portee.
+    Ca permet aux joueurs a cote (mais pas sur le canal/profil) d'entendre
+    ma voix en proximite. Le receveur depulique via state.last_radio_seen_ts
+    (50ms). Optimisation : pas de 2e flux si personne a portee.
 
     CircusPhone (D3) : si state.phone_in_call, on est PRIORITAIRE sur la
     radio - la voix part avec le flag 0x03 (telephone) vers le correspondant,
     + une trame proximity 0x00 si quelqu'un est a portee (regle "ma voix
     telephone part aussi dans ma proximite locale, comme un vrai telephone").
-    La radio (PTT canal/profil) est ignoree pendant un appel : le test
-    phone_in_call court-circuite les branches radio.
+    La radio (PTT canal/profil/diffusion) est ignoree pendant un appel : le
+    test phone_in_call court-circuite les branches radio.
     """
     if not state.audio_connected:
         return
@@ -2599,6 +2719,13 @@ def _on_audio_captured(frame_np):
             # quelqu'un est a portee (eco bande passante).
             _put(b"\x03" + frame_bytes)
             if _has_player_in_range() or state.hp_proxies_allowed:
+                _put(b"\x00" + frame_bytes)
+        elif (state.broadcast_all_active
+                and state.server_supports_broadcast_all
+                and state.is_broadcaster):
+            # PTT diffusion globale : flag 0x04 + (eventuellement) proximity
+            _put(b"\x04" + frame_bytes)
+            if _has_player_in_range():
                 _put(b"\x00" + frame_bytes)
         elif state.profile_radio_active:
             # PTT profil : flag 0x02 + (eventuellement) proximity

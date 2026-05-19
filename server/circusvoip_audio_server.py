@@ -169,7 +169,7 @@ class State:
     # pour ne pas casser les lecteurs existants qui parcourent clients comme
     # un simple ws -> name.
     client_caps = {}   # websocket -> {"can_broadcast": bool}
-    # [BROADCAST_ALL] Dernier timestamp ou un refus 0x03 a ete loggue, par ws.
+    # [BROADCAST_ALL] Dernier timestamp ou un refus 0x04 a ete loggue, par ws.
     # Sert a limiter le spam de logs si un client malveillant tient la touche.
     _last_refusal_log = {}
     running = False
@@ -193,7 +193,7 @@ state = State()
 # Le serveur impose can_broadcast=True (lu dans le ticket) pour relayer
 # une trame portant ce flag. Sinon la trame est jetee silencieusement (avec
 # un log rate-limite pour aider au debug sans flooder).
-FLAG_BROADCAST_ALL = 0x03
+FLAG_BROADCAST_ALL = 0x04
 _BROADCAST_REFUSAL_LOG_INTERVAL_SEC = 60.0
 
 # ---------------------------------------------
@@ -258,11 +258,11 @@ async def handler(ws, ui):
                         )
                         state.rate_limit_first_drop_logged[name] = now_log
                     continue
-                # [BROADCAST_ALL] Drop des trames flag 0x03 si l'emetteur
+                # [BROADCAST_ALL] Drop des trames flag 0x04 si l'emetteur
                 # n'a pas la capability. Sans ce filtre, n'importe quel
-                # client pourrait fabriquer une trame 0x03 et etre entendu
+                # client pourrait fabriquer une trame 0x04 et etre entendu
                 # sur tous les canaux radio simultanement (cf filtrage
-                # cote receveur dans circusvoip_core.py qui accepte 0x03
+                # cote receveur dans circusvoip_core.py qui accepte 0x04
                 # sans verifier le canal). On enforce ici parce que c'est
                 # le seul endroit ou on a a la fois la trame ET l'identite
                 # authentifiee de l'emetteur (via le ticket).
@@ -397,7 +397,7 @@ async def handler(ws, ui):
 
 
 def _maybe_log_broadcast_refusal(ws, name: str, peer_ip: str, ui):
-    """Loggue le refus d'une trame 0x03 (PTT diffusion globale) d'un client
+    """Loggue le refus d'une trame 0x04 (PTT diffusion globale) d'un client
     non-broadcaster, en limitant a 1 log par minute par ws pour ne pas
     flooder si un client tient la touche en continu (50 trames/s)."""
     now = time.time()

@@ -1293,6 +1293,7 @@ async def _admin_session(ws):
             # Envoie les dicts complets aux admins (avec permissions).
             # Les clients normaux recoivent juste les noms via welcome.
             "profiles": [dict(p) for p in _profiles if isinstance(p, dict)],
+            "broadcasters": sorted(_broadcasters),
             "players": players_state,
             "anonymous_mode": _anonymous_mode,
             # "server_token" volontairement retire pour ne pas l'exposer
@@ -2584,6 +2585,22 @@ def remove_profile(name: str) -> bool:
     return True
 
 
+def _broadcast_broadcasters_list_threadsafe():
+    """Pousse la liste des broadcasters aux admins (et seulement aux admins).
+    Contrairement aux canaux/profils, la liste des broadcasters est une
+    info admin : pas la peine de l'exposer a tous les clients."""
+    if _loop and _server_running:
+        async def _do():
+            await _broadcast_admins(json.dumps({
+                "type": "broadcasters_list",
+                "broadcasters": sorted(_broadcasters),
+            }))
+        try:
+            asyncio.run_coroutine_threadsafe(_do(), _loop)
+        except Exception:
+            pass
+
+
 def grant_broadcaster(player_name: str) -> bool:
     """Accorde le role broadcaster a `player_name`. Idempotent : renvoie
     True meme si deja accorde, False uniquement sur nom vide. La
@@ -2597,6 +2614,7 @@ def grant_broadcaster(player_name: str) -> bool:
     if player_name not in _broadcasters:
         _broadcasters.add(player_name)
         _save_broadcasters()
+        _broadcast_broadcasters_list_threadsafe()
         _log(f"Broadcaster accorde : {player_name}", GREEN)
     return True
 
@@ -2612,6 +2630,7 @@ def revoke_broadcaster(player_name: str) -> bool:
     if player_name in _broadcasters:
         _broadcasters.discard(player_name)
         _save_broadcasters()
+        _broadcast_broadcasters_list_threadsafe()
         _log(f"Broadcaster revoque : {player_name}", ORANGE)
     return True
 

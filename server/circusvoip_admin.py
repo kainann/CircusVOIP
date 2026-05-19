@@ -95,6 +95,7 @@ class State:
     # Etat repliquant celui du serveur (recu via admin_welcome + push events)
     channels        = []          # list[str]
     profiles        = []          # list[str]
+    broadcasters    = []          # list[str] - role PTT diffusion globale (flag 0x03)
     players         = {}          # {name: {pos, channel, profile, helmet_on, prox_short}}
     anonymous_mode  = False
     server_token    = ""          # token joueur (pour l'afficher dans l'UI admin)
@@ -212,6 +213,7 @@ def _handle_message(ui, data: dict):
         # ou list[dict] avec permissions (nouveau serveur). Normalise
         # toujours en list[dict].
         state.profiles        = _normalize_profiles_list(data.get("profiles", []))
+        state.broadcasters    = list(data.get("broadcasters", []))
         state.anonymous_mode  = bool(data.get("anonymous_mode", False))
         state.server_token    = data.get("server_token", "")
         state.players         = {}
@@ -321,6 +323,10 @@ def _handle_message(ui, data: dict):
         raw = data.get("profiles", [])
         state.profiles = _normalize_profiles_list(raw)
         ui.refresh_profiles()
+
+    elif msg_type == "broadcasters_list":
+        state.broadcasters = list(data.get("broadcasters", []))
+        ui.refresh_broadcasters()
 
     elif msg_type == "anonymous_mode":
         state.anonymous_mode = bool(data.get("active", False))
@@ -536,6 +542,19 @@ class AdminUI:
         btn_add_prof.pack(fill="x", pady=(2, 8))
         btn_add_prof.bind("<Button-1>", lambda e: self._add_profile())
 
+        # Broadcasters : joueurs autorises a parler sur tous les canaux
+        # simultanement (PTT diffusion globale, flag audio 0x03). Liste
+        # tenue par l'admin via grant_broadcaster / revoke_broadcaster.
+        self._section(right, "BROADCASTERS")
+        self._broadcasters_frame = tk.Frame(right, bg=BG_PANEL)
+        self._broadcasters_frame.pack(fill="x", pady=2)
+        btn_add_bc = tk.Label(right, text="+  Ajouter broadcaster",
+                              bg=BORDER, fg=BLUE,
+                              font=("Courier", 9, "bold"), pady=6, padx=8,
+                              cursor="hand2")
+        btn_add_bc.pack(fill="x", pady=(2, 8))
+        btn_add_bc.bind("<Button-1>", lambda e: self._add_broadcaster())
+
         # Token serveur en bas (info admin)
         self._section(right, "TOKEN JOUEUR")
         self._lbl_server_token = tk.Label(right, text="(non connecte)",
@@ -651,6 +670,7 @@ class AdminUI:
         self.refresh_players()
         self.refresh_channels()
         self.refresh_profiles()
+        self.refresh_broadcasters()
         self.refresh_anonymous()
         self._lbl_server_token.config(text=state.server_token or "(non recu)")
 
@@ -766,6 +786,35 @@ class AdminUI:
             "perm_key": perm_key,
             "value":    bool(value),
         })
+
+    def refresh_broadcasters(self):
+        """Reconstruit le panneau BROADCASTERS a partir de state.broadcasters.
+        Mirroring exact de refresh_channels/refresh_profiles : meme structure
+        de rang BG_ROW + bouton ✕ pour retirer."""
+        def _do():
+            for w in self._broadcasters_frame.winfo_children():
+                w.destroy()
+            if not state.broadcasters:
+                tk.Label(self._broadcasters_frame,
+                         text="(aucun broadcaster)\nLes broadcasters peuvent\n"
+                              "parler sur tous les canaux\nsimultanement (PTT global).",
+                         bg=BG_PANEL, fg=MUTED, font=("Courier", 8),
+                         anchor="w", justify="left", padx=4).pack(fill="x")
+                return
+            for name in state.broadcasters:
+                row = tk.Frame(self._broadcasters_frame, bg=BG_ROW,
+                               pady=2, padx=6)
+                row.pack(fill="x", pady=1)
+                tk.Label(row, text=name, bg=BG_ROW, fg=BLUE,
+                         font=("Courier", 9, "bold"), anchor="w"
+                         ).pack(side="left", fill="x", expand=True)
+                btn_del = tk.Label(row, text="✕", bg=BG_ROW, fg=RED,
+                                   font=("Courier", 9, "bold"),
+                                   cursor="hand2", padx=4)
+                btn_del.pack(side="left")
+                btn_del.bind("<Button-1>",
+                             lambda e, n=name: self._remove_broadcaster(n))
+        self._safe_after(_do)
 
     def refresh_players(self):
         def _do():
@@ -962,6 +1011,33 @@ class AdminUI:
                                f"Les joueurs assignes le perdront.",
                                parent=self.root):
             self._send_cmd({"cmd": "remove_profile", "name": name})
+
+    def _add_broadcaster(self):
+        """Accorde le role broadcaster a un joueur (par nom). Le serveur
+        applique le role idempotemment : si le nom existe deja, no-op.
+        La capability ne prend effet qu'au prochain ticket du joueur cible
+        (typiquement 2 min ; lui demander de se reconnecter pour aller plus
+        vite). Cf doc serveur grant_broadcaster()."""
+        n = simpledialog.askstring(
+            "Accorder broadcaster",
+            "Nom du joueur a qui accorder le role broadcaster :\n"
+            "(le joueur doit se reconnecter au serveur pour que sa\n"
+            "capability prenne effet)",
+            parent=self.root,
+        )
+        if n:
+            self._send_cmd({"cmd": "grant_broadcaster", "name": n})
+
+    def _remove_broadcaster(self, name: str):
+        """Retire le role broadcaster. Effectif au prochain ticket du joueur
+        cible (~2 min). Pour revoquer immediatement, kick le joueur en plus."""
+        if messagebox.askyesno(
+            "Retirer broadcaster",
+            f"Retirer le role broadcaster a '{name}' ?\n"
+            f"Effectif a sa prochaine reconnexion (TTL ticket ≤ 2 min).",
+            parent=self.root,
+        ):
+            self._send_cmd({"cmd": "revoke_broadcaster", "name": name})
 
     def _toggle_anonymous(self):
         self._send_cmd({"cmd": "set_anonymous_mode",

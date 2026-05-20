@@ -183,8 +183,20 @@ class AuthRegistry:
 
     def issue(self, name: str, ticket: str):
         """Enregistre un ticket valide pour `name`. Appele par le serveur
-        positions juste avant d'envoyer le welcome au client."""
+        positions juste avant d'envoyer le welcome au client.
+
+        Si un ou plusieurs tickets etaient deja actifs pour ce meme `name`
+        (cas typique : reconnexion rapide avant que le 'finally' du
+        precedent join ait revoque l'ancien ticket), ils sont
+        automatiquement revoques avant d'enregistrer le nouveau. Cela
+        evite qu'un thread audio fantome se reconnecte avec un ticket
+        obsolete et entre en course avec le nouveau."""
         data = self._read_all()
+        # Revoque les tickets actifs pour ce nom (cas reconnexion rapide).
+        to_remove = [t for t, e in data.items()
+                     if isinstance(e, dict) and e.get("name") == name]
+        for t in to_remove:
+            data.pop(t, None)
         data[ticket] = {
             "name": name,
             "expires": time.time() + self.ttl_sec,

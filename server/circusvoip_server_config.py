@@ -7,28 +7,11 @@ Si vide ou absent, un token aleatoire est genere au 1er lancement.
 """
 
 import json
-import os
 import secrets
 import string
 from pathlib import Path
 
-
-def get_data_dir() -> Path:
-    """Dossier ou sont stockes le token, le certificat TLS, les tickets
-    d'auth, la liste des canaux/profils, etc.
-
-    Par defaut : meme dossier que les sources serveur. En conteneur Docker,
-    on definit CIRCUSVOIP_DATA_DIR=/data pour rediriger l'etat vers un
-    volume monte (le code source reste read-only dans l'image)."""
-    env = os.environ.get("CIRCUSVOIP_DATA_DIR")
-    if env:
-        p = Path(env)
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-    return Path(__file__).resolve().parent
-
-
-CONFIG_FILE = get_data_dir() / "circusvoip_server_config.json"
+CONFIG_FILE = Path(__file__).resolve().parent / "circusvoip_server_config.json"
 
 
 def _generate_token(length: int = 16) -> str:

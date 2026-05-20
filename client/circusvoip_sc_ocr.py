@@ -604,13 +604,13 @@ _KNOWN_ZONES_INTERIORS = [
     "levski_v2_middeck",
     "levski_v2_topdeck",
     "levski_v2_lowerdeck",
+    "levski_v2_refindeck",        # refinery deck
     "levski_v2_bottomdeck",       # deck du bas - ajoute 14/05/2026 : sans
                                   # cette entree le fuzzy matcher ne pouvait
                                   # canonicaliser aucune variante OCR
                                   # ("bottondeck", "vz", "tevski"...), d'ou des
                                   # container_id incoherents entre clients et
                                   # des joueurs "hors de portee" a tort.
-    "levski_v2_refindeck",        # refinery deck
     # Hangars Levski Nyx (tailles : small/medium/large/xl - top/front)
     "hangar_xltop_levski_nyx",
     "hangar_xlfront_levski_nyx",
@@ -690,15 +690,6 @@ _KNOWN_ZONES_INTERIORS = [
     "tsg_gascloud_002",
     "tsg_gascloud_003",
     "tsg_gascloud_004",
-    # Encounters Pyro - harvestable object containers (rencontres aleatoires
-    # dans l'espace Pyro, type epaves/conteneurs). Le suffixe "_001" est un
-    # numero d'instance ; SC peut spawner _002, _003 etc. Ajoute 15/05/2026
-    # apres observation logs Kainan : 11 variantes OCR de ce nom long sur
-    # 32 lectures, "cid_similar" ne rattrapait qu'1 fois sur 32 faute
-    # d'ancre canonique dans _KNOWN_ZONES. Memes consequences potentielles
-    # que pour levski_v2_bottomdeck (joueurs "hors de portee" a tort si
-    # leurs OCR convergent vers des variantes differentes).
-    "locationharvestableobjectcontainer_ab_pyro_int_enctr_001",
     # Stations/outposts sur planetes/lunes
     "keeger_segment_social_001",   # outpost type Keeger
     "keeger_segment_social_002",
@@ -846,6 +837,15 @@ _KNOWN_ZONES_INTERIORS = [
     # Refinery deck Pyro (process raffinage minerai). Variante non-pyro
     # (rs_refinery tout court) non observee a date.
     "rs_refinery_pyro",
+    # Encounters Pyro - harvestable object containers (rencontres aleatoires
+    # dans l'espace Pyro, type epaves/conteneurs). Le suffixe "_001" est un
+    # numero d'instance ; SC peut spawner _002, _003 etc. Ajoute 15/05/2026
+    # apres observation logs Kainan : 11 variantes OCR de ce nom long sur
+    # 32 lectures, "cid_similar" ne rattrapait qu'1 fois sur 32 faute
+    # d'ancre canonique dans _KNOWN_ZONES. Memes consequences potentielles
+    # que pour levski_v2_bottomdeck (joueurs "hors de portee" a tort si
+    # leurs OCR convergent vers des variantes differentes).
+    "locationharvestableobjectcontainer_ab_pyro_int_enctr_001",
 ]
 
 # Liste unifiee (conservee pour compat + utilisee par le fuzzy match)
@@ -3081,6 +3081,27 @@ def _ensure_imaging():
         import mss as _m
         _mss = _m
 
+
+# v0.2 (optim perf) : cache MSS thread-local.
+# Avant : `with _mss.mss() as sct:` etait dans capture_region(), recree a
+# chaque appel (-> 10-20 fois/s en jeu). Recreer le contexte GDI Windows
+# coute ~5-10ms a chaque fois.
+# Maintenant : un instance MSS par thread (mss n'est pas thread-safe :
+# .grab() partage un buffer interne, donc instance par thread). On utilise
+# threading.local() qui isole automatiquement les attributs par thread.
+import threading as _threading_mss
+_mss_tls = _threading_mss.local()
+
+def _get_mss_instance():
+    """Retourne un instance mss.mss() unique pour le thread appelant.
+    Cree au 1er appel par thread, reutilise ensuite. Reste vivant jusqu'a
+    la fin du thread (mss.mss() libere ses ressources GDI au gc)."""
+    sct = getattr(_mss_tls, "sct", None)
+    if sct is None:
+        sct = _mss.mss()
+        _mss_tls.sct = sct
+    return sct
+
 # _dbg_save : sauvegarde des images du pipeline OCR pour diagnostic.
 # Reste en no-op tant que enable_debug_screens() n'est pas appele
 # (typiquement par le client via --debug-ocr en ligne de commande).
@@ -3239,10 +3260,12 @@ def capture_region(region):
             except Exception:
                 pass
     try:
-        with _mss.mss() as sct:
-            raw = sct.grab(region)
-            img = _np.frombuffer(raw.bgra, dtype=_np.uint8).reshape(raw.height, raw.width, 4)
-            return _cv2.cvtColor(img, _cv2.COLOR_BGRA2BGR)
+        # v0.2 (optim perf) : MSS reutilise via thread-local cache au lieu
+        # d'etre recree a chaque appel. Voir _get_mss_instance() plus haut.
+        sct = _get_mss_instance()
+        raw = sct.grab(region)
+        img = _np.frombuffer(raw.bgra, dtype=_np.uint8).reshape(raw.height, raw.width, 4)
+        return _cv2.cvtColor(img, _cv2.COLOR_BGRA2BGR)
     finally:
         # Hook post-capture : reactiver le masque, MEME si grab a leve.
         # Le finally garantit qu'on ne laisse jamais le masque cache si

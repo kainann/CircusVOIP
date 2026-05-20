@@ -123,12 +123,13 @@ def _ws_send_safe(payload: dict) -> bool:
 # ---------------------------------------------
 
 async def _ws_client(ui):
-    # [P1 - TLS] Connexion CHIFFREE en wss://.
-    # Le serveur positions utilise un certificat auto-signe (genere
-    # automatiquement). build_client_ssl_context_insecure() construit un
-    # contexte SSL qui accepte ce cert sans verifier l'identite : connexion
-    # chiffree mais pas d'authentification stricte. L'admin s'authentifie
-    # ensuite via le token admin dans le message "auth_admin".
+    # [P1 - TLS] Connexion CHIFFREE en wss:// (alignee avec le client v0.1.1+).
+    # Le serveur positions ecoute uniquement en wss:// depuis v0.1.1 (cert
+    # auto-signe genere automatiquement). build_client_ssl_context_insecure()
+    # construit un contexte SSL qui accepte le cert sans verifier l'identite
+    # (chiffrement OK, pas d'auth stricte du cert). L'auth admin se fait
+    # ensuite via le token dans le message "auth_admin" (compare_digest
+    # cote serveur).
     from circusvoip_security import build_client_ssl_context_insecure
     uri = f"wss://{state.server_ip}:{SERVER_PORT}"
     _ssl_ctx = build_client_ssl_context_insecure()
@@ -163,6 +164,43 @@ async def _ws_client(ui):
         ui.set_status(False, "Deconnecte")
 
 
+def _normalize_profiles_list(raw) -> list:
+    """Normalise la liste de profils recue du serveur en list[dict].
+    Accepte les 2 formats :
+      - list[str] : vieux serveur, ex ["Pilote", "Mecano"].
+        On cree des dicts avec permissions a False.
+      - list[dict] : nouveau serveur, ex
+        [{"name": "Pilote", "soundboard_allowed": true}].
+    Retourne toujours list[dict]."""
+    result = []
+    if not isinstance(raw, list):
+        return result
+    for item in raw:
+        if isinstance(item, str):
+            n = item.strip()
+            if n:
+                # Cree dict avec permissions defaults (toutes False).
+                result.append({
+                    "name": n,
+                    "soundboard_allowed": False,
+                })
+        elif isinstance(item, dict):
+            n = (item.get("name") or "").strip()
+            if not n:
+                continue
+            d = {"name": n}
+            # Recopie les cles connues (False si absentes).
+            d["soundboard_allowed"] = bool(item.get("soundboard_allowed", False))
+            result.append(d)
+    return result
+
+
+def _profile_names() -> list:
+    """Retourne la liste des noms de profils (list[str]) extraite de
+    state.profiles (qui est list[dict])."""
+    return [p["name"] for p in state.profiles if isinstance(p, dict) and p.get("name")]
+
+
 def _handle_message(ui, data: dict):
     """Traite un message recu du serveur."""
     msg_type = data.get("type")
@@ -170,7 +208,10 @@ def _handle_message(ui, data: dict):
     if msg_type == "admin_welcome":
         # Etat initial
         state.channels        = list(data.get("channels", []))
-        state.profiles        = list(data.get("profiles", []))
+        # v0.2 alpha 035 : profiles peut etre list[str] (vieux serveur)
+        # ou list[dict] avec permissions (nouveau serveur). Normalise
+        # toujours en list[dict].
+        state.profiles        = _normalize_profiles_list(data.get("profiles", []))
         state.anonymous_mode  = bool(data.get("anonymous_mode", False))
         state.server_token    = data.get("server_token", "")
         state.players         = {}
@@ -273,7 +314,12 @@ def _handle_message(ui, data: dict):
         ui.refresh_channels()
 
     elif msg_type == "profiles_list":
-        state.profiles = list(data.get("profiles", []))
+        # v0.2 alpha 035 : nouveau format possible : list[dict] avec
+        # permissions (envoye par le serveur quand on est admin auth).
+        # Ancien format possible : list[str] (vieux serveur). On
+        # normalise toujours en list[dict] cote admin.
+        raw = data.get("profiles", [])
+        state.profiles = _normalize_profiles_list(raw)
         ui.refresh_profiles()
 
     elif msg_type == "anonymous_mode":
@@ -660,9 +706,17 @@ class AdminUI:
                 self._refresh_all_player_profile_select()
                 return
             for prof in state.profiles:
-                row = tk.Frame(self._profiles_frame, bg=BG_ROW, pady=2, padx=6)
-                row.pack(fill="x", pady=1)
-                tk.Label(row, text=prof, bg=BG_ROW, fg=PURPLE,
+                # prof est maintenant un dict {"name": str, "soundboard_allowed": bool}
+                prof_name = prof.get("name") if isinstance(prof, dict) else str(prof)
+                if not prof_name:
+                    continue
+                # Bloc englobant pour ce profil (nom + permissions)
+                block = tk.Frame(self._profiles_frame, bg=BG_ROW, pady=2, padx=6)
+                block.pack(fill="x", pady=1)
+                # Ligne 1 : nom du profil + boutons rename/delete
+                row = tk.Frame(block, bg=BG_ROW)
+                row.pack(fill="x")
+                tk.Label(row, text=prof_name, bg=BG_ROW, fg=PURPLE,
                          font=("Courier", 9, "bold"), anchor="w"
                          ).pack(side="left", fill="x", expand=True)
                 btn_ren = tk.Label(row, text="✎", bg=BG_ROW, fg=BLUE,
@@ -670,15 +724,48 @@ class AdminUI:
                                    cursor="hand2", padx=4)
                 btn_ren.pack(side="left")
                 btn_ren.bind("<Button-1>",
-                             lambda e, n=prof: self._rename_profile(n))
+                             lambda e, n=prof_name: self._rename_profile(n))
                 btn_del = tk.Label(row, text="✕", bg=BG_ROW, fg=RED,
                                    font=("Courier", 9, "bold"),
                                    cursor="hand2", padx=4)
                 btn_del.pack(side="left")
                 btn_del.bind("<Button-1>",
-                             lambda e, n=prof: self._remove_profile(n))
+                             lambda e, n=prof_name: self._remove_profile(n))
+                # Ligne 2 : case a cocher "Soundboard autorise"
+                # v0.2 alpha 035. Toggle envoie set_profile_permission
+                # au serveur, qui sauve + push my_profile aux clients.
+                perm_row = tk.Frame(block, bg=BG_ROW)
+                perm_row.pack(fill="x", pady=(2, 0))
+                sb_allowed = bool(prof.get("soundboard_allowed", False)) if isinstance(prof, dict) else False
+                sb_var = tk.BooleanVar(value=sb_allowed)
+                # On stocke la var pour pouvoir l'inspecter, et un flag
+                # pour ignorer le 1er trigger du var lors de la creation.
+                cb = tk.Checkbutton(
+                    perm_row,
+                    text="🔊 Soundboard autorise",
+                    variable=sb_var,
+                    bg=BG_ROW, fg=TEXT, font=("Courier", 8),
+                    activebackground=BG_ROW, activeforeground=TEXT,
+                    selectcolor=BG_PANEL,
+                    relief="flat", bd=0, highlightthickness=0,
+                    cursor="hand2", anchor="w",
+                    command=lambda n=prof_name, v=sb_var:
+                        self._on_toggle_profile_perm(n, "soundboard_allowed", v.get()),
+                )
+                cb.pack(side="left", padx=(12, 0))
             self._refresh_all_player_profile_select()
         self._safe_after(_do)
+
+    def _on_toggle_profile_perm(self, profile_name: str, perm_key: str, value: bool):
+        """Envoie au serveur la modification d'une permission profil.
+        Le serveur sauve, broadcast aux admins (profiles_list) et push
+        my_profile aux clients concernes (v0.2 alpha 035)."""
+        self._send_cmd({
+            "cmd":      "set_profile_permission",
+            "profile":  profile_name,
+            "perm_key": perm_key,
+            "value":    bool(value),
+        })
 
     def refresh_players(self):
         def _do():
@@ -798,7 +885,7 @@ class AdminUI:
 
         tk.Label(prof_frame, text="Profil :", bg=BG_ROW, fg=MUTED,
                  font=("Courier", 8)).pack(side="left", padx=(0, 4))
-        menu = tk.OptionMenu(prof_frame, var, "(aucun)", *state.profiles)
+        menu = tk.OptionMenu(prof_frame, var, "(aucun)", *_profile_names())
         menu.config(bg=BG_PANEL, fg=PURPLE, font=("Courier", 8),
                     activebackground=BORDER, activeforeground=TEXT,
                     relief="flat", bd=0, padx=4, pady=0,

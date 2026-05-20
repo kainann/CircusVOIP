@@ -49,6 +49,10 @@ from circusvoip_server_config import get_token, set_password
 
 # [SECURITE] Module commun (lockout, rate limiting, registre de tickets,
 # helper TLS). Doit etre present dans le meme dossier que ce fichier.
+# Note : l'anti-bruteforce IP est deja gere par _record_auth_failure /
+# _auth_failures / _auth_banned plus bas (legacy mais fonctionnel), donc
+# on n'utilise PAS AuthLockout ici - juste AuthRegistry (auth partagee
+# avec le serveur audio) et RateLimiter (anti-flood messages).
 from circusvoip_security import AuthRegistry, RateLimiter
 
 # ─────────────────────────────────────────────
@@ -58,7 +62,7 @@ from circusvoip_security import AuthRegistry, RateLimiter
 # [P1 - TLS] HOST reste en 0.0.0.0 pour un usage LAN classique.
 # Si tu mets un reverse proxy (Caddy/nginx) devant pour le TLS, passe
 # cette valeur a "127.0.0.1" pour que SEUL le proxy local puisse parler
-# au serveur (voir le bloc TLS commente dans _server_main()).
+# au serveur (voir le bloc TLS dans _server_main()).
 HOST = "0.0.0.0"
 PORT = 8888
 CLIENT_TIMEOUT = 30.0
@@ -74,11 +78,8 @@ AUTH_MAX_FAILURES = 5
 AUTH_WINDOW_SEC   = 60
 AUTH_BAN_SEC      = 600
 
-# Dossier des donnees runtime (token, cert TLS, tickets, canaux, profils).
-# Surchargeable via CIRCUSVOIP_DATA_DIR pour les deploiements Docker
-# (cf. circusvoip_server_config.get_data_dir).
-from circusvoip_server_config import get_data_dir as _get_data_dir
-_BASE_DIR       = _get_data_dir()
+# Log debug serveur (meme dossier que le client)
+_BASE_DIR       = Path(__file__).resolve().parent
 _DEBUG_DIR      = _BASE_DIR / "circusvoip_debug"
 DEBUG_LOG_FILE  = _DEBUG_DIR / "circusvoip_server_debug.log"
 _debug_log_fp   = None
@@ -95,6 +96,23 @@ _auth_registry = AuthRegistry(_AUTH_REGISTRY_FILE, ttl_sec=120.0)
 # 50 messages/s en regime permanent, 100 de reserve pour les rafales.
 # Protege contre un membre malveillant qui flood pos/ping/etc.
 _msg_rate = RateLimiter(rate=50.0, burst=100.0)
+
+# [D5] Photos de profil : le serveur stocke un JPEG par pseudo + un index
+# JSON {pseudo: {hash, ts}}. Distribution a la demande (request avec hash
+# if-none-match pour epargner la bande passante). Limite stricte sur la
+# taille du JPEG pour eviter qu'un client malveillant ne sature le disque
+# ou la bande passante. Pas de broadcast au login : un client demande la
+# photo d'un pair uniquement quand il a besoin de l'afficher (ouverture
+# MP, sonnerie d'appel, ecran contacts).
+_PROFILE_PHOTOS_DIR        = _BASE_DIR / "circusvoip_profile_photos"
+_PROFILE_PHOTOS_INDEX_FILE = _BASE_DIR / "circusvoip_profiles.json"
+# 200 Ko de bytes JPEG. Cote client on compresse en 200x200 q80, ce qui
+# donne typiquement 15-30 Ko. 200 Ko laisse de la marge pour des photos
+# riches en details. Le base64 transmis pese ~4/3 de cette taille.
+_PROFILE_PHOTO_MAX_BYTES   = 200_000
+# Cap defensif sur le pseudo (evite path traversal via clients malveillants
+# avant validation par _is_safe_pseudo).
+_PROFILE_PSEUDO_MAX_LEN    = 64
 
 # Token admin (distinct du token joueur, pour qu'un joueur ne puisse pas
 # devenir admin avec son seul mdp). Stocke dans un fichier separe.
@@ -312,6 +330,32 @@ _server_running = False
 _anonymous_mode: bool = False
 
 # ─────────────────────────────────────────────
+#  CircusPhone - Feature 4 (D1 : table d'appels serveur)
+# ─────────────────────────────────────────────
+# Table des appels en cours. Cle = call_id (hex 8 chars genere a la
+# demande d'appel). Valeur = dict :
+#   {
+#     "caller":      str,            # pseudo de l'appelant
+#     "callee":      str,            # pseudo de l'appele
+#     "state":       str,            # "ringing" | "active"
+#     "created_at":  float,          # time.time() a la creation
+#     "accepted_at": float | None,   # time.time() quand l'appel a ete decroche
+#     "ring_task":   asyncio.Task | None,  # timer 45s (annule au decroche)
+#   }
+# Vit uniquement en RAM : un restart serveur purge tout (les clients
+# encore en appel verront leur WS se couper -> appel coupe cote client).
+# En parallele, chaque transition d'etat est journalisee dans
+# phone_calls.log (un objet JSON par ligne) pour le debug post-mortem.
+active_calls: dict = {}
+
+# Duree maximale de sonnerie avant "appel non abouti" (spec : 45 s).
+PHONE_RING_TIMEOUT_S = 45.0
+
+# Log debug dedie aux appels (separe du log serveur generique).
+PHONE_LOG_FILE = _DEBUG_DIR / "phone_calls.log"
+_phone_log_fp = None
+
+# ─────────────────────────────────────────────
 #  Canaux radio
 # ─────────────────────────────────────────────
 # Liste de canaux radio nommes (ex: ["General", "Pont", "Tourelles"]).
@@ -369,13 +413,60 @@ def _save_channels():
         print(f"[CHANNELS] Echec sauvegarde {_CHANNELS_FILE.name} : {e}")
 
 
+# Cle des permissions supportees sur un profil. Pour ajouter une
+# nouvelle permission, ajouter ici sa cle ET sa valeur par defaut.
+# Toutes les permissions sont des booleens. False = pas autorise.
+_PROFILE_PERM_DEFAULTS = {
+    "soundboard_allowed": False,
+    # Futurs : "phone_allowed": False, etc.
+}
+
+
+def _profile_default_dict(name: str) -> dict:
+    """Cree un dict profil avec les permissions par defaut (toutes a False)."""
+    d = {"name": name}
+    d.update(_PROFILE_PERM_DEFAULTS)
+    return d
+
+
+def _profile_normalize(item) -> dict | None:
+    """Convertit une entree de fichier en dict profil normalise. Accepte
+    deux formats :
+      - str "Nom" : ancien format, on cree un dict avec permissions
+        par defaut (toutes a False).
+      - dict {"name": "Nom", "soundboard_allowed": bool, ...} : format
+        actuel, on garde et on complete les permissions manquantes
+        avec leur defaut.
+    Retourne None si l'entree est invalide (vide, mal formee)."""
+    if isinstance(item, str):
+        n = item.strip()
+        if not n:
+            return None
+        return _profile_default_dict(n)
+    if isinstance(item, dict):
+        n = (item.get("name") or "").strip()
+        if not n:
+            return None
+        d = {"name": n}
+        # Pour chaque permission connue : prendre la valeur du fichier
+        # si presente et valide, sinon le defaut.
+        for perm_key, default in _PROFILE_PERM_DEFAULTS.items():
+            v = item.get(perm_key, default)
+            d[perm_key] = bool(v)
+        return d
+    return None
+
+
 def _load_profiles() -> list:
     """Charge la liste des profils depuis circusvoip_profiles.json.
+    Format actuel (v0.2 alpha 035) : liste de dicts avec permissions.
+    Format ancien (pre-0.2) : liste de strings -> converti auto au boot.
     Retourne [] si absent (les profils sont optionnels).
-    Migration : si l'ancien fichier circusvoip_channels.json contenait des
-    entries avec is_profile=true, on les recupere ici (migration auto)."""
+    Migration : si l'ancien fichier circusvoip_channels.json contenait
+    des entries avec is_profile=true, on les recupere aussi."""
     profiles = []
     seen = set()
+    needs_resave = False
     try:
         if _PROFILES_FILE.exists():
             with open(_PROFILES_FILE, "r", encoding="utf-8") as f:
@@ -383,10 +474,16 @@ def _load_profiles() -> list:
             if isinstance(data, list):
                 for item in data:
                     if isinstance(item, str):
-                        n = item.strip()
-                        if n and n not in seen:
-                            profiles.append(n)
-                            seen.add(n)
+                        # Ancien format detecte : sera resauvegarde en
+                        # format dict ci-dessous.
+                        needs_resave = True
+                    norm = _profile_normalize(item)
+                    if norm is None:
+                        continue
+                    if norm["name"] in seen:
+                        continue
+                    profiles.append(norm)
+                    seen.add(norm["name"])
     except Exception as e:
         print(f"[PROFILES] Echec chargement {_PROFILES_FILE.name} : {e}")
     # Migration depuis l'ancien format channels (is_profile=true)
@@ -400,23 +497,77 @@ def _load_profiles() -> list:
                     if isinstance(item, dict) and item.get("is_profile", False):
                         n = (item.get("name") or "").strip()
                         if n and n not in seen:
-                            profiles.append(n)
+                            profiles.append(_profile_default_dict(n))
                             seen.add(n)
                             migrated.append(n)
+                            needs_resave = True
                 if migrated:
                     print(f"[PROFILES] Migration auto depuis channels.json : {migrated}")
     except Exception:
         pass
+    # Si on a converti l'ancien format string -> dict, on resauve
+    # pour persister la migration (sinon on referait la conversion
+    # a chaque boot).
+    if needs_resave:
+        try:
+            with open(_PROFILES_FILE, "w", encoding="utf-8") as f:
+                json.dump(profiles, f, ensure_ascii=False, indent=2)
+            print(f"[PROFILES] Migration auto vers format dict effectuee dans {_PROFILES_FILE.name}")
+        except Exception as e:
+            print(f"[PROFILES] Migration auto KO (sauvegarde) : {e}")
     return profiles
 
 
 def _save_profiles():
-    """Persiste la liste des profils dans circusvoip_profiles.json."""
+    """Persiste la liste des profils dans circusvoip_profiles.json
+    (format dict avec permissions)."""
     try:
         with open(_PROFILES_FILE, "w", encoding="utf-8") as f:
             json.dump(_profiles, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[PROFILES] Echec sauvegarde {_PROFILES_FILE.name} : {e}")
+
+
+def _profile_names() -> list:
+    """Retourne la liste des noms de profils (pour les anciens callers
+    qui s'attendent a une list[str]). _profiles est maintenant list[dict]."""
+    return [p["name"] for p in _profiles if isinstance(p, dict) and p.get("name")]
+
+
+def _profile_find(name: str) -> dict | None:
+    """Retourne le dict profil pour le nom donne, ou None si non trouve."""
+    if not name:
+        return None
+    for p in _profiles:
+        if isinstance(p, dict) and p.get("name") == name:
+            return p
+    return None
+
+
+def _profile_has_perm(name: str, perm_key: str) -> bool:
+    """Verifie si un profil a une permission donnee. Retourne False
+    si le profil n'existe pas, n'a pas la permission, ou si la permission
+    n'est pas dans la liste connue."""
+    p = _profile_find(name)
+    if p is None:
+        return False
+    return bool(p.get(perm_key, False))
+
+
+def _build_my_profile_msg(profile_name) -> dict:
+    """Construit le payload du message my_profile envoye a un client.
+    Inclut :
+      - profile : nom du profil (ou None si pas assigne).
+      - une cle par permission (ex: soundboard_allowed=bool).
+    Si profile_name est None, toutes les permissions sont False
+    (= pas de profil = aucune permission, cf. spec Q1)."""
+    msg = {"type": "my_profile", "profile": profile_name}
+    for perm_key in _PROFILE_PERM_DEFAULTS.keys():
+        if profile_name is None:
+            msg[perm_key] = False
+        else:
+            msg[perm_key] = _profile_has_perm(profile_name, perm_key)
+    return msg
 
 
 # Initialisation : charger au demarrage du module
@@ -480,6 +631,42 @@ async def _broadcast_all(message: str):
     await _broadcast_admins(message)
 
 
+async def _broadcast_clients_only(message: str):
+    """Envoie un message a tous les joueurs (pas aux admins).
+    Utile quand on veut envoyer un format different aux admins (qui
+    peuvent recevoir plus d'infos), comme pour profiles_list ou les
+    permissions de profils."""
+    dead = []
+    for ws in list(clients.keys()):
+        try:
+            await ws.send(message)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        clients.pop(ws, None)
+
+
+async def _broadcast_channel(channel, message: str):
+    """Envoie un message a tous les joueurs du canal donne (et seulement
+    eux). L'emetteur recoit aussi : utile pour le soundboard ou
+    l'emetteur veut s'entendre. Les admins recoivent aussi via
+    _broadcast_admins (push event).
+
+    channel = None ou un id de canal. Si None, on broadcast aux joueurs
+    qui n'ont pas de canal (rare cas)."""
+    dead = []
+    for ws, info in list(clients.items()):
+        if info.get("channel") != channel:
+            continue
+        try:
+            await ws.send(message)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        clients.pop(ws, None)
+    await _broadcast_admins(message)
+
+
 async def _broadcast_admins(message: str):
     """Envoie un message a tous les admins authentifies."""
     dead = []
@@ -514,7 +701,381 @@ async def _cleanup_loop():
             _log(f"Timeout : {name}", ORANGE)
             if _ui:
                 _ui.remove_player(name)
+            # CircusPhone : un joueur qui timeout en plein appel doit
+            # voir ses appels coupes proprement (sinon appel zombie).
+            # Le cleanup_loop fait clients.pop() directement sans passer
+            # par le finally du handler, d'ou cet appel explicite.
+            await _phone_drop_calls_for(name, reason="peer_timeout")
             await _broadcast_all(json.dumps({"type": "leave", "name": name}))
+
+
+# ─────────────────────────────────────────────
+#  CircusPhone - helpers (Feature 4, D1)
+# ─────────────────────────────────────────────
+
+def _phone_log_init():
+    """Ouvre (append) le fichier de log dedie aux appels CircusPhone.
+    Best-effort : si l'ouverture echoue, _phone_log_event devient un
+    no-op silencieux, le serveur continue de tourner normalement."""
+    global _phone_log_fp
+    try:
+        _DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        _phone_log_fp = open(PHONE_LOG_FILE, "a", encoding="utf-8")
+        _phone_log_event("log_init", call_id=None,
+                         note="phone_calls.log ouvert")
+    except Exception as e:
+        _phone_log_fp = None
+        print(f"[PHONE] Echec ouverture {PHONE_LOG_FILE.name} : {e}")
+
+
+def _phone_log_event(event: str, call_id, **fields):
+    """Journalise un evenement d'appel : un objet JSON par ligne.
+    event   : nom de l'evenement (request, ringing, accept, decline,
+              hangup, missed, busy, ended, drop_disconnect, ...).
+    call_id : id de l'appel concerne (ou None pour les events globaux).
+    fields  : champs additionnels (caller, callee, reason, ...).
+    Best-effort : jamais d'exception remontee a l'appelant."""
+    if _phone_log_fp is None:
+        return
+    try:
+        rec = {
+            "ts": datetime.now().isoformat(timespec="milliseconds"),
+            "event": event,
+            "call_id": call_id,
+        }
+        rec.update(fields)
+        _phone_log_fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        _phone_log_fp.flush()
+    except Exception:
+        # On n'interrompt jamais la logique d'appel pour un souci de log.
+        pass
+
+
+# ─────────────────────────────────────────────
+#  [D5] Photos de profil : stockage + index
+# ─────────────────────────────────────────────
+#
+# Modele :
+#   - Un fichier <pseudo>.jpg par photo dans _PROFILE_PHOTOS_DIR.
+#   - Un index JSON {pseudo: {"hash": "...", "ts": float}} dans
+#     _PROFILE_PHOTOS_INDEX_FILE. Le hash est un SHA-256 hex calcule
+#     cote client sur le JPEG (bytes finals apres compression), retransmis
+#     dans l'upload et utilise par tous les clients pour le if-none-match.
+#   - Pas de notification automatique : les pairs decouvrent la nouvelle
+#     photo au prochain request (a l'affichage). C'est volontaire :
+#     evite le broadcast au login et le tempete de trafic.
+
+_profile_photos_index: dict = {}     # {pseudo: {"hash": str, "ts": float}}
+
+
+def _is_safe_pseudo_for_file(name) -> bool:
+    """Filtre defensif sur les pseudos avant tout acces disque a base de
+    leur nom (path traversal, caracteres reserves Windows, longueur)."""
+    if not isinstance(name, str) or not name:
+        return False
+    if len(name) > _PROFILE_PSEUDO_MAX_LEN:
+        return False
+    # Pas de separateur, pas de '..', pas de NUL ni autres caracteres bizarres
+    bad = set('\\/:*?"<>|\x00')
+    for ch in name:
+        if ch in bad or ord(ch) < 32:
+            return False
+    if name in (".", "..") or name.startswith("."):
+        return False
+    return True
+
+
+def _profile_photos_load_index():
+    """Charge l'index des photos de profil depuis le disque. Recree le
+    dossier de stockage si absent. Best-effort : un index manquant ou
+    corrompu repart d'un dict vide."""
+    global _profile_photos_index
+    try:
+        _PROFILE_PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"[PROFILE] Echec mkdir {_PROFILE_PHOTOS_DIR} : {e}")
+    if not _PROFILE_PHOTOS_INDEX_FILE.exists():
+        _profile_photos_index = {}
+        return
+    try:
+        with open(_PROFILE_PHOTOS_INDEX_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            # Nettoyage defensif : on vire les entrees malformees.
+            cleaned = {}
+            for pseudo, entry in data.items():
+                if (isinstance(pseudo, str)
+                        and isinstance(entry, dict)
+                        and isinstance(entry.get("hash"), str)):
+                    cleaned[pseudo] = {
+                        "hash": entry["hash"],
+                        "ts": float(entry.get("ts") or 0.0),
+                    }
+            _profile_photos_index = cleaned
+        else:
+            _profile_photos_index = {}
+    except Exception as e:
+        print(f"[PROFILE] Index corrompu, reset : {e}")
+        _profile_photos_index = {}
+
+
+def _profile_photos_save_index():
+    """Sauvegarde l'index sur disque. Best-effort, jamais bloquant."""
+    try:
+        with open(_PROFILE_PHOTOS_INDEX_FILE, "w", encoding="utf-8") as f:
+            json.dump(_profile_photos_index, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[PROFILE] Echec sauvegarde index : {e}")
+
+
+def _profile_photo_path(pseudo: str):
+    """Chemin disque du JPEG pour ce pseudo (ne valide PAS le pseudo : a
+    appeler uniquement apres _is_safe_pseudo_for_file)."""
+    return _PROFILE_PHOTOS_DIR / f"{pseudo}.jpg"
+
+
+def _find_ws_by_name(name: str):
+    """Retourne le ws du joueur portant ce pseudo, ou None s'il n'est pas
+    connecte. Les pseudos sont uniques cote serveur (un joueur = un ws)."""
+    if not name:
+        return None
+    for ws, info in clients.items():
+        if info.get("name") == name:
+            return ws
+    return None
+
+
+def _find_active_call_for(name: str):
+    """Cherche un appel en cours (ringing OU active) impliquant ce joueur,
+    qu'il soit caller ou callee. Retourne (call_id, call_dict) ou None.
+    Sert a la regle 'occupe' : un joueur deja dans un appel ne peut pas
+    en recevoir/passer un autre."""
+    for call_id, call in active_calls.items():
+        if call["caller"] == name or call["callee"] == name:
+            return call_id, call
+    return None
+
+
+async def _send_to_name(name: str, payload: dict) -> bool:
+    """Envoie un message JSON cible a un joueur designe par son pseudo.
+    Retourne True si l'envoi a reussi, False si le joueur est introuvable
+    ou si l'envoi a echoue (socket morte)."""
+    ws = _find_ws_by_name(name)
+    if ws is None:
+        return False
+    try:
+        await ws.send(json.dumps(payload))
+        return True
+    except Exception:
+        return False
+
+
+def _phone_clear_call(call_id: str):
+    """Retire un appel de la table et annule son timer de sonnerie s'il
+    est encore actif. Idempotent : appeler 2x ne pose pas de probleme.
+
+    D4b : notifie aussi tous les voisins HP courants que le HP est OFF
+    (pour qu'ils nettoient leur etat 'autorise a entendre' cote client),
+    et notifie le peer que la liste de voisins HP devient vide. Ainsi on
+    n'a aucun cas de leak d'autorisation HP cote client meme si le call
+    se termine brutalement (timeout, deco, etc.).
+
+    Note technique : la fonction est sync (appelee depuis _ring_timeout
+    qui n'est plus async, ainsi que depuis des handlers async). On utilise
+    asyncio.get_running_loop() pour detecter si on est dans un contexte
+    async ; si oui on schedule les notifs via create_task, sinon on les
+    skippe silencieusement (cas exceptionnel, normalement le call_id n'a
+    pas de HP a ce moment-la)."""
+    call = active_calls.pop(call_id, None)
+    if call is None:
+        return
+    task = call.get("ring_task")
+    if task is not None and not task.done():
+        task.cancel()
+    # D4b : cleanup HP si actif sur cet appel.
+    hp = call.get("hp") or {}
+    hp_owner = hp.get("owner")             # le joueur qui avait active son HP
+    hp_neighbors = hp.get("neighbors") or set()
+    caller, callee = call.get("caller"), call.get("callee")
+    if not hp_owner or not (caller or callee):
+        return
+    # Determiner si on peut scheduler des notifs async (on doit etre dans
+    # une loop asyncio active : _phone_clear_call est presque toujours
+    # appele depuis un context async, sauf _ring_timeout qui n'a pas de HP
+    # de toute facon - pas de HP pendant le ringing).
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # Hors loop : pas de notif (rare, et le client gere son cleanup
+        # via call_ended/peer_disconnect en parallele).
+        return
+    # Le peer de l'owner du HP est l'autre partie de l'appel.
+    hp_peer = callee if hp_owner == caller else caller
+    # Notifier les anciens voisins (ils n'entendent plus le peer en HP)
+    for nb in hp_neighbors:
+        asyncio.create_task(_send_to_name(nb, {
+            "type": "phone_hp_inactive",
+            "call_id": call_id,
+            "owner": hp_owner,
+            "peer": hp_peer,
+        }))
+    # Notifier le peer (sa liste de voisins entendables tombe a vide)
+    if hp_peer:
+        asyncio.create_task(_send_to_name(hp_peer, {
+            "type": "phone_hp_neighbors_update",
+            "call_id": call_id,
+            "owner": hp_owner,
+            "neighbors": [],
+        }))
+
+
+async def _phone_hp_apply_state(call_id: str, owner_name: str,
+                                new_neighbors: set) -> None:
+    """D4b : applique un nouvel etat HP pour un appel.
+
+    owner_name : pseudo du joueur qui a active son HP (cote A dans la spec).
+                 Ses voisins =5m vont pouvoir entendre le peer en 0x03 et
+                 leur prox 0x00 sera entendue par le peer.
+    new_neighbors : ensemble des pseudos voisins =5m fournis par le client.
+                    Set vide = HP desactive (raccroche / toggle OFF).
+
+    La fonction calcule les diffs avec l'ancienne liste stockee dans
+    active_calls[call_id]["hp"] :
+      - 'arrives' : nouveaux voisins -> phone_hp_active
+      - 'partis'  : anciens voisins qui ne sont plus la -> phone_hp_inactive
+    Et notifie le peer (l'autre partie de l'appel) avec la liste complete
+    mise a jour via phone_hp_neighbors_update.
+
+    Si call_id n'existe pas ou si owner_name n'est pas partie de l'appel,
+    on ignore silencieusement (best-effort, le serveur reste autoritaire).
+    """
+    call = active_calls.get(call_id)
+    if call is None:
+        return
+    if owner_name not in (call.get("caller"), call.get("callee")):
+        return
+    if call.get("state") != "active":
+        # Pas de HP pendant la sonnerie : seulement quand l'appel est decroche.
+        return
+
+    # Le peer est l'autre partie de l'appel
+    peer = call["callee"] if owner_name == call["caller"] else call["caller"]
+
+    # On ne s'autorise pas soi-meme ni le peer dans la liste des voisins
+    # (cas tordus : le peer est trop loin par definition, et soi-meme c'est
+    # une absurdite). Tres important pour la securite/coherence cote serveur.
+    new_neighbors = set(new_neighbors) - {owner_name, peer}
+
+    old = call.get("hp") or {}
+    old_owner = old.get("owner")
+    old_neighbors = old.get("neighbors") or set()
+
+    # Si un autre owner avait deja active son HP sur cet appel (cas tordu :
+    # les 2 parties activent leur HP en meme temps), on rejette : un seul
+    # HP a la fois par appel. Le 2eme owner ne peut pas s'imposer sans que
+    # le 1er ne raccroche d'abord.
+    if old_owner and old_owner != owner_name and new_neighbors:
+        _log(f"[PHONE] {owner_name} : phone_speaker_state ignore "
+             f"(HP deja actif par {old_owner})", ORANGE)
+        return
+
+    arrives = new_neighbors - old_neighbors
+    partis = old_neighbors - new_neighbors
+
+    # Mettre a jour l'etat dans active_calls
+    if new_neighbors:
+        call["hp"] = {"owner": owner_name, "neighbors": set(new_neighbors)}
+    else:
+        # HP eteint : on retire l'entree (et on garde owner=None implicitement)
+        call.pop("hp", None)
+
+    # Notifier les nouveaux voisins
+    for nb in arrives:
+        await _send_to_name(nb, {
+            "type": "phone_hp_active",
+            "call_id": call_id,
+            "owner": owner_name,
+            "peer": peer,
+        })
+
+    # Notifier les voisins partis
+    for nb in partis:
+        await _send_to_name(nb, {
+            "type": "phone_hp_inactive",
+            "call_id": call_id,
+            "owner": owner_name,
+            "peer": peer,
+        })
+
+    # Notifier le peer avec la liste complete mise a jour
+    await _send_to_name(peer, {
+        "type": "phone_hp_neighbors_update",
+        "call_id": call_id,
+        "owner": owner_name,
+        "neighbors": sorted(new_neighbors),
+    })
+
+    _log(f"[PHONE] HP {owner_name} (peer={peer}) : "
+         f"+{len(arrives)} -{len(partis)} (total {len(new_neighbors)})",
+         PURPLE)
+
+
+async def _ring_timeout(call_id: str):
+    """Timer de sonnerie : attend PHONE_RING_TIMEOUT_S secondes ; si
+    l'appel est toujours en 'ringing' a l'expiration, il devient un
+    appel non abouti. On notifie les deux parties (phone_call_missed)
+    puis on purge la table.
+
+    Annule par _phone_clear_call() des que l'appel est decroche, refuse
+    ou raccroche -> dans ce cas la CancelledError sort proprement."""
+    try:
+        await asyncio.sleep(PHONE_RING_TIMEOUT_S)
+    except asyncio.CancelledError:
+        # Appel decroche / refuse / raccroche avant la fin : rien a faire.
+        return
+    call = active_calls.get(call_id)
+    if call is None or call["state"] != "ringing":
+        return
+    caller, callee = call["caller"], call["callee"]
+    _log(f"[PHONE] Appel non abouti : {caller} -> {callee} "
+         f"(pas de reponse en {int(PHONE_RING_TIMEOUT_S)}s)", ORANGE)
+    _phone_log_event("missed", call_id, caller=caller, callee=callee)
+    # Cleanup centralise (idempotent, gere aussi le HP - mais pas de HP
+    # en ringing, donc no-op pour cette partie). On utilise la version
+    # avec helper plutot que pop direct pour la coherence avec les
+    # autres chemins de sortie d'un appel.
+    _phone_clear_call(call_id)
+    missed_msg = {"type": "phone_call_missed", "call_id": call_id,
+                  "caller": caller, "callee": callee}
+    # Cote appelant : "appel non abouti" ; cote appele : stoppe la sonnerie.
+    await _send_to_name(caller, missed_msg)
+    await _send_to_name(callee, missed_msg)
+
+
+async def _phone_drop_calls_for(name: str, reason: str):
+    """Coupe tous les appels (ringing ou active) impliquant ce joueur.
+    Appele quand le joueur se deconnecte ou timeout : l'autre partie
+    recoit phone_call_ended pour revenir a l'etat repos.
+    reason : 'peer_disconnect' (WS ferme) ou 'peer_timeout' (silence)."""
+    # Copie de la liste : on modifie active_calls pendant l'iteration.
+    concerned = [
+        (cid, call) for cid, call in list(active_calls.items())
+        if call["caller"] == name or call["callee"] == name
+    ]
+    for call_id, call in concerned:
+        caller, callee = call["caller"], call["callee"]
+        # L'autre partie = celle qui n'est pas 'name'.
+        other = callee if caller == name else caller
+        _log(f"[PHONE] Appel coupe ({reason}) : {caller} <-> {callee} "
+             f"(declencheur : {name})", ORANGE)
+        _phone_log_event("ended", call_id, caller=caller, callee=callee,
+                         reason=reason, trigger=name)
+        _phone_clear_call(call_id)
+        await _send_to_name(other, {
+            "type": "phone_call_ended",
+            "call_id": call_id,
+            "reason": reason,
+        })
 
 
 # ─────────────────────────────────────────────
@@ -544,7 +1105,9 @@ async def _admin_session(ws):
         await ws.send(json.dumps({
             "type": "admin_welcome",
             "channels": list(_channels),
-            "profiles": list(_profiles),
+            # Envoie les dicts complets aux admins (avec permissions).
+            # Les clients normaux recoivent juste les noms via welcome.
+            "profiles": [dict(p) for p in _profiles if isinstance(p, dict)],
             "players": players_state,
             "anonymous_mode": _anonymous_mode,
             # "server_token" volontairement retire pour ne pas l'exposer
@@ -603,6 +1166,47 @@ async def _admin_handle_cmd(ws, cmd: str, data: dict) -> tuple:
             ok = assign_profile(data.get("player", ""),
                                 data.get("profile"))
             return (ok, "" if ok else "joueur introuvable ou profil invalide")
+        if cmd == "set_profile_permission":
+            # v0.2 alpha 035 : admin modifie une permission d'un profil.
+            # Payload : {profile: str, perm_key: str, value: bool}.
+            # Verifie que la perm est connue, met a jour, sauve,
+            # broadcast aux admins (profiles_list complet) et push
+            # my_profile aux clients qui ont ce profil (pour effet
+            # immediat cote UI).
+            profile_name = (data.get("profile") or "").strip()
+            perm_key     = (data.get("perm_key") or "").strip()
+            value        = bool(data.get("value", False))
+            if perm_key not in _PROFILE_PERM_DEFAULTS:
+                return (False, f"permission inconnue : {perm_key}")
+            p = _profile_find(profile_name)
+            if p is None:
+                return (False, "profil introuvable")
+            p[perm_key] = value
+            _save_profiles()
+            _log(
+                f"Profil '{profile_name}' : {perm_key} = {value}",
+                BLUE
+            )
+            # Broadcast profiles_list (admins recoivent full dict, clients
+            # juste les noms qu'ils avaient deja)
+            _broadcast_profiles_list_threadsafe()
+            # Push my_profile aux clients qui ont ce profil assigne, pour
+            # qu'ils mettent leur UI a jour immediatement (afficher/cacher
+            # le bouton soundboard sans attendre une reconnexion).
+            async def _push_my_profile_updates():
+                for ws_, info_ in list(clients.items()):
+                    if info_.get("assigned_profile") == profile_name:
+                        try:
+                            await ws_.send(json.dumps(
+                                _build_my_profile_msg(profile_name)
+                            ))
+                        except Exception:
+                            pass
+            try:
+                await _push_my_profile_updates()
+            except Exception:
+                pass
+            return (True, "")
         if cmd == "set_anonymous_mode":
             target = bool(data.get("active", False))
             global _anonymous_mode
@@ -771,7 +1375,9 @@ async def handler(ws):
                     "prox_short": False,
                     "audio_ticket": audio_ticket,
                 }
-                # Enregistre le ticket dans le fichier partage avec l'audio.
+                # [P4] Enregistre le ticket dans le fichier partage avec
+                # le serveur audio. Le serveur audio relira ce fichier au
+                # moment du join audio pour valider le ticket presente.
                 _auth_registry.issue(name, audio_ticket)
                 _log(f"JOIN : {name}  ({len(clients)} connecté(s))", GREEN)
                 if _ui:
@@ -790,17 +1396,26 @@ async def handler(ws):
                     for other_ws, info in clients.items()
                     if other_ws is not ws
                 ]
-                await ws.send(json.dumps({
+                # Au welcome, le joueur n'a pas encore de profil assigne
+                # (None). Les permissions sont donc toutes a False. C'est
+                # l'admin qui assignera un profil ensuite et qui pushera
+                # my_profile separement.
+                welcome_msg = {
                     "type": "welcome",
                     "players": existing,
                     "anonymous_mode": _anonymous_mode,
                     "channels": list(_channels),
-                    "profiles": list(_profiles),
+                    "profiles": _profile_names(),
                     "my_channel": initial_channel,
                     "my_profile": None,
                     # [P4] Ticket a renvoyer au serveur audio lors du join audio.
                     "audio_ticket": audio_ticket,
-                }))
+                }
+                # Ajout des permissions a False (cf. _build_my_profile_msg
+                # qui renvoie False pour profile=None).
+                for perm_key in _PROFILE_PERM_DEFAULTS.keys():
+                    welcome_msg[perm_key] = False
+                await ws.send(json.dumps(welcome_msg))
                 # Annoncer aux autres l'arrivee du nouveau
                 await _broadcast(ws, json.dumps({
                     "type": "join",
@@ -895,6 +1510,467 @@ async def handler(ws):
                         "active": active,
                     }))
 
+            elif msg_type == "soundboard_play":
+                # v0.2 alpha 029/035 : un client declenche un son du
+                # soundboard. Verification de la permission profil
+                # `soundboard_allowed` (alpha 035) :
+                #   - Si le joueur n'a pas de profil assigne -> refus.
+                #   - Si son profil n'a pas la perm soundboard_allowed
+                #     -> refus.
+                # En cas de refus : ignore silencieusement + log cote
+                # serveur. On ne renvoie pas d'erreur au client (pas la
+                # peine d'alourdir le protocole, le client n'aurait pas
+                # du afficher le bouton de toutes facons).
+                if ws in clients:
+                    sound_id  = data.get("sound_id")
+                    cname     = clients[ws]["name"]
+                    cchan     = clients[ws].get("channel")
+                    cprofile  = clients[ws].get("assigned_profile")
+                    # Verifier permission
+                    if not cprofile:
+                        _log(
+                            f"{cname} : soundboard_play '{sound_id}' "
+                            f"REFUSE (pas de profil assigne)",
+                            ORANGE
+                        )
+                    elif not _profile_has_perm(cprofile, "soundboard_allowed"):
+                        _log(
+                            f"{cname} : soundboard_play '{sound_id}' "
+                            f"REFUSE (profil '{cprofile}' n'a pas la perm "
+                            f"soundboard_allowed)",
+                            ORANGE
+                        )
+                    elif isinstance(sound_id, str) and sound_id:
+                        _log(
+                            f"{cname} : soundboard_play '{sound_id}' "
+                            f"canal={cchan or '(aucun)'}",
+                            BLUE
+                        )
+                        await _broadcast_channel(cchan, json.dumps({
+                            "type":     "soundboard_play",
+                            "name":     cname,
+                            "sound_id": sound_id,
+                        }))
+
+            # ─────────────────────────────────────────────
+            #  CircusPhone (Feature 4, D1) : cycle de vie d'appel
+            # ─────────────────────────────────────────────
+            elif msg_type == "phone_call_request":
+                # L'appelant veut joindre 'target' (pseudo).
+                if ws in clients:
+                    caller = clients[ws]["name"]
+                    target = data.get("target")
+
+                    # Garde-fous basiques. Le client ne devrait pas
+                    # envoyer ces requetes invalides, mais le serveur
+                    # reste autoritaire et ne fait jamais confiance.
+                    if not isinstance(target, str) or not target:
+                        _log(f"[PHONE] {caller} : phone_call_request "
+                             f"ignore (target invalide)", ORANGE)
+                    elif target == caller:
+                        # S'appeler soi-meme : on ignore.
+                        _log(f"[PHONE] {caller} : phone_call_request "
+                             f"ignore (auto-appel)", ORANGE)
+                    elif _find_active_call_for(caller) is not None:
+                        # L'appelant est deja dans un appel : on ignore
+                        # (le client n'aurait pas du proposer le bouton).
+                        _log(f"[PHONE] {caller} : phone_call_request "
+                             f"ignore (deja en appel)", ORANGE)
+                    elif _find_ws_by_name(target) is None:
+                        # Cible hors ligne -> 'occupe' (le client D1 ne
+                        # distingue pas hors-ligne et occupe ; un seul
+                        # retour suffit pour revenir au repos).
+                        _log(f"[PHONE] {caller} -> {target} : cible hors "
+                             f"ligne", ORANGE)
+                        _phone_log_event("busy", call_id=None,
+                                         caller=caller, callee=target,
+                                         cause="offline")
+                        await ws.send(json.dumps({
+                            "type": "phone_call_busy",
+                            "target": target,
+                            "cause": "offline",
+                        }))
+                    elif _find_active_call_for(target) is not None:
+                        # Cible deja en appel -> 'occupe'.
+                        _log(f"[PHONE] {caller} -> {target} : occupe "
+                             f"(deja en appel)", ORANGE)
+                        _phone_log_event("busy", call_id=None,
+                                         caller=caller, callee=target,
+                                         cause="in_call")
+                        await ws.send(json.dumps({
+                            "type": "phone_call_busy",
+                            "target": target,
+                            "cause": "in_call",
+                        }))
+                    else:
+                        # OK : on cree l'appel et on lance la sonnerie.
+                        call_id = secrets.token_hex(4)
+                        ring_task = asyncio.create_task(
+                            _ring_timeout(call_id)
+                        )
+                        active_calls[call_id] = {
+                            "caller":      caller,
+                            "callee":      target,
+                            "state":       "ringing",
+                            "created_at":  time.time(),
+                            "accepted_at": None,
+                            "ring_task":   ring_task,
+                        }
+                        _log(f"[PHONE] Appel : {caller} -> {target} "
+                             f"(call_id={call_id})", PURPLE)
+                        _phone_log_event("request", call_id,
+                                         caller=caller, callee=target)
+                        # Accuse de reception a l'appelant (ca sonne).
+                        await ws.send(json.dumps({
+                            "type": "phone_call_ringing",
+                            "call_id": call_id,
+                            "target": target,
+                        }))
+                        # Notification d'appel entrant a l'appele.
+                        await _send_to_name(target, {
+                            "type": "phone_call_incoming",
+                            "call_id": call_id,
+                            "caller": caller,
+                        })
+
+            elif msg_type == "phone_call_accept":
+                # L'appele decroche.
+                if ws in clients:
+                    cname = clients[ws]["name"]
+                    call_id = data.get("call_id")
+                    call = active_calls.get(call_id)
+                    if call is None:
+                        _log(f"[PHONE] {cname} : phone_call_accept "
+                             f"ignore (call_id inconnu : {call_id})", ORANGE)
+                    elif call["callee"] != cname:
+                        # Seul l'appele peut decrocher.
+                        _log(f"[PHONE] {cname} : phone_call_accept "
+                             f"REFUSE (pas l'appele de {call_id})", ORANGE)
+                    elif call["state"] != "ringing":
+                        # Deja decroche / etat incoherent : on ignore.
+                        _log(f"[PHONE] {cname} : phone_call_accept "
+                             f"ignore (etat={call['state']})", ORANGE)
+                    else:
+                        # Decroche valide : on annule le timer de sonnerie
+                        # et on passe l'appel en 'active'.
+                        rt = call.get("ring_task")
+                        if rt is not None and not rt.done():
+                            rt.cancel()
+                        call["ring_task"] = None
+                        call["state"] = "active"
+                        call["accepted_at"] = time.time()
+                        caller, callee = call["caller"], call["callee"]
+                        _log(f"[PHONE] Decroche : {caller} <-> {callee} "
+                             f"(call_id={call_id})", GREEN)
+                        _phone_log_event("accept", call_id,
+                                         caller=caller, callee=callee)
+                        # Les DEUX parties recoivent phone_call_accepted :
+                        # l'appelant passe de 'sonne' a 'en appel',
+                        # l'appele confirme son propre passage en appel.
+                        accepted_msg = {
+                            "type": "phone_call_accepted",
+                            "call_id": call_id,
+                            "caller": caller,
+                            "callee": callee,
+                        }
+                        await _send_to_name(caller, accepted_msg)
+                        await _send_to_name(callee, accepted_msg)
+
+            elif msg_type == "phone_call_decline":
+                # L'appele refuse l'appel entrant.
+                if ws in clients:
+                    cname = clients[ws]["name"]
+                    call_id = data.get("call_id")
+                    call = active_calls.get(call_id)
+                    if call is None:
+                        _log(f"[PHONE] {cname} : phone_call_decline "
+                             f"ignore (call_id inconnu : {call_id})", ORANGE)
+                    elif call["callee"] != cname:
+                        _log(f"[PHONE] {cname} : phone_call_decline "
+                             f"REFUSE (pas l'appele de {call_id})", ORANGE)
+                    elif call["state"] != "ringing":
+                        # On ne peut refuser qu'un appel qui sonne encore.
+                        _log(f"[PHONE] {cname} : phone_call_decline "
+                             f"ignore (etat={call['state']})", ORANGE)
+                    else:
+                        caller, callee = call["caller"], call["callee"]
+                        _log(f"[PHONE] Refuse : {callee} a refuse l'appel "
+                             f"de {caller} (call_id={call_id})", ORANGE)
+                        _phone_log_event("decline", call_id,
+                                         caller=caller, callee=callee)
+                        _phone_clear_call(call_id)
+                        # Seul l'appelant a besoin d'etre notifie (l'appele
+                        # sait qu'il vient de refuser).
+                        await _send_to_name(caller, {
+                            "type": "phone_call_declined",
+                            "call_id": call_id,
+                        })
+
+            elif msg_type == "phone_call_hangup":
+                # Une des deux parties raccroche. Valable pendant la
+                # sonnerie (l'appelant annule) OU pendant l'appel actif
+                # (l'un des deux met fin a la conversation).
+                if ws in clients:
+                    cname = clients[ws]["name"]
+                    call_id = data.get("call_id")
+                    call = active_calls.get(call_id)
+                    if call is None:
+                        _log(f"[PHONE] {cname} : phone_call_hangup "
+                             f"ignore (call_id inconnu : {call_id})", ORANGE)
+                    elif cname not in (call["caller"], call["callee"]):
+                        # Le raccrocheur doit faire partie de l'appel.
+                        _log(f"[PHONE] {cname} : phone_call_hangup "
+                             f"REFUSE (pas partie de {call_id})", ORANGE)
+                    else:
+                        caller, callee = call["caller"], call["callee"]
+                        other = callee if cname == caller else caller
+                        _log(f"[PHONE] Raccroche par {cname} : "
+                             f"{caller} <-> {callee} (call_id={call_id}, "
+                             f"etat={call['state']})", ORANGE)
+                        _phone_log_event("hangup", call_id,
+                                         caller=caller, callee=callee,
+                                         by=cname, prev_state=call["state"])
+                        _phone_clear_call(call_id)
+                        # L'autre partie est notifiee de la fin d'appel.
+                        await _send_to_name(other, {
+                            "type": "phone_call_ended",
+                            "call_id": call_id,
+                            "reason": "hangup",
+                        })
+
+            elif msg_type == "phone_speaker_state":
+                # D4b : un joueur en appel active/maintient/desactive son HP.
+                # Charge utile : {call_id, neighbors: [pseudo1, pseudo2, ...]}
+                # neighbors = liste vide -> HP eteint (ou raccroche).
+                # Le serveur calcule la diff avec l'etat precedent et notifie
+                # les voisins concernes + le peer. Voir _phone_hp_apply_state.
+                if ws in clients:
+                    cname = clients[ws]["name"]
+                    call_id = data.get("call_id")
+                    raw_neighbors = data.get("neighbors") or []
+                    # Filtrer : que des chaines non vides
+                    new_neighbors = {
+                        n for n in raw_neighbors
+                        if isinstance(n, str) and n
+                    }
+                    await _phone_hp_apply_state(call_id, cname, new_neighbors)
+
+            # ─────────────────────────────────────────────
+            #  CircusPhone (Feature 4, D4 etape 3) : messagerie privee
+            # ─────────────────────────────────────────────
+            elif msg_type == "phone_message_send":
+                # Un joueur veut envoyer un MP texte a un autre. Le serveur
+                # se contente de router : aucun stockage cote serveur, le
+                # stockage est local cote client (10 envoyes + 10 recus par
+                # contact, max 500c par message). Si le destinataire est
+                # hors ligne, le message est perdu (la spec ne prevoit pas
+                # de boite differee). Aucun controle de profil : la
+                # messagerie est universelle.
+                if ws in clients:
+                    sender = clients[ws]["name"]
+                    target = data.get("target")
+                    body   = data.get("body")
+                    # Garde-fous : champs valides + longueur + auto-msg.
+                    if not isinstance(target, str) or not target:
+                        _log(f"[PHONE-MSG] {sender} : ignore "
+                             f"(target invalide)", ORANGE)
+                    elif target == sender:
+                        _log(f"[PHONE-MSG] {sender} : ignore (auto-msg)",
+                             ORANGE)
+                    elif not isinstance(body, str) or not body:
+                        _log(f"[PHONE-MSG] {sender} : ignore (body vide)",
+                             ORANGE)
+                    elif len(body) > 500:
+                        # Le serveur valide la limite cote serveur aussi
+                        # (defense en profondeur, le client la valide deja).
+                        _log(f"[PHONE-MSG] {sender} -> {target} : ignore "
+                             f"(body > 500 char : {len(body)})", ORANGE)
+                    elif _find_ws_by_name(target) is None:
+                        _log(f"[PHONE-MSG] {sender} -> {target} : cible "
+                             f"hors ligne, message perdu", ORANGE)
+                        _phone_log_event("msg_lost", call_id=None,
+                                         sender=sender, target=target,
+                                         len=len(body))
+                    else:
+                        # Route au destinataire. Timestamp serveur (source
+                        # de verite : evite les triches d'horloge client).
+                        ts = time.time()
+                        _log(f"[PHONE-MSG] {sender} -> {target} ({len(body)} "
+                             f"char)", PURPLE)
+                        _phone_log_event("msg_sent", call_id=None,
+                                         sender=sender, target=target,
+                                         len=len(body))
+                        await _send_to_name(target, {
+                            "type":   "phone_message_received",
+                            "sender": sender,
+                            "body":   body,
+                            "ts":     ts,
+                        })
+
+            # ─────────────────────────────────────────────
+            #  [D5] Photos de profil : upload + request
+            # ─────────────────────────────────────────────
+            elif msg_type == "profile_photo_upload":
+                # Un joueur envoie sa photo de profil (JPEG compresse cote
+                # client). Champs attendus :
+                #   - data_b64 : str, base64 du JPEG
+                #   - hash     : str, SHA-256 hex du JPEG (calcule par le
+                #                client, sera renvoye aux pairs pour le
+                #                if-none-match). Pas de validation forte
+                #                cote serveur : on stocke ce qu'on recoit.
+                # Aucune reponse particuliere n'est renvoyee : si l'upload
+                # passe les garde-fous, c'est qu'il est OK. Le client n'a
+                # pas besoin de confirmation pour fonctionner. En cas de
+                # rejet, on log et on ignore.
+                if ws in clients:
+                    sender = clients[ws]["name"]
+                    data_b64 = data.get("data_b64")
+                    new_hash = data.get("hash")
+                    if not _is_safe_pseudo_for_file(sender):
+                        # Ne devrait pas arriver (pseudo deja filtre au join),
+                        # garde-fou supplementaire.
+                        _log(f"[PROFILE] {sender} : upload ignore (pseudo "
+                             f"non sur pour fichier)", ORANGE)
+                    elif (not isinstance(data_b64, str)
+                          or not isinstance(new_hash, str)
+                          or not data_b64 or not new_hash):
+                        _log(f"[PROFILE] {sender} : upload ignore (champs "
+                             f"manquants ou invalides)", ORANGE)
+                    else:
+                        # Cap defensif sur la taille base64 avant decodage.
+                        # 200 Ko bytes => ~270 Ko base64. On tolere 280 Ko.
+                        if len(data_b64) > 280_000:
+                            _log(f"[PROFILE] {sender} : upload rejete "
+                                 f"(base64 trop volumineux : {len(data_b64)} "
+                                 f"chars)", ORANGE)
+                        else:
+                            try:
+                                import base64 as _b64
+                                jpeg_bytes = _b64.b64decode(
+                                    data_b64, validate=True
+                                )
+                            except Exception as e:
+                                jpeg_bytes = None
+                                _log(f"[PROFILE] {sender} : upload rejete "
+                                     f"(base64 invalide : {e})", ORANGE)
+                            if jpeg_bytes is not None:
+                                if len(jpeg_bytes) > _PROFILE_PHOTO_MAX_BYTES:
+                                    _log(f"[PROFILE] {sender} : upload "
+                                         f"rejete (JPEG > {_PROFILE_PHOTO_MAX_BYTES} "
+                                         f"bytes : {len(jpeg_bytes)})", ORANGE)
+                                else:
+                                    # Sanity check : signature JPEG (FFD8FF).
+                                    if (len(jpeg_bytes) >= 3
+                                            and jpeg_bytes[0] == 0xFF
+                                            and jpeg_bytes[1] == 0xD8
+                                            and jpeg_bytes[2] == 0xFF):
+                                        try:
+                                            path = _profile_photo_path(sender)
+                                            with open(path, "wb") as f:
+                                                f.write(jpeg_bytes)
+                                            _profile_photos_index[sender] = {
+                                                "hash": new_hash,
+                                                "ts": time.time(),
+                                            }
+                                            _profile_photos_save_index()
+                                            _log(f"[PROFILE] {sender} : photo "
+                                                 f"mise a jour "
+                                                 f"({len(jpeg_bytes)} bytes, "
+                                                 f"hash {new_hash[:8]}...)",
+                                                 PURPLE)
+                                        except Exception as e:
+                                            _log(f"[PROFILE] {sender} : "
+                                                 f"echec ecriture disque "
+                                                 f"({e})", RED)
+                                    else:
+                                        _log(f"[PROFILE] {sender} : upload "
+                                             f"rejete (pas une signature "
+                                             f"JPEG)", ORANGE)
+
+            elif msg_type == "profile_photo_request":
+                # Un client demande la photo d'un pair. Champs attendus :
+                #   - target         : str, pseudo du proprietaire vise
+                #   - if_none_match  : str|None, hash deja en cache cote
+                #                      demandeur (pour eviter de retransmettre
+                #                      si rien n'a change).
+                # Reponse : profile_photo_response avec un de ces statuts :
+                #   - status="none"      : aucune photo connue pour ce pseudo
+                #   - status="unchanged" : meme hash, garde ton cache
+                #   - status="ok"        : data_b64 + hash a jour
+                if ws in clients:
+                    requester     = clients[ws]["name"]
+                    target        = data.get("target")
+                    if_none_match = data.get("if_none_match")
+                    if not isinstance(target, str) or not target:
+                        # Reponse minimale "none" pour debloquer le client
+                        # sans causer d'erreur.
+                        await ws.send(json.dumps({
+                            "type": "profile_photo_response",
+                            "target": target if isinstance(target, str) else "",
+                            "status": "none",
+                        }))
+                    elif not _is_safe_pseudo_for_file(target):
+                        await ws.send(json.dumps({
+                            "type": "profile_photo_response",
+                            "target": target,
+                            "status": "none",
+                        }))
+                    else:
+                        entry = _profile_photos_index.get(target)
+                        if not entry:
+                            await ws.send(json.dumps({
+                                "type": "profile_photo_response",
+                                "target": target,
+                                "status": "none",
+                            }))
+                        else:
+                            stored_hash = entry.get("hash") or ""
+                            if (isinstance(if_none_match, str)
+                                    and if_none_match
+                                    and if_none_match == stored_hash):
+                                # Le demandeur a deja la bonne version.
+                                await ws.send(json.dumps({
+                                    "type": "profile_photo_response",
+                                    "target": target,
+                                    "status": "unchanged",
+                                    "hash": stored_hash,
+                                }))
+                            else:
+                                # Relire le JPEG depuis le disque. Si le
+                                # fichier a disparu (cas pathologique), on
+                                # nettoie l'entree et on repond "none".
+                                path = _profile_photo_path(target)
+                                jpeg_bytes = None
+                                try:
+                                    with open(path, "rb") as f:
+                                        jpeg_bytes = f.read()
+                                except Exception:
+                                    jpeg_bytes = None
+                                if jpeg_bytes is None:
+                                    _profile_photos_index.pop(target, None)
+                                    _profile_photos_save_index()
+                                    await ws.send(json.dumps({
+                                        "type": "profile_photo_response",
+                                        "target": target,
+                                        "status": "none",
+                                    }))
+                                else:
+                                    import base64 as _b64
+                                    data_b64 = _b64.b64encode(
+                                        jpeg_bytes
+                                    ).decode("ascii")
+                                    await ws.send(json.dumps({
+                                        "type": "profile_photo_response",
+                                        "target": target,
+                                        "status": "ok",
+                                        "hash": stored_hash,
+                                        "data_b64": data_b64,
+                                    }))
+                                    # Log discret (les requests sont
+                                    # frequentes, on evite le bruit).
+                                    _log(f"[PROFILE] {requester} <- {target} "
+                                         f"({len(jpeg_bytes)} bytes)", MUTED)
+
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
@@ -911,6 +1987,23 @@ async def handler(ws):
             _log(f"LEAVE : {name}  ({len(clients)} connecté(s))", ORANGE)
             if _ui:
                 _ui.remove_player(name)
+            # CircusPhone : couper les appels en cours de ce joueur
+            # AVANT d'annoncer son leave. L'autre partie recevra
+            # phone_call_ended (reason=peer_disconnect).
+            await _phone_drop_calls_for(name, reason="peer_disconnect")
+            # D4b : si ce joueur faisait partie de listes HP d'autres appels
+            # (en tant que voisin d'un owner), le retirer pour eviter que le
+            # peer croie pouvoir l'entendre encore. On parcourt les calls
+            # ayant un HP actif, on retire 'name' de leur set 'neighbors'
+            # s'il y est, et on resynchronise via _phone_hp_apply_state.
+            for cid, call in list(active_calls.items()):
+                hp = call.get("hp") or {}
+                neighbors = hp.get("neighbors") or set()
+                if name in neighbors:
+                    owner = hp.get("owner")
+                    if owner:
+                        new_set = set(neighbors) - {name}
+                        await _phone_hp_apply_state(cid, owner, new_set)
             await _broadcast_all(json.dumps({"type": "leave", "name": name}))
 
 
@@ -922,6 +2015,9 @@ async def _server_main():
     _stop_event = asyncio.Event()
     _server_running = True
     _debug_log_init()
+    _phone_log_init()
+    # [D5] Charge l'index des photos de profil (cree le dossier si absent).
+    _profile_photos_load_index()
     _log(f"Serveur démarré sur port {PORT}", BLUE)
     # [P5] Les tokens ne sont plus affiches en clair dans les logs.
     # Ils restent visibles dans l'UI Tkinter (saisis par l'admin) et
@@ -967,10 +2063,13 @@ async def _server_main():
     # gere les renouvellements.
     from circusvoip_security import ensure_self_signed_cert, build_ssl_context
     _cert_file = _BASE_DIR / "cert.pem"
-    _key_file = _BASE_DIR / "key.pem"
-    _ok, _detail = ensure_self_signed_cert(_cert_file, _key_file, common_name="circusvoip-server")
+    _key_file  = _BASE_DIR / "key.pem"
+    _ok, _detail = ensure_self_signed_cert(
+        _cert_file, _key_file, common_name="circusvoip-server"
+    )
     if not _ok:
-        _log(f"[FATAL] Impossible de generer le certificat TLS. Detail : {_detail}", RED)
+        _log(f"[FATAL] Impossible de generer le certificat TLS. "
+             f"Detail : {_detail}", RED)
         _server_running = False
         return
     _ssl_ctx = build_ssl_context(str(_cert_file), str(_key_file))
@@ -1132,12 +2231,23 @@ def remove_channel(name: str) -> bool:
 # ---- Profils : fonctions thread-safe appelees depuis l'UI admin ----
 
 def _broadcast_profiles_list_threadsafe():
-    """Broadcast la liste des profils a tous les clients."""
+    """Broadcast la liste des profils.
+    - Aux clients normaux : juste les noms (compat, pas besoin des
+      permissions cote client autre que celle qui le concerne, envoyee
+      via my_profile).
+    - Aux admins : la liste complete avec permissions (pour le panneau
+      d'edition des profils)."""
     if _loop and _server_running:
         async def _do():
-            await _broadcast_all(json.dumps({
+            # Clients : noms uniquement
+            await _broadcast_clients_only(json.dumps({
                 "type": "profiles_list",
-                "profiles": list(_profiles),
+                "profiles": _profile_names(),
+            }))
+            # Admins : full dicts avec permissions
+            await _broadcast_admins(json.dumps({
+                "type": "profiles_list",
+                "profiles": [dict(p) for p in _profiles if isinstance(p, dict)],
             }))
         try:
             asyncio.run_coroutine_threadsafe(_do(), _loop)
@@ -1146,11 +2256,12 @@ def _broadcast_profiles_list_threadsafe():
 
 
 def add_profile(name: str) -> bool:
-    """Ajoute un profil (tag de faction)."""
+    """Ajoute un profil (tag de faction). Le profil est cree avec
+    toutes ses permissions a False par defaut."""
     name = (name or "").strip()
-    if not name or name in _profiles:
+    if not name or _profile_find(name) is not None:
         return False
-    _profiles.append(name)
+    _profiles.append(_profile_default_dict(name))
     _save_profiles()
     _broadcast_profiles_list_threadsafe()
     _log(f"Profil ajoute : {name}", GREEN)
@@ -1158,12 +2269,17 @@ def add_profile(name: str) -> bool:
 
 
 def rename_profile(old: str, new: str) -> bool:
-    """Renomme un profil. Met a jour les joueurs qui l'avaient assigne."""
+    """Renomme un profil. Met a jour les joueurs qui l'avaient assigne.
+    Les permissions du profil sont conservees (on modifie juste le nom)."""
     new = (new or "").strip()
-    if not new or old == new or new in _profiles or old not in _profiles:
+    if not new or old == new:
         return False
-    idx = _profiles.index(old)
-    _profiles[idx] = new
+    if _profile_find(new) is not None:
+        return False
+    p = _profile_find(old)
+    if p is None:
+        return False
+    p["name"] = new
     _save_profiles()
     for ws, info in clients.items():
         if info.get("assigned_profile") == old:
@@ -1181,10 +2297,7 @@ def rename_profile(old: str, new: str) -> bool:
             for ws_, info_ in clients.items():
                 if info_.get("assigned_profile") == new:
                     try:
-                        await ws_.send(json.dumps({
-                            "type": "my_profile",
-                            "profile": new,
-                        }))
+                        await ws_.send(json.dumps(_build_my_profile_msg(new)))
                     except Exception:
                         pass
         try:
@@ -1197,9 +2310,10 @@ def rename_profile(old: str, new: str) -> bool:
 
 def remove_profile(name: str) -> bool:
     """Supprime un profil. Les joueurs qui l'avaient n'en ont plus."""
-    if name not in _profiles:
+    p = _profile_find(name)
+    if p is None:
         return False
-    _profiles.remove(name)
+    _profiles.remove(p)
     _save_profiles()
     fallback = None
     affected = []
@@ -1219,10 +2333,7 @@ def remove_profile(name: str) -> bool:
             for ws_, info_ in clients.items():
                 if info_.get("name") in affected:
                     try:
-                        await ws_.send(json.dumps({
-                            "type": "my_profile",
-                            "profile": fallback,
-                        }))
+                        await ws_.send(json.dumps(_build_my_profile_msg(fallback)))
                     except Exception:
                         pass
         try:
@@ -1235,7 +2346,7 @@ def remove_profile(name: str) -> bool:
 
 def assign_profile(player_name: str, profile_name) -> bool:
     """Assigne un profil a un joueur connecte (admin uniquement)."""
-    if profile_name is not None and profile_name not in _profiles:
+    if profile_name is not None and _profile_find(profile_name) is None:
         return False
     target_ws = None
     for ws, info in clients.items():
@@ -1256,10 +2367,7 @@ def assign_profile(player_name: str, profile_name) -> bool:
             for ws, info in clients.items():
                 if info.get("name") == player_name:
                     try:
-                        await ws.send(json.dumps({
-                            "type": "my_profile",
-                            "profile": profile_name,
-                        }))
+                        await ws.send(json.dumps(_build_my_profile_msg(profile_name)))
                     except Exception:
                         pass
                     break
@@ -1586,9 +2694,17 @@ class ServerUI:
                      anchor="w", justify="left").pack(fill="x", padx=4)
             self._refresh_all_players_profile_select()
             return
-        for prof_name in _profiles:
-            row = tk.Frame(self._profiles_list_frame, bg=BG_ROW, pady=2, padx=6)
-            row.pack(fill="x", pady=1, padx=6)
+        for prof_name in _profile_names():
+            # v0.2 alpha 036 : un bloc englobant par profil pour grouper
+            # le nom et ses cases de permission. Permet d'afficher la
+            # case "Soundboard autorise" directement dans l'UI serveur,
+            # sans passer par l'admin (utile quand le serveur tourne en
+            # local et qu'on n'utilise pas l'admin distant).
+            block = tk.Frame(self._profiles_list_frame, bg=BG_ROW, pady=2, padx=6)
+            block.pack(fill="x", pady=1, padx=6)
+            # Ligne 1 : nom + boutons rename/delete
+            row = tk.Frame(block, bg=BG_ROW)
+            row.pack(fill="x")
             tk.Label(row, text=prof_name, bg=BG_ROW, fg="#bc8cff",
                      font=("Courier", 9, "bold"), anchor="w"
                      ).pack(side="left", fill="x", expand=True)
@@ -1604,7 +2720,75 @@ class ServerUI:
             btn_del.pack(side="left")
             btn_del.bind("<Button-1>",
                          lambda e, n=prof_name: self._on_delete_profile(n))
+            # Ligne 2 : case a cocher "Soundboard autorise". L'etat est
+            # lu directement du dict _profiles via _profile_has_perm.
+            # Au toggle, on appelle _set_profile_perm_local qui :
+            #   - met a jour le dict
+            #   - sauvegarde _profiles -> JSON
+            #   - broadcast aux admins (profiles_list)
+            #   - push my_profile aux clients ayant ce profil
+            perm_row = tk.Frame(block, bg=BG_ROW)
+            perm_row.pack(fill="x", pady=(2, 0))
+            sb_var = tk.BooleanVar(
+                value=_profile_has_perm(prof_name, "soundboard_allowed")
+            )
+            cb = tk.Checkbutton(
+                perm_row,
+                text="🔊 Soundboard autorise",
+                variable=sb_var,
+                bg=BG_ROW, fg=TEXT, font=("Courier", 8),
+                activebackground=BG_ROW, activeforeground=TEXT,
+                selectcolor=BG_PANEL,
+                relief="flat", bd=0, highlightthickness=0,
+                cursor="hand2", anchor="w",
+                command=lambda n=prof_name, v=sb_var:
+                    self._on_toggle_profile_perm_local(n, "soundboard_allowed", v.get()),
+            )
+            cb.pack(side="left", padx=(12, 0))
         self._refresh_all_players_profile_select()
+
+    def _on_toggle_profile_perm_local(self, profile_name: str, perm_key: str, value: bool):
+        """Toggle d'une permission profil depuis l'UI serveur directe
+        (v0.2 alpha 036). Equivalent local du dispatch admin
+        set_profile_permission, sans passer par le reseau.
+
+        Met a jour le dict _profiles, persiste, broadcast aux admins
+        (s'il y en a), et push my_profile aux clients ayant ce profil
+        pour effet immediat cote UI."""
+        if perm_key not in _PROFILE_PERM_DEFAULTS:
+            _log(f"_on_toggle_profile_perm_local : perm inconnue {perm_key}", ORANGE)
+            return
+        p = _profile_find(profile_name)
+        if p is None:
+            _log(f"_on_toggle_profile_perm_local : profil introuvable {profile_name}", ORANGE)
+            return
+        p[perm_key] = bool(value)
+        _save_profiles()
+        _log(
+            f"Profil '{profile_name}' : {perm_key} = {value} (UI serveur)",
+            BLUE
+        )
+        # Broadcast aux admins + clients (deja gere par
+        # _broadcast_profiles_list_threadsafe qui envoie 2 messages
+        # distincts)
+        _broadcast_profiles_list_threadsafe()
+        # Push my_profile aux clients qui ont ce profil assigne, pour
+        # mise a jour immediate de leur UI (afficher/cacher le bouton
+        # soundboard).
+        if _loop and _server_running:
+            async def _do():
+                for ws_, info_ in list(clients.items()):
+                    if info_.get("assigned_profile") == profile_name:
+                        try:
+                            await ws_.send(json.dumps(
+                                _build_my_profile_msg(profile_name)
+                            ))
+                        except Exception:
+                            pass
+            try:
+                asyncio.run_coroutine_threadsafe(_do(), _loop)
+            except Exception:
+                pass
 
     def _on_add_profile(self):
         from tkinter import simpledialog, messagebox
@@ -1850,7 +3034,7 @@ class ServerUI:
         prof_frame = info["prof_frame"]
         for w in prof_frame.winfo_children():
             w.destroy()
-        profile_names = list(_profiles)
+        profile_names = _profile_names()
         if not profile_names:
             return
         current = None
@@ -1954,7 +3138,7 @@ def _run_headless():
     print(f"Lockout auth   : {AUTH_MAX_FAILURES} echecs / {AUTH_WINDOW_SEC}s "
           f"-> ban {AUTH_BAN_SEC}s")
     print(f"Canaux         : {_channels}")
-    print(f"Profils        : {_profiles}")
+    print(f"Profils        : {_profile_names()}")
     print(f"Mode anonyme   : {'ON' if _anonymous_mode else 'OFF'}")
     print("=" * 60)
     print("Logs (Ctrl+C pour arreter) :")
@@ -1965,13 +3149,19 @@ def _run_headless():
     except KeyboardInterrupt:
         print("\n[INFO] Arret demande par l'utilisateur (Ctrl+C)")
     finally:
-        global _debug_log_fp
+        global _debug_log_fp, _phone_log_fp
         if _debug_log_fp:
             try:
                 _debug_log_fp.close()
             except Exception:
                 pass
             _debug_log_fp = None
+        if _phone_log_fp:
+            try:
+                _phone_log_fp.close()
+            except Exception:
+                pass
+            _phone_log_fp = None
 
 
 if __name__ == "__main__":

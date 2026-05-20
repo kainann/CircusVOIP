@@ -78,10 +78,17 @@ except ImportError:
 
 RADIUS_TRIGGER  = 5.0       # m : volume max (zone verte)
 RADIUS_FADE     = 30.0      # m : debut du fondu (volume 0)
-SCAN_INTERVAL   = 0.01      # secondes entre 2 lectures OCR
 AUDIBLE_RANGE_M = 30.0      # m : limite d'audibilite proximity
 SERVER_PORT     = 8888      # port WS serveur de controle
 AUDIO_PORT      = 8889      # port WS serveur audio
+
+# v0.2 (optim perf) : periode des logs [STATS Xs] et [METRICS] dans la
+# boucle OCR. Reduire cette valeur pendant les phases d'optimisation pour
+# voir evoluer la conso CPU/GPU/RAM plus rapidement. Defaut 30s en prod.
+# Le cleanup VRAM CUDA reste sur sa cadence propre (30s) pour ne pas
+# multiplier les torch.cuda.empty_cache() inutilement.
+STATS_PERIOD_S = 30.0       # prod : 30s (phase optim : 10s)
+VRAM_CLEANUP_PERIOD_S = 30.0  # cleanup VRAM CUDA (cadence inchangee)
 
 # Delai de "linger" apres relachement du PTT radio (en millisecondes).
 # Quand l'utilisateur relache la touche radio, on garde state.radio_active
@@ -369,6 +376,201 @@ def _log_system_metrics(label: str = ""):
         tag = f"[METRICS {label}]" if label else "[METRICS]"
         _dbg_log(tag + " " + " | ".join(parts))
 
+
+# v0.2 (optim perf) : profiling detaille temporaire.
+# Etat persistant entre 2 appels pour calculer les deltas (CPU user/system par
+# thread, nombre d'appels, etc.). Flipper _PROFILING_ENABLED a True pour
+# reactiver les logs [PROFILING] toutes les STATS_PERIOD_S quand on veut
+# re-investiguer la conso CPU/GPU. Par defaut False en prod (cout negligeable
+# meme actif, mais inutile au quotidien).
+_PROFILING_ENABLED = False
+_profiling_state: dict = {
+    "last_call_ts": None,        # monotonic du precedent appel (pour calculer la duree)
+    "last_proc_cpu_times": None,  # (user, system) du process Circus
+    "last_thread_times": {},     # tid -> cpu_time_s precedent (Windows : via psutil)
+    "last_gc_counts": None,      # gc.get_count() precedent
+    "ocr_iterations": 0,         # incremente a chaque tour de boucle OCR
+    "ocr_pipeline_total_s": 0.0,  # temps cumule en read_coords() depuis dernier log
+    "ocr_stable_iters": 0,       # nb de tours OCR ou la cadence stable etait active
+    "ocr_movement_iters": 0,     # nb de tours OCR ou la cadence mouvement etait active
+}
+
+
+def _profiling_tick_ocr(pipeline_duration_s: float, is_stable_cadence: bool = False):
+    """A appeler dans la boucle OCR a chaque tour avec le temps qu'a pris
+    read_coords(). Permet de calculer le % de temps reellement passe dans le
+    pipeline OCR vs ailleurs dans la boucle.
+    is_stable_cadence : True si la cadence stable (~500ms) etait active pour
+    ce tour, False pour la cadence mouvement (~350ms). Permet de tracker la
+    repartition du temps entre les 2 modes."""
+    if not _PROFILING_ENABLED:
+        return
+    _profiling_state["ocr_iterations"] += 1
+    _profiling_state["ocr_pipeline_total_s"] += pipeline_duration_s
+    if is_stable_cadence:
+        _profiling_state["ocr_stable_iters"] += 1
+    else:
+        _profiling_state["ocr_movement_iters"] += 1
+
+
+def _log_profiling_metrics():
+    """Profiling detaille temporaire : decomposition CPU user/system du process,
+    temps cumule par thread, stats GC, tailles des structures internes,
+    fraction du CPU passee dans le pipeline OCR.
+
+    Conception :
+    - Tout est calcule en delta entre 2 appels successifs.
+    - Sans crasher si psutil indispo : on log juste ce qu'on peut.
+    - Coup d'execution : ~5-10ms (psutil iter threads).
+    - A appeler juste apres _log_system_metrics() pour avoir une vue alignee.
+    """
+    if not _PROFILING_ENABLED:
+        return
+
+    now_mono = time.monotonic()
+    last_ts = _profiling_state["last_call_ts"]
+    _profiling_state["last_call_ts"] = now_mono
+    if last_ts is None:
+        # Premier appel : juste amorcer les compteurs, pas de log
+        try:
+            import psutil
+            p = psutil.Process()
+            ct = p.cpu_times()
+            _profiling_state["last_proc_cpu_times"] = (ct.user, ct.system)
+            _profiling_state["last_thread_times"] = {
+                t.id: t.user_time + t.system_time for t in p.threads()
+            }
+            import gc
+            _profiling_state["last_gc_counts"] = gc.get_count()
+        except Exception:
+            pass
+        return
+
+    interval_s = max(0.001, now_mono - last_ts)
+    parts = []
+
+    # --- 1) CPU user/system du process (delta sur l'intervalle) ---
+    try:
+        import psutil
+        p = psutil.Process()
+        ct = p.cpu_times()
+        prev = _profiling_state["last_proc_cpu_times"]
+        if prev is not None:
+            d_user = ct.user - prev[0]
+            d_sys  = ct.system - prev[1]
+            ncpu = psutil.cpu_count() or 1
+            # Normaliser en %CPU (rapporte a 1 core, divise par ncpu pour
+            # avoir un equivalent system-wide comparable a Circus=X% deja loggue)
+            pct_user = (d_user / interval_s) * 100 / ncpu
+            pct_sys  = (d_sys / interval_s) * 100 / ncpu
+            parts.append(f"user={pct_user:.0f}%+sys={pct_sys:.0f}%")
+        _profiling_state["last_proc_cpu_times"] = (ct.user, ct.system)
+
+        # --- 2) Top threads par CPU (delta) ---
+        prev_th = _profiling_state["last_thread_times"]
+        cur_th = {t.id: t.user_time + t.system_time for t in p.threads()}
+        deltas = []
+        for tid, cur_t in cur_th.items():
+            prev_t = prev_th.get(tid)
+            if prev_t is not None:
+                dt = cur_t - prev_t
+                if dt > 0.001:  # ignorer les threads quasi-idle
+                    deltas.append((tid, dt))
+        deltas.sort(key=lambda x: -x[1])
+        # Top 5 threads : tid + %CPU
+        if deltas:
+            top = []
+            for tid, dt in deltas[:5]:
+                pct = (dt / interval_s) * 100 / ncpu
+                # Tenter de retrouver le nom du thread (Python keep track via threading.enumerate)
+                tname = "?"
+                try:
+                    import threading
+                    for th in threading.enumerate():
+                        if th.native_id == tid:
+                            tname = th.name
+                            break
+                except Exception:
+                    pass
+                top.append(f"{tname}({tid})={pct:.0f}%")
+            parts.append("threads=[" + " ".join(top) + "]")
+        _profiling_state["last_thread_times"] = cur_th
+    except Exception as e:
+        parts.append(f"psutil_err={type(e).__name__}")
+
+    # --- 3) Stats GC Python ---
+    try:
+        import gc
+        cur_counts = gc.get_count()
+        prev_counts = _profiling_state["last_gc_counts"]
+        if prev_counts is not None:
+            # gc.get_count() = (gen0, gen1, gen2). On ne peut pas mesurer
+            # le nombre de collectes directement, mais gc.get_stats() le donne.
+            try:
+                stats = gc.get_stats()
+                # stats = [{collections, collected, uncollectable} pour gen0,1,2]
+                cols = [s["collections"] for s in stats]
+                # On stocke aussi pour delta
+                prev_stats = _profiling_state.get("last_gc_stats")
+                if prev_stats is not None:
+                    d_cols = [cols[i] - prev_stats[i] for i in range(min(len(cols), len(prev_stats)))]
+                    parts.append(f"gc_collects={d_cols}")
+                _profiling_state["last_gc_stats"] = cols
+            except Exception:
+                pass
+            # Compte courant (objets en attente de gen0/1/2)
+            parts.append(f"gc_count={cur_counts}")
+        _profiling_state["last_gc_counts"] = cur_counts
+    except Exception:
+        pass
+
+    # --- 4) Compteurs internes OCR ---
+    n_iter = _profiling_state["ocr_iterations"]
+    n_stable = _profiling_state["ocr_stable_iters"]
+    n_movement = _profiling_state["ocr_movement_iters"]
+    total_pipeline_s = _profiling_state["ocr_pipeline_total_s"]
+    if n_iter > 0:
+        avg_pipeline_ms = (total_pipeline_s / n_iter) * 1000
+        # Fraction du wall time passee dans read_coords()
+        pipeline_share = (total_pipeline_s / interval_s) * 100
+        # Repartition mouvement vs stable (% des iterations)
+        stable_pct = (n_stable / n_iter) * 100 if n_iter else 0
+        parts.append(
+            f"ocr_iter={n_iter} avg_pipeline={avg_pipeline_ms:.0f}ms "
+            f"share={pipeline_share:.0f}% stable={n_stable}/{n_iter}({stable_pct:.0f}%)"
+        )
+    _profiling_state["ocr_iterations"] = 0
+    _profiling_state["ocr_pipeline_total_s"] = 0.0
+    _profiling_state["ocr_stable_iters"] = 0
+    _profiling_state["ocr_movement_iters"] = 0
+
+    # --- 5) Tailles des structures internes ---
+    try:
+        struct_sizes = []
+        struct_sizes.append(f"players={len(state.players)}")
+        if state.audio_io is not None:
+            try:
+                struct_sizes.append(f"remote_bufs={len(state.audio_io._remote_buffers)}")
+            except Exception:
+                pass
+        # Caches sign-flip dans sc_ocr (peuvent grossir avec les containers visites)
+        try:
+            import circusvoip_sc_ocr as _sco
+            for attr in ("_sign_memory_per_container", "_sign_correction_streak",
+                         "_sign_correction_history", "_sign_restore_guard_streak"):
+                d = getattr(_sco, attr, None)
+                if isinstance(d, dict):
+                    struct_sizes.append(f"{attr}={len(d)}")
+        except Exception:
+            pass
+        if struct_sizes:
+            parts.append("sizes={" + " ".join(struct_sizes) + "}")
+    except Exception:
+        pass
+
+    if parts:
+        _dbg_log("[PROFILING] " + " | ".join(parts))
+
 # Cache : clef -> (last_ts, last_value) pour la deduplication des logs
 _dbg_last: dict = {}
 
@@ -435,6 +637,15 @@ class State:
     # Le serveur audio refuse la connexion sans ce ticket. Rafraichi a
     # chaque welcome (donc a chaque reconnexion au serveur positions).
     audio_ticket = ""
+    # [P4+] Generation de thread WS audio. Incremente a chaque demarrage
+    # d'un nouveau thread audio. Chaque thread garde sa generation a son
+    # demarrage et termine si elle devient obsolete (= un nouveau thread
+    # a ete demarre apres lui). Evite la course classique : ancien thread
+    # qui tente une reconnexion avec un ticket obsolete pendant que le
+    # nouveau thread se connecte avec le ticket frais. Sans ca, l'ancien
+    # peut "voler" la session au nouveau et ensuite se faire refuser
+    # quand le ticket expire/se rafraichit.
+    audio_ws_generation = 0
     # Audio
     audio_io         = None   # instance AudioIO
     audio_ws         = None   # WebSocket audio
@@ -521,6 +732,19 @@ class State:
     profile_radio_active = False
     # Touche pour cycler les canaux (descente, boucle en haut)
     cycle_channel_key    = None
+    # CircusPhone (D4 etape 4) : 5 raccourcis configurables.
+    # Tous vides par defaut (la spec : "Vides par defaut, configurables
+    # dans Parametres"). Format : "ctrl+shift+x" ou "f1" etc., normalises.
+    #   phone_open_key     : ouvrir/fermer l'overlay smartphone (actif partout)
+    #   phone_accept_key   : decrocher  (actif uniquement en appel entrant)
+    #   phone_decline_key  : refuser/raccrocher (actif sonnerie ou en cours)
+    #   phone_mute_key     : toggle mute micro (actif pendant un appel)
+    #   phone_speaker_key  : toggle haut-parleur (actif pendant un appel)
+    phone_open_key     = None
+    phone_accept_key   = None
+    phone_decline_key  = None
+    phone_mute_key     = None
+    phone_speaker_key  = None
     # Overlays floating windows
     # - overlays_show : True quand le bouton "Overlay" est ON (overlays affiches)
     # - overlays_edit : True quand le bouton "Overlay Edition" est ON
@@ -542,6 +766,43 @@ class State:
     # du client, l'UI afficherait "En attente de position OCR..." au lieu
     # du plus informatif "Hors-jeu".
     sc_running       = False
+    # ---- CircusPhone (Feature 4, D3 : audio bidirectionnel) ----
+    # Etat d'appel vu par le core (mis a jour par le client / MainWindow a
+    # chaque transition d'appel). Le core en a besoin pour :
+    #  - l'emission : si phone_in_call, la voix part avec le flag 0x03
+    #    (telephone) au lieu des flags radio/proximity habituels.
+    #  - la reception : une trame 0x03 n'est jouee que si elle vient de
+    #    phone_peer (mon correspondant) - les trames 0x03 des autres
+    #    appels en cours sur le serveur audio sont ignorees.
+    # Pendant un appel, la radio (PTT canal + PTT profil) est neutralisee
+    # cote emission (spec : radio desactivee pendant un appel telephone).
+    phone_in_call    = False   # True quand un appel telephone est decroche
+    phone_peer       = None    # pseudo du correspondant (None hors appel)
+    phone_call_id    = None    # id de l'appel en cours (D4b : necessaire pour
+                               #   les messages phone_speaker_state)
+    # Timestamps des dernieres trames telephone recues par sender. Meme
+    # role que last_radio_seen_ts : dedup de la trame proximity quand
+    # l'emetteur envoie 2 flux (telephone 0x03 + proximity 0x00).
+    last_phone_seen_ts = {}
+
+    # ---- CircusPhone D4b : routage haut-parleur ----
+    # Cote A (proprietaire du HP) : etat local pour piloter l'envoi
+    # phone_speaker_state au serveur.
+    phone_hp_active             = False   # True quand MON HP est on pendant un appel
+    phone_hp_last_neighbors_sent = set()   # dernier set de voisins envoye au serveur
+    phone_hp_last_send_ts        = 0.0    # monotonic du dernier envoi (throttle 1s)
+
+    # Cote B (voisin d'un proprietaire HP) : autorise a entendre les
+    # trames 0x03 venant des pseudos contenus dans hp_speakers_allowed.
+    # Cle = pseudo du peer (l'autre partie de l'appel HP), valeur = pseudo
+    # de l'owner (necessaire pour le log/debug, et pour invalider via OFF).
+    # Multiples entrees possibles si on est voisin de plusieurs proprietaires.
+    hp_speakers_allowed: dict = {}   # {peer: owner}  (peer = qui parler entendre)
+
+    # Cote C (peer du HP) : autorise a entendre les trames 0x00 prox
+    # venant des pseudos contenus dans hp_proxies_allowed.
+    # Cle = pseudo du voisin, valeur = pseudo de l'owner (pour invalider).
+    hp_proxies_allowed: dict = {}    # {neighbor: owner}
 
 state = State()
 
@@ -587,6 +848,108 @@ def _ws_send_safe(data: dict) -> bool:
             return False
     except Exception:
         return False
+
+
+# ─────────────────────────────────────────────
+#  CircusPhone D4b : helpers routage haut-parleur
+# ─────────────────────────────────────────────
+
+# Rayon du HP : voisins audibles autour du proprietaire (spec D4b).
+PHONE_HP_RADIUS_M = 5.0
+# Throttle anti-spam pour les envois phone_speaker_state declenches par
+# la boucle OCR (mouvement). 1 envoi/seconde max suffit largement pour la
+# VoIP positionnelle.
+PHONE_HP_THROTTLE_S = 1.0
+
+
+def _phone_hp_compute_neighbors() -> set:
+    """Calcule l'ensemble des pseudos de joueurs a <=PHONE_HP_RADIUS_M
+    metres de moi. Lit state.players (dist deja calculee par la boucle
+    OCR / les recv de pos serveur). Le peer en appel est EXCLU
+    automatiquement (il ne peut pas etre son propre voisin HP, et de
+    toute facon le serveur le filtrerait).
+
+    Thread-safe lecture seule sur state.players (un dict Python : on
+    iterates sur une snapshot avec list() pour eviter une mutation
+    concurrente)."""
+    neighbors = set()
+    peer = state.phone_peer
+    try:
+        for name, info in list(state.players.items()):
+            if name == peer:
+                continue
+            d = info.get("dist")
+            if d is None:
+                continue
+            if d <= PHONE_HP_RADIUS_M:
+                neighbors.add(name)
+    except Exception:
+        # Best-effort : si l'iteration foire pour une raison quelconque,
+        # on retourne un set vide plutot que de remonter l'exception
+        # (qui interromprait la boucle OCR ou le slot Qt).
+        pass
+    return neighbors
+
+
+def _phone_hp_send_state(force: bool = False) -> bool:
+    """Envoie phone_speaker_state au serveur avec la liste actuelle de
+    voisins ≤5m (ou vide si HP non actif / non en appel).
+
+    Appele a deux endroits :
+      1) Toggle HP (cote client, slot Qt) : force=True, envoi immediat.
+      2) Boucle OCR (cote core, thread OCR) : force=False, sujet a throttle.
+
+    Le throttle PHONE_HP_THROTTLE_S evite d'envoyer 2.8 fois/sec en
+    mouvement (cadence OCR). On envoie uniquement si :
+      - force=True
+      - OU la liste a change ET le dernier envoi date d'au moins 1s
+
+    Returns True si un envoi a effectivement ete planifie, False sinon
+    (skip pour throttle ou pas connecte)."""
+    # HP inactif et rien a envoyer : skip total (cas le plus frequent).
+    if not state.phone_hp_active and not state.phone_hp_last_neighbors_sent:
+        return False
+    if not state.phone_in_call:
+        # Pas en appel = HP impossible. Si on avait envoye une liste
+        # avant, le serveur a deja nettoye via phone_call_ended.
+        state.phone_hp_active = False
+        state.phone_hp_last_neighbors_sent = set()
+        return False
+
+    if state.phone_hp_active:
+        new_set = _phone_hp_compute_neighbors()
+    else:
+        # HP off : envoyer liste vide pour signaler au serveur (cleanup)
+        new_set = set()
+
+    if not force:
+        # Throttle + diff
+        if new_set == state.phone_hp_last_neighbors_sent:
+            return False  # rien change, pas d'envoi
+        now = time.monotonic()
+        if now - state.phone_hp_last_send_ts < PHONE_HP_THROTTLE_S:
+            # Trop tot pour un nouvel envoi. La boucle OCR rappellera
+            # la prochaine fois et finira par passer (state.phone_hp_active
+            # reste actif, le diff sera toujours valable).
+            return False
+
+    # Recuperer le call_id depuis le state (n'est pas dans state, le
+    # client connait via _phone_call_id). On l'expose dans state pour
+    # rester sync core/client : on le lit dans state.phone_call_id si
+    # present, sinon on n'envoie pas (le serveur a besoin du call_id).
+    call_id = getattr(state, "phone_call_id", None)
+    if not call_id:
+        return False
+
+    ok = _ws_send_safe({
+        "type": "phone_speaker_state",
+        "call_id": call_id,
+        "neighbors": sorted(new_set),
+    })
+    if ok:
+        state.phone_hp_last_neighbors_sent = new_set
+        state.phone_hp_last_send_ts = time.monotonic()
+    return ok
 
 
 # ======================================================================
@@ -867,6 +1230,13 @@ class RadioKeyListener:
         # Ils servent a faire un set_channel cote UI (sur le thread main).
         self._on_profile_radio_pressed  = None
         self._on_profile_radio_released = None
+        # CircusPhone (D4 etape 4) : callbacks des 5 raccourcis telephone.
+        # Tous declenches au press (toggle simple, pas de press/release).
+        self._on_phone_open    = None
+        self._on_phone_accept  = None
+        self._on_phone_decline = None
+        self._on_phone_mute    = None
+        self._on_phone_speaker = None
         # Debounce : set des touches actuellement enfoncees (pour eviter le repeat)
         self._currently_pressed = set()
         # Release linger : compteur de generation pour annuler les anciens
@@ -884,7 +1254,18 @@ class RadioKeyListener:
 
         Met radio_active=True immediatement. Si un timer release etait en
         cours (release linger), il est invalide (l'utilisateur a re-press
-        avant la fin du linger -> on continue normalement)."""
+        avant la fin du linger -> on continue normalement).
+
+        CircusPhone (D3) : pendant un appel telephone, la radio est
+        desactivee (spec). On ignore donc completement le press : pas de
+        bip PTT, pas de radio_active, pas de gate force. La voix continue
+        de partir en mode telephone (gere par _on_audio_captured)."""
+        if state.phone_in_call:
+            try:
+                _dbg_log("[RADIO PTT] press ignore (appel telephone en cours)")
+            except Exception:
+                pass
+            return
         with self._release_lock:
             # Invalide tout timer release en cours
             self._release_gen += 1
@@ -912,7 +1293,14 @@ class RadioKeyListener:
         Au lieu de couper radio_active=False immediatement, on programme un
         timer differe (RADIO_RELEASE_LINGER_MS) qui le fera. Si l'utilisateur
         re-press la touche entre temps, le timer sera invalide (par increment
-        de _release_gen)."""
+        de _release_gen).
+
+        CircusPhone (D3) : pendant un appel, le press a deja ete ignore
+        (cf _on_radio_pressed), donc radio_active est reste False et il
+        n'y a rien a nettoyer. On ignore le release pour ne pas jouer le
+        bip 'release' ni flusher inutilement."""
+        if state.phone_in_call:
+            return
         with self._release_lock:
             self._release_gen += 1
             my_gen = self._release_gen
@@ -960,7 +1348,10 @@ class RadioKeyListener:
                              on_all=None, on_prox_short=None,
                              on_cycle_channel=None,
                              on_profile_radio_pressed=None,
-                             on_profile_radio_released=None):
+                             on_profile_radio_released=None,
+                             on_phone_open=None, on_phone_accept=None,
+                             on_phone_decline=None, on_phone_mute=None,
+                             on_phone_speaker=None):
         """Enregistre les callbacks de toggle (appeles depuis un thread non-UI).
         Les callbacks doivent etre thread-safe (utiliser root.after en interne)."""
         self._on_toggle_mic   = on_mic
@@ -971,6 +1362,12 @@ class RadioKeyListener:
         self._on_cycle_channel     = on_cycle_channel
         self._on_profile_radio_pressed  = on_profile_radio_pressed
         self._on_profile_radio_released = on_profile_radio_released
+        # CircusPhone (D4 etape 4) : 5 raccourcis telephone.
+        self._on_phone_open    = on_phone_open
+        self._on_phone_accept  = on_phone_accept
+        self._on_phone_decline = on_phone_decline
+        self._on_phone_mute    = on_phone_mute
+        self._on_phone_speaker = on_phone_speaker
 
     # ---- PTT profil : meme logique que radio mais bascule aussi le canal ----
     # Au press : signale a l'UI (callback) qui va faire set_channel(my_profile)
@@ -985,7 +1382,16 @@ class RadioKeyListener:
     # de l'emetteur a ete bascule sur son canal-profil.
 
     def _on_profile_radio_pressed_impl(self):
-        """Press de la touche PTT profil : delegue le switch de canal a l'UI."""
+        """Press de la touche PTT profil : delegue le switch de canal a l'UI.
+
+        CircusPhone (D3) : ignore pendant un appel telephone (radio
+        desactivee, spec). Pas de bip, pas de switch de canal."""
+        if state.phone_in_call:
+            try:
+                _dbg_log("[RADIO PTT-PROFIL] press ignore (appel telephone en cours)")
+            except Exception:
+                pass
+            return
         with self._profile_release_lock:
             self._profile_release_gen += 1
         state.profile_radio_active = True
@@ -1015,7 +1421,12 @@ class RadioKeyListener:
                 pass
 
     def _on_profile_radio_released_impl(self):
-        """Release du PTT profil : restaure le canal precedent + coupe radio."""
+        """Release du PTT profil : restaure le canal precedent + coupe radio.
+
+        CircusPhone (D3) : pendant un appel, le press a ete ignore donc
+        rien a nettoyer ; on ignore le release (pas de bip 'release')."""
+        if state.phone_in_call:
+            return
         with self._profile_release_lock:
             self._profile_release_gen += 1
             my_gen = self._profile_release_gen
@@ -1133,6 +1544,36 @@ class RadioKeyListener:
         if cck and self._on_cycle_channel and \
                 _combo_matches_pressed(cck, self._currently_pressed, key_str):
             try: self._on_cycle_channel()
+            except Exception: pass
+        # CircusPhone (D4 etape 4) : 5 raccourcis telephone, toggle au press.
+        # Tous suivent le meme pattern : si la touche configuree match et que
+        # le callback est branche, on appelle. Le callback decidera lui-meme
+        # si l'action est legitime (ex: phone_accept ne fait rien hors
+        # appel entrant - geste cote MainWindow).
+        ph_open = state.phone_open_key or ""
+        if ph_open and self._on_phone_open and \
+                _combo_matches_pressed(ph_open, self._currently_pressed, key_str):
+            try: self._on_phone_open()
+            except Exception: pass
+        ph_acc = state.phone_accept_key or ""
+        if ph_acc and self._on_phone_accept and \
+                _combo_matches_pressed(ph_acc, self._currently_pressed, key_str):
+            try: self._on_phone_accept()
+            except Exception: pass
+        ph_dec = state.phone_decline_key or ""
+        if ph_dec and self._on_phone_decline and \
+                _combo_matches_pressed(ph_dec, self._currently_pressed, key_str):
+            try: self._on_phone_decline()
+            except Exception: pass
+        ph_mut = state.phone_mute_key or ""
+        if ph_mut and self._on_phone_mute and \
+                _combo_matches_pressed(ph_mut, self._currently_pressed, key_str):
+            try: self._on_phone_mute()
+            except Exception: pass
+        ph_sp = state.phone_speaker_key or ""
+        if ph_sp and self._on_phone_speaker and \
+                _combo_matches_pressed(ph_sp, self._currently_pressed, key_str):
+            try: self._on_phone_speaker()
             except Exception: pass
 
     def _check_ptt_press(self, key_str):
@@ -1725,6 +2166,13 @@ async def _audio_sender(ws):
         try:
             # run_in_executor pour que queue.get() ne bloque pas la boucle
             data = await loop.run_in_executor(None, _audio_send_queue.get)
+        except asyncio.CancelledError:
+            # Cancellation propre (le caller a cancel() cette task).
+            # Le thread executor reste bloque dans queue.get() : c'est
+            # le caller (cf. _audio_ws_loop.finally) qui doit avoir
+            # mis une sentinel None pour le debloquer juste avant le
+            # cancel.
+            return
         except Exception:
             return
         if data is None:
@@ -1732,20 +2180,37 @@ async def _audio_sender(ws):
             return
         try:
             await ws.send(data)
+        except asyncio.CancelledError:
+            return
         except Exception:
             return
 
-async def _audio_ws_loop(ui):
+async def _audio_ws_loop(ui, my_gen: int = 0):
     """
     Se connecte au serveur audio et gere l'echange de trames.
     - Reception : chaque message binaire est prefixe du nom de l'emetteur.
     - Envoi : un task dedie consomme la queue alimentee par la capture.
+    
+    my_gen : numero de generation au moment du demarrage de ce thread.
+    Si state.audio_ws_generation augmente (= un nouveau thread a ete
+    lance, typiquement apres une reconnexion serveur principal), ce
+    thread termine proprement. Sans ca, l'ancien thread continuerait a
+    tenter des reconnexions avec un ticket obsolete et entrerait en
+    course avec le nouveau thread, qui pourrait alors echouer
+    (l'ancien "vole" la session puis se fait refuser plus tard quand
+    son ticket expire).
     """
     global _audio_send_queue
     import queue as _q
     _audio_send_queue = _q.Queue(maxsize=50)
 
     while True:
+        # [P4+] Verifier qu'on est toujours le thread actif. Si un
+        # nouveau thread a ete lance entretemps (reconnexion serveur
+        # principal), on termine proprement et on le laisse prendre
+        # le relais avec le ticket frais.
+        if my_gen != 0 and my_gen != state.audio_ws_generation:
+            break
         ip = getattr(state, "audio_server_ip", None)
         if not ip or state.audio_io is None:
             await asyncio.sleep(1)
@@ -1804,11 +2269,41 @@ async def _audio_ws_loop(ui):
                             #   0x00 = proximity (sans PTT)
                             #   0x01 = radio classique (PTT canal)
                             #   0x02 = radio profil (PTT profil)
+                            #   0x03 = voix telephone CircusPhone (D3)
                             flag = payload[0]
                             is_radio_canal  = (flag == 1)
                             is_radio_profil = (flag == 2)
+                            is_phone        = (flag == 3)
                             is_radio = is_radio_canal or is_radio_profil  # alias pour audio_io
                             frame    = payload[1:]
+
+                            # ── CircusPhone (D3) : trame voix telephone ──
+                            # Une trame 0x03 n'est jouee QUE si elle vient
+                            # de mon correspondant d'appel. Le serveur audio
+                            # broadcast a tout le monde : les trames 0x03
+                            # des autres appels en cours doivent etre
+                            # ignorees ici (le serveur de positions, lui,
+                            # garantit le 1-a-1 ; le serveur audio est bete).
+                            if is_phone:
+                                if not state.phone_in_call:
+                                    continue
+                                if sender != state.phone_peer:
+                                    continue
+                                # Dedup : noter le timestamp pour jeter la
+                                # trame proximity du meme sender (il envoie
+                                # 0x03 + 0x00 en parallele).
+                                state.last_phone_seen_ts[sender] = time.monotonic()
+                                if state.audio_io is not None:
+                                    # Volume plein : au telephone la distance
+                                    # physique n'existe pas. Pas de filtre
+                                    # radio (spec : clair des deux cotes),
+                                    # pas d'echo grotte (route vers mix_phone
+                                    # dans audio_io via is_phone=True).
+                                    state.audio_io.set_user_volume(sender, 1.0)
+                                    state.audio_io.feed_remote_frame(
+                                        sender, frame, is_phone=True
+                                    )
+                                continue
 
                             # Mute radio : coupe les 2 modes radio
                             if is_radio and state.mute_radio:
@@ -1838,6 +2333,14 @@ async def _audio_ws_loop(ui):
                                 # ou profil) du meme sender dans les 50ms qui precedent.
                                 last_radio = state.last_radio_seen_ts.get(sender, 0)
                                 if (time.monotonic() - last_radio) < 0.05:
+                                    continue
+                                # Dedup aussi vs la voix telephone : si le
+                                # sender m'envoie sa voix telephone (0x03) et
+                                # que je l'ai recue dans les 50ms, je jette
+                                # sa trame proximity (sinon je l'entendrais
+                                # 2 fois : une en telephone, une en proximite).
+                                last_phone = state.last_phone_seen_ts.get(sender, 0)
+                                if (time.monotonic() - last_phone) < 0.05:
                                     continue
 
                             if state.audio_io is not None:
@@ -1902,10 +2405,47 @@ async def _audio_ws_loop(ui):
                                         pass
                                     break
                 finally:
+                    # Debloquer _audio_sender qui peut etre bloque dans
+                    # run_in_executor(None, _audio_send_queue.get). Sans
+                    # cette sentinel, le thread du default executor reste
+                    # pendu indefiniment sur queue.Queue.get() : la
+                    # cancel asyncio ne peut pas tuer un thread Python,
+                    # donc on doit le reveiller proprement. Au shutdown
+                    # asyncio joindrait alors les threads et abandonnerait
+                    # apres 300s avec un RuntimeWarning.
+                    try:
+                        if _audio_send_queue is not None:
+                            # Si la queue est pleine, on draine d'abord
+                            # quelques items pour garantir que put_nowait
+                            # passe. Pas besoin de tout vider, juste assez
+                            # pour faire de la place pour la sentinel.
+                            try:
+                                _audio_send_queue.put_nowait(None)
+                            except Exception:
+                                # Queue pleine : on draine puis on retente.
+                                try:
+                                    for _ in range(60):
+                                        if _audio_send_queue.empty():
+                                            break
+                                        _audio_send_queue.get_nowait()
+                                except Exception:
+                                    pass
+                                try:
+                                    _audio_send_queue.put_nowait(None)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
                     sender_task.cancel()
                     try:
                         await sender_task
-                    except Exception:
+                    except (asyncio.CancelledError, Exception):
+                        # CancelledError est attendu (on vient de cancel),
+                        # Exception couvre les autres erreurs de fermeture
+                        # (websocket deja ferme, etc.). En Python 3.8+,
+                        # CancelledError herite de BaseException et n'est
+                        # PAS attrape par except Exception : il faut le
+                        # nommer explicitement.
                         pass
         except websockets.exceptions.ConnectionClosedError as e:
             # Code 1008 = connexion refusee par le serveur (token OU ticket).
@@ -1938,7 +2478,13 @@ async def _audio_ws_loop(ui):
         await asyncio.sleep(3)
 
 def _run_audio_ws(ui):
-    asyncio.run(_audio_ws_loop(ui))
+    # Incremente la generation : tout ancien thread audio en cours verra
+    # sa generation devenir obsolete et terminera proprement. Thread-safe
+    # car GIL : lecture-modification-ecriture sur un int Python sont
+    # atomiques au niveau bytecode (pas besoin de lock pour incrementer).
+    state.audio_ws_generation += 1
+    my_gen = state.audio_ws_generation
+    asyncio.run(_audio_ws_loop(ui, my_gen))
 
 
 def _has_player_in_range() -> bool:
@@ -1973,11 +2519,28 @@ def _on_audio_captured(frame_np):
     joueurs a cote (mais pas sur le canal/profil) d'entendre ma voix en
     proximite. Le receveur depulique via state.last_radio_seen_ts (50ms).
     Optimisation : pas de 2e flux si personne a portee.
+
+    CircusPhone (D3) : si state.phone_in_call, on est PRIORITAIRE sur la
+    radio - la voix part avec le flag 0x03 (telephone) vers le correspondant,
+    + une trame proximity 0x00 si quelqu'un est a portee (regle "ma voix
+    telephone part aussi dans ma proximite locale, comme un vrai telephone").
+    La radio (PTT canal/profil) est ignoree pendant un appel : le test
+    phone_in_call court-circuite les branches radio.
     """
     if not state.audio_connected:
         return
     if _audio_send_queue is None:
         return
+    # CircusPhone (D4 etape 2) : si l'utilisateur a active le mute micro
+    # depuis l'overlay (ecran 'En appel'), aucune trame n'est emise.
+    # La capture continue de tourner (pour reprendre instantanement) mais
+    # cette frame est simplement jetee. Coupure NETTE : la spec l'impose.
+    if state.audio_io is not None:
+        try:
+            if state.audio_io.is_capture_muted():
+                return
+        except Exception:
+            pass
     try:
         frame_bytes = frame_np.tobytes()
 
@@ -1989,7 +2552,19 @@ def _on_audio_captured(frame_np):
                     pass
             _audio_send_queue.put_nowait(data)
 
-        if state.profile_radio_active:
+        if state.phone_in_call:
+            # Appel telephone en cours : flag 0x03 + (eventuellement)
+            # proximity. La radio est neutralisee (spec).
+            # D4b : si je suis le peer d'un appel HP (hp_proxies_allowed
+            # non vide), il y a des voisins de l'owner qui doivent
+            # m'entendre en prox malgre la distance. On force l'envoi
+            # 0x00 dans ce cas, meme si personne n'est dans mes 30m
+            # locaux. Sinon test classique : 2e flux prox seulement si
+            # quelqu'un est a portee (eco bande passante).
+            _put(b"\x03" + frame_bytes)
+            if _has_player_in_range() or state.hp_proxies_allowed:
+                _put(b"\x00" + frame_bytes)
+        elif state.profile_radio_active:
             # PTT profil : flag 0x02 + (eventuellement) proximity
             _put(b"\x02" + frame_bytes)
             if _has_player_in_range():
@@ -2397,6 +2972,11 @@ def _ocr_loop_inner(ui: "ClientUI"):
     stats_rejected = 0    # rejetees par MAX_JUMP
     stats_cid_similar = 0 # corrections de container_id par _are_containers_similar
                           # (chiffres OCR confondus type 3 vs 8 sur l'id numerique)
+    # v0.2 (optim perf) : cleanup VRAM CUDA garde sa cadence propre (30s)
+    # decouplee de la cadence des stats (qui peut etre raccourcie en phase
+    # d'optim). Sans ce decouplage, raccourcir stats provoquerait des
+    # empty_cache() plus frequents = des micro-pauses GPU inutiles.
+    vram_cleanup_t0 = time.time()
 
     # Backoff CPU hors-jeu :
     # - Quand SC n'est pas en jeu (launcher, login, menu charge mais hors session),
@@ -2418,7 +2998,62 @@ def _ocr_loop_inner(ui: "ClientUI"):
     )
     consecutive_empty = 0  # nb de tentatives consecutives sans parse OK
 
+    # v0.2 (optim perf) : cadence cible de la boucle OCR.
+    # Avant : pas de rate limiter -> sur GPU recent (3060+), la boucle
+    # tournait a 10-20 lectures/s (limite seulement par le temps pipeline
+    # cv2 + EasyOCR GPU). 4 lectures/s etait l'INTENTION (vu les
+    # commentaires "cadence normale ~4/s") mais pas garantie.
+    # Pour de la VoIP positionnelle, 2-3 lectures/s suffisent largement :
+    #  - le joueur ne se teleporte pas (les positions varient lentement)
+    #  - le mixage audio tolere 300-500ms de latence de position sans
+    #    artefact audible
+    #  - la distance au plus proche joueur est recalculee aussi a chaque
+    #    pos recue des AUTRES joueurs (independamment de notre cadence)
+    # Cible : 1 lecture toutes les 350ms = ~2.8 Hz. Si le pipeline OCR
+    # met deja 350ms ou plus, on ne dort pas (cadence naturelle = celle
+    # du pipeline). Sinon on dort la difference pour respecter la cible.
+    # NB : la cadence s'applique aussi hors connexion, car l'UI locale
+    # affiche la position courante / le container meme sans serveur.
+    OCR_TARGET_PERIOD_S = 0.35
+
+    # v0.2 (optim perf) : backoff cadence sur position stable.
+    # Observe en profiling : quand le joueur est immobile, le pipeline OCR
+    # tourne au meme cout que en mouvement (~270ms), mais la conso Circus
+    # est SUPERIEURE (21% vs 5-14%). Hypothese : memcpy synchrones host<->
+    # device CUDA plus frequentes quand l'image OCR ne change pas (cache
+    # CUDA differemment sollicite). On compense en ralentissant la cadence
+    # quand on a confirme l'immobilite (3 lectures identiques consecutives).
+    # Conservateur (-> latence max 500ms) : OK pour la VoIP, le joueur ne
+    # se met pas a courir a 100m/s d'un coup, et 1 lecture rapide suffira
+    # a redetecter le mouvement.
+    OCR_STABLE_THRESHOLD = 3        # nb de lectures identiques avant backoff
+    OCR_STABLE_PERIOD_S = 0.5       # periode quand position confirmee stable
+    # Quel "identique" : on compare container_id + x/y/z arrondis a 1m.
+    # Les oscillations OCR sub-metrique (-84.76m vs -84.77m) ne reveillent
+    # pas le backoff -> on profite bien de l'optim en pratique.
+    OCR_STABLE_ROUND_M = 1
+    consecutive_stable = 0          # nb de lectures consecutives "memes coords"
+    last_stable_key = None          # tuple (cid, x, y, z) de la derniere lecture
+
+    _ocr_last_iter_start = 0.0  # monotonic du debut du tour precedent (0 = pas encore)
+    _ocr_current_target_period_s = OCR_TARGET_PERIOD_S  # peut basculer en stable
+
     while True:
+        # v0.2 (optim perf) : rate limiter cadence cible (dynamique).
+        # On dort le temps restant pour respecter _ocr_current_target_period_s
+        # entre 2 debuts de tour. La periode bascule automatiquement entre
+        # OCR_TARGET_PERIOD_S (mouvement, 350ms) et OCR_STABLE_PERIOD_S (stable,
+        # 500ms) selon consecutive_stable. Independant du chemin pris par le
+        # tour precedent (peu importe les continue / branches dans la boucle).
+        # Si le tour precedent a deja pris plus que la periode cible, on
+        # ne dort pas (le pipeline OCR est deja le bottleneck).
+        if _ocr_last_iter_start > 0.0:
+            _elapsed = time.monotonic() - _ocr_last_iter_start
+            _to_sleep = _ocr_current_target_period_s - _elapsed
+            if _to_sleep > 0:
+                time.sleep(_to_sleep)
+        _ocr_last_iter_start = time.monotonic()
+
         # Signaler au watchdog qu'on est toujours vivant. A chaque tour, meme
         # avant le read_coords : si l'OCR freeze pendant un read, le watchdog
         # verra que _ocr_last_tick n'avance plus et logguera.
@@ -2447,7 +3082,16 @@ def _ocr_loop_inner(ui: "ClientUI"):
             # consecutive_empty n'est PAS incremente ici : c'est specifique
             # a "OCR a tente mais rien trouve", pas "OCR pas tente".
 
+        # v0.2 (optim perf) : chrono autour de read_coords() pour mesurer
+        # le temps reel du pipeline OCR (capture + cv2 + EasyOCR + Tesseract
+        # fallback). Le delta est cumule par _profiling_tick_ocr et reporte
+        # toutes les STATS_PERIOD_S dans [PROFILING].
+        _ocr_pipeline_t0 = time.monotonic()
         pos = read_coords(zone)
+        _profiling_tick_ocr(
+            time.monotonic() - _ocr_pipeline_t0,
+            is_stable_cadence=(_ocr_current_target_period_s == OCR_STABLE_PERIOD_S),
+        )
         stats_tried += 1
 
         # Backoff CPU sur OCR vide en serie : si l'OCR ne trouve rien pendant
@@ -2478,11 +3122,12 @@ def _ocr_loop_inner(ui: "ClientUI"):
             _dbg_log(f"[SC OFFLINE] pas de position valide depuis {SC_OFFLINE_TIMEOUT}s")
             _ws_send_safe({"type": "sc_offline"})
 
-        # Stats periodiques (toutes les 30s)
-        if time.time() - stats_t0 >= 30.0:
+        # Stats periodiques (cadence STATS_PERIOD_S, ajustable pour phase
+        # d'optim ; defaut 30s en prod).
+        if time.time() - stats_t0 >= STATS_PERIOD_S:
             dur = time.time() - stats_t0
             _dbg_log(
-                f"[STATS 30s] tentes={stats_tried} parses_ok={stats_parsed} "
+                f"[STATS {STATS_PERIOD_S:.0f}s] tentes={stats_tried} parses_ok={stats_parsed} "
                 f"rejetes_jump={stats_rejected} cid_similar={stats_cid_similar} "
                 f"taux={100*stats_parsed/max(stats_tried,1):.0f}% "
                 f"cadence={stats_tried/dur:.1f}/s"
@@ -2495,17 +3140,27 @@ def _ocr_loop_inner(ui: "ClientUI"):
                 _log_system_metrics()
             except Exception:
                 pass
+            # v0.2 (optim perf) : profiling detaille temporaire. A retirer
+            # (ou flipper _PROFILING_ENABLED a False) une fois l'optim finie.
+            try:
+                _log_profiling_metrics()
+            except Exception:
+                pass
             stats_t0       = time.time()
             stats_tried    = 0
             stats_parsed   = 0
             stats_rejected = 0
             stats_cid_similar = 0
 
-            # Cleanup VRAM CUDA periodique : libere la memoire fragmentee
-            # accumulee par les nombreuses lectures EasyOCR. Sur les petites
-            # cartes (RTX 2060 6GB) qui partagent la VRAM avec Star Citizen,
-            # ca evite les freezes OCR quand SC fait un pic memoire.
-            # Operation legere (~5-10ms) faite uniquement toutes les 30s.
+        # Cleanup VRAM CUDA periodique : libere la memoire fragmentee
+        # accumulee par les nombreuses lectures EasyOCR. Sur les petites
+        # cartes (RTX 2060 6GB) qui partagent la VRAM avec Star Citizen,
+        # ca evite les freezes OCR quand SC fait un pic memoire.
+        # Operation legere (~5-10ms) faite toutes les VRAM_CLEANUP_PERIOD_S
+        # (defaut 30s) - cadence decouplee des stats pour ne pas multiplier
+        # les empty_cache() si on raccourcit les stats en phase d'optim.
+        if time.time() - vram_cleanup_t0 >= VRAM_CLEANUP_PERIOD_S:
+            vram_cleanup_t0 = time.time()
             try:
                 import torch
                 if torch.cuda.is_available():
@@ -2907,6 +3562,13 @@ def _ocr_loop_inner(ui: "ClientUI"):
             reject_count  = 0
             last_pos      = pos
             state.my_pos  = pos
+            # v0.2 : timestamp monotonic de la derniere position locale
+            # lue par l'OCR. Utilise par le client pour decider si l'OCR
+            # est "actif" (= position fraiche) et donc afficher l'overlay
+            # de masquage DisplayInfo. Au-dela d'un delai (cf. constante
+            # cote client, defaut 20s), la position est consideree perimee
+            # et l'overlay disparait.
+            state.my_pos_ts = time.monotonic()
 
             # Mettre a jour l'UI
             ui.update_my_pos(pos)
@@ -2953,6 +3615,23 @@ def _ocr_loop_inner(ui: "ClientUI"):
                     last_radio = state.radio_recv_ts.get(name, 0)
                     if (now_mono - last_radio) < 1.0:
                         continue
+                    # CircusPhone D4b : si ce joueur est un peer HP autorise
+                    # (= je suis voisin d'un appel HP et lui est l'autre
+                    # partie de cet appel), je dois l'entendre a fond comme
+                    # s'il etait dans mon rayon prox, peu importe sa
+                    # distance reelle. On force le volume a 1.0 et on saute
+                    # tous les checks de distance / sc_online / pos.
+                    if name in state.hp_speakers_allowed:
+                        state.audio_io.set_user_volume(name, 1.0)
+                        continue
+                    # CircusPhone D4b : si je suis le peer d'un appel HP
+                    # (mon HP est actif sur l'autre cote, ou je suis C),
+                    # les voisins de l'owner doivent etre audibles a fond
+                    # via la prox, peu importe leur distance reelle. Eux
+                    # sont dans state.hp_proxies_allowed.
+                    if name in state.hp_proxies_allowed:
+                        state.audio_io.set_user_volume(name, 1.0)
+                        continue
                     # Si SC est ferme chez l'autre -> volume 0
                     if not info.get("sc_online", True):
                         state.audio_io.set_user_volume(name, 0.0)
@@ -2989,6 +3668,48 @@ def _ocr_loop_inner(ui: "ClientUI"):
                 "pos": pos,
                 "ts_capture": time.time(),  # timestamp Unix pour mesurer latence
             })
+
+            # CircusPhone D4b : si MON HP est actif, recalculer la liste
+            # des voisins ≤5m et l'envoyer au serveur si elle a change
+            # (throttle 1s en interne, geré par _phone_hp_send_state).
+            # Pas de cout si HP off ou pas en appel : la fonction sort en
+            # premiere ligne.
+            try:
+                _phone_hp_send_state(force=False)
+            except Exception:
+                # Best-effort : un fail d'envoi HP ne doit pas interrompre
+                # la boucle OCR (qui doit tourner pour la VoIP positionnelle).
+                pass
+
+            # v0.2 (optim perf) : detection position stable -> bascule cadence.
+            # On compare la position courante (arrondie a OCR_STABLE_ROUND_M
+            # metres) avec la precedente. Si identiques sur OCR_STABLE_THRESHOLD
+            # lectures consecutives, on passe en cadence "stable" (plus lente).
+            # Des qu'une difference apparait, retour immediat a la cadence
+            # "mouvement". L'arrondi a 1m permet d'ignorer les oscillations
+            # sub-metrique de l'OCR (ex: -84.76m vs -84.77m) qui ne sont pas
+            # de vrais mouvements.
+            try:
+                _cur_key = (
+                    pos.get("container_id"),
+                    round((pos.get("x") or 0) / OCR_STABLE_ROUND_M),
+                    round((pos.get("y") or 0) / OCR_STABLE_ROUND_M),
+                    round((pos.get("z") or 0) / OCR_STABLE_ROUND_M),
+                )
+                if last_stable_key is not None and _cur_key == last_stable_key:
+                    consecutive_stable += 1
+                else:
+                    consecutive_stable = 1
+                last_stable_key = _cur_key
+                # Bascule de cadence
+                if consecutive_stable >= OCR_STABLE_THRESHOLD:
+                    _ocr_current_target_period_s = OCR_STABLE_PERIOD_S
+                else:
+                    _ocr_current_target_period_s = OCR_TARGET_PERIOD_S
+            except Exception:
+                # Si erreur (pos malforme), on reste en cadence mouvement
+                _ocr_current_target_period_s = OCR_TARGET_PERIOD_S
+                consecutive_stable = 0
 
 # ---------------------------------------------
 #  Interface

@@ -71,7 +71,8 @@ _audio_rate = RateLimiter(rate=60.0, burst=120.0)
 # [P4 - auth partagee] Registre de tickets partage avec le serveur
 # positions. Un client doit presenter un ticket emis par le serveur
 # positions pour etre accepte ici. Meme fichier des deux cotes.
-_AUTH_REGISTRY_FILE = Path(__file__).resolve().parent / "circusvoip_auth_tickets.json"
+from circusvoip_server_config import get_data_dir as _get_data_dir
+_AUTH_REGISTRY_FILE = _get_data_dir() / "circusvoip_auth_tickets.json"
 _auth_registry = AuthRegistry(_AUTH_REGISTRY_FILE, ttl_sec=120.0)
 
 # Format audio utilise par les clients (pour info, pas enforced)
@@ -303,7 +304,7 @@ async def _serve(ui):
     # plutot que d'accepter en clair (la VoIP serait alors lisible par
     # quiconque ecoute le reseau).
     from circusvoip_security import ensure_self_signed_cert, build_ssl_context
-    _base_dir = Path(__file__).resolve().parent
+    _base_dir = _get_data_dir()
     _cert_file = _base_dir / "cert.pem"
     _key_file = _base_dir / "key.pem"
     _ok, _detail = ensure_self_signed_cert(_cert_file, _key_file, common_name="circusvoip-audio")

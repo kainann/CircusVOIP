@@ -19,6 +19,7 @@ PATCHES SECURITE appliques :
 """
 
 import asyncio
+import hashlib
 import json
 import secrets
 import socket
@@ -427,12 +428,39 @@ _channels: list = []
 _PROFILES_FILE = _BASE_DIR / "circusvoip_profiles.json"
 _profiles: list = []
 
-# Liste des broadcasters : joueurs autorises a parler simultanement sur TOUS
-# les canaux radio (PTT diffusion globale, flag audio 0x04). L'admin gere la
-# liste via grant_broadcaster / revoke_broadcaster. La capability est
-# propagee au serveur audio via le ticket (cf. AuthRegistry.issue(can_broadcast=)).
+# Broadcasters : joueurs autorises a parler simultanement sur TOUS les canaux
+# radio (PTT diffusion globale, flag audio 0x04). L'admin gere la liste via
+# grant_broadcaster / revoke_broadcaster. La capability est propagee au serveur
+# audio via le ticket (cf. AuthRegistry.issue(can_broadcast=)).
+#
+# Modele d'auth (cf. feat/broadcaster-token-auth) :
+#   _broadcasters : dict {name: sha256_hex_du_token}
+#   Le token clair est genere au grant, hashe ici, et pushed une seule fois au
+#   client cible via sa WebSocket. Le client le sauvegarde dans son config et
+#   le presente au join (champ "broadcaster_token"). Le serveur compare en
+#   temps constant. Sans le bon token, le nom est REFUSE au join (anti-impersonation).
 _BROADCASTERS_FILE = _BASE_DIR / "circusvoip_broadcasters.json"
-_broadcasters: set = set()
+_broadcasters: dict = {}
+
+
+def _hash_broadcaster_token(token: str) -> str:
+    """Hash SHA-256 hexa du token broadcaster.
+    On ne stocke jamais le token en clair cote serveur ; on ne peut donc pas
+    le re-emettre apres le grant initial (re-grant requis pour le renvoyer)."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _verify_broadcaster_token(name: str, token: str) -> bool:
+    """Verifie en temps constant que `token` correspond au hash stocke pour `name`.
+    Renvoie False si le nom n'est pas dans _broadcasters, si le token est vide,
+    ou si le hash ne correspond pas."""
+    if not name or not token or not isinstance(token, str):
+        return False
+    stored = _broadcasters.get(name)
+    if not stored:
+        return False
+    candidate = _hash_broadcaster_token(token)
+    return secrets.compare_digest(candidate, stored)
 
 
 def _load_channels() -> list:
@@ -632,25 +660,49 @@ def _build_my_profile_msg(profile_name) -> dict:
     return msg
 
 
-def _load_broadcasters() -> set:
-    """Charge la liste des broadcasters depuis circusvoip_broadcasters.json.
-    Retourne un set vide si absent (la capability est opt-in)."""
+def _load_broadcasters() -> dict:
+    """Charge le mapping {name: hash} depuis circusvoip_broadcasters.json.
+    Retourne {} si absent (la capability est opt-in).
+
+    Migration : l'ancien format etait une liste de noms (pas de token). Si on
+    detecte ce format, on log un warning et on retourne un dict vide : l'admin
+    doit re-grant chaque broadcaster pour generer leurs tokens. On ne migre
+    PAS en silence (cela donnerait l'illusion d'un setup sûr alors qu'aucun
+    token n'aurait ete distribue aux joueurs concernes)."""
     try:
         if _BROADCASTERS_FILE.exists():
             with open(_BROADCASTERS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list):
-                return {n.strip() for n in data if isinstance(n, str) and n.strip()}
+                # Ancien format detecte : pas de tokens, re-grant requis.
+                old_names = [n for n in data if isinstance(n, str) and n.strip()]
+                if old_names:
+                    print(
+                        f"[BROADCASTERS] Ancien format detecte dans "
+                        f"{_BROADCASTERS_FILE.name} ({len(old_names)} entree(s) : "
+                        f"{old_names}). Les broadcasters DOIVENT etre re-grant "
+                        f"pour generer leurs tokens. Liste videe."
+                    )
+                return {}
+            if isinstance(data, dict):
+                # Format actuel : {name: sha256_hex}.
+                clean = {}
+                for name, h in data.items():
+                    if (isinstance(name, str) and name.strip()
+                            and isinstance(h, str) and len(h) == 64):
+                        clean[name.strip()] = h
+                return clean
     except Exception as e:
         print(f"[BROADCASTERS] Echec chargement {_BROADCASTERS_FILE.name} : {e}")
-    return set()
+    return {}
 
 
 def _save_broadcasters():
-    """Persiste la liste des broadcasters dans circusvoip_broadcasters.json."""
+    """Persiste le mapping {name: hash} dans circusvoip_broadcasters.json.
+    Le hash uniquement est persiste, jamais le token en clair."""
     try:
         with open(_BROADCASTERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(_broadcasters), f, ensure_ascii=False, indent=2)
+            json.dump(_broadcasters, f, ensure_ascii=False, indent=2, sort_keys=True)
     except Exception as e:
         print(f"[BROADCASTERS] Echec sauvegarde {_BROADCASTERS_FILE.name} : {e}")
 
@@ -1394,11 +1446,11 @@ async def _admin_handle_cmd(ws, cmd: str, data: dict) -> tuple:
                 pass
             return (True, "")
         if cmd == "grant_broadcaster":
-            ok = grant_broadcaster(data.get("name", ""))
-            return (ok, "" if ok else "nom vide")
+            ok, reason = await grant_broadcaster(data.get("name", ""))
+            return (ok, reason)
         if cmd == "revoke_broadcaster":
-            ok = revoke_broadcaster(data.get("name", ""))
-            return (ok, "" if ok else "nom vide")
+            ok, reason = await revoke_broadcaster(data.get("name", ""))
+            return (ok, reason)
         if cmd == "list_broadcasters":
             try:
                 await ws.send(json.dumps({
@@ -1577,6 +1629,51 @@ async def handler(ws):
 
                 name = data.get("name", f"Player_{len(clients)+1}")
 
+                # [UNIQUE NAME] Refuse si un client deja connecte porte le
+                # meme nom. Sans cela, n'importe qui peut se faire passer
+                # pour un autre joueur dans le chat / les canaux. Combine
+                # avec la verification du broadcaster_token, cela ferme
+                # aussi le scenario "deconnecte, reconnecte sous le nom
+                # d'un broadcaster connu pour usurper le role".
+                if _find_client_ws_by_name(name) is not None:
+                    _log(f"REFUSE : nom deja utilise '{name}' (ip {peer_ip})", ORANGE)
+                    try:
+                        await ws.send(json.dumps({
+                            "type": "error",
+                            "reason": "name_in_use",
+                            "message": "Ce nom est deja utilise sur ce serveur",
+                        }))
+                    except Exception:
+                        pass
+                    await ws.close(code=1008, reason="name_in_use")
+                    return
+
+                # [BROADCASTER AUTH] Si le nom figure dans _broadcasters, le
+                # client DOIT presenter le broadcaster_token correct. Cela
+                # protege a la fois :
+                #   - l'octroi du role (sans token, can_broadcast=False)
+                #   - l'identite (un non-broadcaster ne peut pas usurper le
+                #     nom d'un broadcaster connu)
+                # Distinction stricte entre les deux cas n'apporte rien :
+                # dans les deux cas le join est refuse, le client clarifie
+                # son setup et ressaie.
+                client_bcast_token = data.get("broadcaster_token", "")
+                if name in _broadcasters:
+                    if not _verify_broadcaster_token(name, client_bcast_token):
+                        _log(f"REFUSE : broadcaster_token invalide pour '{name}' "
+                             f"(ip {peer_ip})", RED)
+                        try:
+                            await ws.send(json.dumps({
+                                "type": "error",
+                                "reason": "broadcaster_token_invalid",
+                                "message": "Ce nom est reserve a un broadcaster ; "
+                                           "broadcaster_token manquant ou invalide",
+                            }))
+                        except Exception:
+                            pass
+                        await ws.close(code=1008, reason="broadcaster_token_invalid")
+                        return
+
                 # [P4 - auth partagee] Genere un ticket court pour ce
                 # joueur. Le client le recevra dans le welcome et devra le
                 # presenter au serveur audio. Sans ce ticket, le serveur
@@ -1603,7 +1700,9 @@ async def handler(ws):
                 # le serveur audio. Le serveur audio relira ce fichier au
                 # moment du join audio pour valider le ticket presente.
                 # can_broadcast est lu cote audio pour autoriser les frames
-                # avec flag 0x04 (PTT diffusion globale). Si le role est
+                # avec flag 0x04 (PTT diffusion globale) ; n'est True que
+                # si le nom est broadcaster ET que le token a ete verifie
+                # ci-dessus. Si le role est
                 # revoque pendant que le joueur est connecte, la revocation
                 # ne s'applique qu'au prochain ticket (TTL <= 120s).
                 _auth_registry.issue(
@@ -2601,43 +2700,80 @@ def _broadcast_broadcasters_list_threadsafe():
             pass
 
 
-def grant_broadcaster(player_name: str) -> bool:
-    """Accorde le role broadcaster a `player_name`. Idempotent : renvoie
-    True meme si deja accorde, False uniquement sur nom vide. La
-    capability ne devient effective qu'au prochain ticket emis : si le
-    joueur est deja connecte, il devra se reconnecter au serveur positions
-    pour que son ticket audio porte can_broadcast=True (TTL ticket = 120s
-    + cycle reconnect, donc effectif sous ~2 min en pratique)."""
-    player_name = (player_name or "").strip()
-    if not player_name:
-        return False
-    if player_name not in _broadcasters:
-        _broadcasters.add(player_name)
-        _save_broadcasters()
-        _broadcast_broadcasters_list_threadsafe()
-        _log(f"Broadcaster accorde : {player_name}", GREEN)
-    return True
+def _find_client_ws_by_name(player_name: str):
+    """Cherche dans `clients` la WebSocket associee au nom donne.
+    Renvoie None si aucune connexion active ne porte ce nom."""
+    for ws_, info in clients.items():
+        if info.get("name") == player_name:
+            return ws_
+    return None
 
 
-def revoke_broadcaster(player_name: str) -> bool:
-    """Retire le role broadcaster a `player_name`. Idempotent : renvoie
-    True meme si deja absent, False uniquement sur nom vide. Comme
-    grant_broadcaster, la revocation n'est effective qu'au prochain
-    ticket (TTL <= 120s)."""
+async def grant_broadcaster(player_name: str) -> tuple:
+    """Accorde le role broadcaster a `player_name` et lui push son token
+    via sa WebSocket. Renvoie (ok, reason).
+
+    Le joueur DOIT etre connecte au moment du grant. C'est le seul canal
+    par lequel le token est transmis (jamais affiche en clair, jamais
+    persiste cote serveur autrement que sous forme de hash). Si le joueur
+    se deconnecte avant d'avoir sauvegarde le token cote client, le grant
+    doit etre refait."""
     player_name = (player_name or "").strip()
     if not player_name:
-        return False
+        return (False, "nom_vide")
+    target_ws = _find_client_ws_by_name(player_name)
+    if target_ws is None:
+        return (False, "player_must_be_connected")
+    # Token clair : 32 hex chars (16 octets d'entropie). Stocke uniquement
+    # son hash cote serveur ; le clair part vers le client une seule fois.
+    token = secrets.token_hex(16)
+    _broadcasters[player_name] = _hash_broadcaster_token(token)
+    _save_broadcasters()
+    # Push au client cible. On ne capture pas l'echec : si la WS est cassee
+    # entre temps, le grant reste valide cote serveur mais le client n'aura
+    # pas le token (re-grant requis). L'admin verra le succes dans la
+    # reponse mais le joueur ne pourra pas broadcast tant qu'il n'a pas
+    # le token sauvegarde et re-presente au join.
+    try:
+        await target_ws.send(json.dumps({
+            "type": "broadcaster_token_granted",
+            "token": token,
+        }))
+    except Exception as e:
+        _log(f"Broadcaster grant : echec push WS a {player_name} : {e}", ORANGE)
+    _broadcast_broadcasters_list_threadsafe()
+    _log(f"Broadcaster accorde : {player_name} (token pushed)", GREEN)
+    return (True, "")
+
+
+async def revoke_broadcaster(player_name: str) -> tuple:
+    """Retire le role broadcaster a `player_name`. Si le joueur est connecte,
+    lui push aussi un message broadcaster_revoked pour qu'il efface son
+    token cote client. La capability cessera d'etre accordee au prochain
+    ticket (TTL <= 120s). Idempotent."""
+    player_name = (player_name or "").strip()
+    if not player_name:
+        return (False, "nom_vide")
     if player_name in _broadcasters:
-        _broadcasters.discard(player_name)
+        del _broadcasters[player_name]
         _save_broadcasters()
+        target_ws = _find_client_ws_by_name(player_name)
+        if target_ws is not None:
+            try:
+                await target_ws.send(json.dumps({
+                    "type": "broadcaster_revoked",
+                }))
+            except Exception:
+                pass
         _broadcast_broadcasters_list_threadsafe()
         _log(f"Broadcaster revoque : {player_name}", ORANGE)
-    return True
+    return (True, "")
 
 
 def list_broadcasters() -> list:
-    """Retourne la liste triee des broadcasters actuels."""
-    return sorted(_broadcasters)
+    """Retourne la liste triee des noms de broadcasters actuels (hashes
+    masques)."""
+    return sorted(_broadcasters.keys())
 
 
 def assign_profile(player_name: str, profile_name) -> bool:

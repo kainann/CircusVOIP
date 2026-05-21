@@ -95,7 +95,7 @@ class State:
     # Etat repliquant celui du serveur (recu via admin_welcome + push events)
     channels        = []          # list[str]
     profiles        = []          # list[str]
-    broadcasters    = []          # list[str] - role PTT diffusion globale (flag 0x03)
+    broadcasters    = []          # list[str] - role PTT diffusion globale (flag 0x04)
     players         = {}          # {name: {pos, channel, profile, helmet_on, prox_short}}
     anonymous_mode  = False
     server_token    = ""          # token joueur (pour l'afficher dans l'UI admin)
@@ -543,7 +543,7 @@ class AdminUI:
         btn_add_prof.bind("<Button-1>", lambda e: self._add_profile())
 
         # Broadcasters : joueurs autorises a parler sur tous les canaux
-        # simultanement (PTT diffusion globale, flag audio 0x03). Liste
+        # simultanement (PTT diffusion globale, flag audio 0x04). Liste
         # tenue par l'admin via grant_broadcaster / revoke_broadcaster.
         self._section(right, "BROADCASTERS")
         self._broadcasters_frame = tk.Frame(right, bg=BG_PANEL)
@@ -1013,20 +1013,74 @@ class AdminUI:
             self._send_cmd({"cmd": "remove_profile", "name": name})
 
     def _add_broadcaster(self):
-        """Accorde le role broadcaster a un joueur (par nom). Le serveur
-        applique le role idempotemment : si le nom existe deja, no-op.
-        La capability ne prend effet qu'au prochain ticket du joueur cible
-        (typiquement 2 min ; lui demander de se reconnecter pour aller plus
-        vite). Cf doc serveur grant_broadcaster()."""
-        n = simpledialog.askstring(
-            "Accorder broadcaster",
-            "Nom du joueur a qui accorder le role broadcaster :\n"
-            "(le joueur doit se reconnecter au serveur pour que sa\n"
-            "capability prenne effet)",
-            parent=self.root,
+        """Accorde le role broadcaster a un joueur connecte. On affiche un
+        dropdown des joueurs actuellement connectes (state.players) plutot
+        qu'une saisie libre : le serveur exige que le joueur soit connecte
+        au moment du grant pour pouvoir lui pusher son token. Saisir un
+        nom inexistant donnerait une erreur player_must_be_connected.
+
+        Le serveur cible pousse ensuite le token au client choisi via la
+        WebSocket existante (jamais affiche en clair ici) ; le client le
+        sauve, et la capability sera effective des sa prochaine reconnexion."""
+        # Filtre : exclut soi-meme et les noms deja broadcasters (no-op
+        # serveur de toute facon, mais evite de polluer le dropdown).
+        already = set(state.broadcasters)
+        connected = sorted(n for n in state.players.keys()
+                           if n and n not in already)
+        if not connected:
+            messagebox.showinfo(
+                "Accorder broadcaster",
+                "Aucun joueur connecte ne peut etre accorde "
+                "(soit deja broadcaster, soit personne en ligne).",
+                parent=self.root,
+            )
+            return
+        # Petit dialog modale avec un ttk.Combobox.
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Accorder broadcaster")
+        dlg.configure(bg=BG_PANEL)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        tk.Label(
+            dlg,
+            text="Joueur a qui accorder le role broadcaster :\n"
+                 "(le token sera pushed via sa WebSocket ;\n"
+                 "il devra se reconnecter pour activer la touche)",
+            bg=BG_PANEL, fg=FG, justify="left",
+        ).pack(padx=12, pady=(12, 8))
+        import tkinter.ttk as ttk
+        var = tk.StringVar(value=connected[0])
+        combo = ttk.Combobox(
+            dlg, textvariable=var, values=connected, state="readonly", width=28
         )
-        if n:
-            self._send_cmd({"cmd": "grant_broadcaster", "name": n})
+        combo.pack(padx=12, pady=(0, 8))
+        combo.focus_set()
+        btns = tk.Frame(dlg, bg=BG_PANEL)
+        btns.pack(padx=12, pady=(0, 12), fill="x")
+        chosen = {"name": None}
+
+        def on_ok():
+            chosen["name"] = var.get()
+            dlg.destroy()
+
+        def on_cancel():
+            dlg.destroy()
+
+        tk.Button(btns, text="Accorder", command=on_ok, bg=BG_BTN, fg=FG,
+                  activebackground=BG_BTN_HOVER).pack(side="right", padx=4)
+        tk.Button(btns, text="Annuler", command=on_cancel, bg=BG_BTN, fg=FG,
+                  activebackground=BG_BTN_HOVER).pack(side="right")
+        dlg.bind("<Return>", lambda e: on_ok())
+        dlg.bind("<Escape>", lambda e: on_cancel())
+        # Position : centre approx sur la fenetre admin
+        self.root.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() // 2) - 150
+        y = self.root.winfo_rooty() + 120
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.wait_window()
+        if chosen["name"]:
+            self._send_cmd({"cmd": "grant_broadcaster", "name": chosen["name"]})
 
     def _remove_broadcaster(self, name: str):
         """Retire le role broadcaster. Effectif au prochain ticket du joueur

@@ -545,15 +545,39 @@ class AdminUI:
         # Broadcasters : joueurs autorises a parler sur tous les canaux
         # simultanement (PTT diffusion globale, flag audio 0x04). Liste
         # tenue par l'admin via grant_broadcaster / revoke_broadcaster.
+        #
+        # Le serveur exige que le joueur soit connecte au moment du grant
+        # (le token est pushed via sa WS). On expose donc un dropdown des
+        # joueurs connectes (non deja broadcasters) directement dans le
+        # panneau, plutot qu'un dialog modal : moins de friction, et l'admin
+        # voit immediatement qui peut etre promu.
         self._section(right, "BROADCASTERS")
         self._broadcasters_frame = tk.Frame(right, bg=BG_PANEL)
         self._broadcasters_frame.pack(fill="x", pady=2)
-        btn_add_bc = tk.Label(right, text="+  Ajouter broadcaster",
-                              bg=BORDER, fg=BLUE,
-                              font=("Courier", 9, "bold"), pady=6, padx=8,
-                              cursor="hand2")
-        btn_add_bc.pack(fill="x", pady=(2, 8))
-        btn_add_bc.bind("<Button-1>", lambda e: self._add_broadcaster())
+        import tkinter.ttk as ttk
+        self._add_bc_frame = tk.Frame(right, bg=BG_PANEL)
+        self._add_bc_frame.pack(fill="x", pady=(4, 8))
+        self._add_bc_var = tk.StringVar(value="")
+        self._add_bc_combo = ttk.Combobox(
+            self._add_bc_frame,
+            textvariable=self._add_bc_var,
+            values=[],
+            state="disabled",
+            width=20,
+        )
+        self._add_bc_combo.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self._add_bc_btn = tk.Label(
+            self._add_bc_frame, text="Accorder",
+            bg=BORDER, fg=BLUE,
+            font=("Courier", 9, "bold"),
+            padx=8, pady=4, cursor="hand2",
+        )
+        self._add_bc_btn.pack(side="right")
+        self._add_bc_btn.bind(
+            "<Button-1>", lambda e: self._grant_selected_broadcaster()
+        )
+        # Initialise vide ; sera peuple par _refresh_add_broadcaster_dropdown()
+        # appele depuis refresh_players / refresh_broadcasters.
 
         # Token serveur en bas (info admin)
         self._section(right, "TOKEN JOUEUR")
@@ -815,6 +839,9 @@ class AdminUI:
                 btn_del.bind("<Button-1>",
                              lambda e, n=name: self._remove_broadcaster(n))
         self._safe_after(_do)
+        # Sync du dropdown : un broadcaster en plus / en moins change les
+        # candidats au grant.
+        self._refresh_add_broadcaster_dropdown()
 
     def refresh_players(self):
         def _do():
@@ -833,6 +860,8 @@ class AdminUI:
                     self._build_player_row(name)
                 self._update_player_row(name)
         self._safe_after(_do)
+        # Un join/leave change les candidats au grant -> resync.
+        self._refresh_add_broadcaster_dropdown()
 
     def _build_player_row(self, name: str):
         row = tk.Frame(self._players_frame, bg=BG_ROW, pady=4, padx=8)
@@ -1012,75 +1041,39 @@ class AdminUI:
                                parent=self.root):
             self._send_cmd({"cmd": "remove_profile", "name": name})
 
-    def _add_broadcaster(self):
-        """Accorde le role broadcaster a un joueur connecte. On affiche un
-        dropdown des joueurs actuellement connectes (state.players) plutot
-        qu'une saisie libre : le serveur exige que le joueur soit connecte
-        au moment du grant pour pouvoir lui pusher son token. Saisir un
-        nom inexistant donnerait une erreur player_must_be_connected.
-
-        Le serveur cible pousse ensuite le token au client choisi via la
-        WebSocket existante (jamais affiche en clair ici) ; le client le
-        sauve, et la capability sera effective des sa prochaine reconnexion."""
-        # Filtre : exclut soi-meme et les noms deja broadcasters (no-op
-        # serveur de toute facon, mais evite de polluer le dropdown).
-        already = set(state.broadcasters)
-        connected = sorted(n for n in state.players.keys()
-                           if n and n not in already)
-        if not connected:
-            messagebox.showinfo(
-                "Accorder broadcaster",
-                "Aucun joueur connecte ne peut etre accorde "
-                "(soit deja broadcaster, soit personne en ligne).",
-                parent=self.root,
-            )
+    def _refresh_add_broadcaster_dropdown(self):
+        """Met a jour les valeurs du dropdown "Accorder broadcaster" :
+        joueurs connectes qui ne sont pas deja broadcasters. Appele depuis
+        refresh_players et refresh_broadcasters pour rester en sync avec
+        l'etat. Si la liste est vide, on disable le widget."""
+        if not hasattr(self, "_add_bc_combo"):
             return
-        # Petit dialog modale avec un ttk.Combobox.
-        dlg = tk.Toplevel(self.root)
-        dlg.title("Accorder broadcaster")
-        dlg.configure(bg=BG_PANEL)
-        dlg.transient(self.root)
-        dlg.grab_set()
-        dlg.resizable(False, False)
-        tk.Label(
-            dlg,
-            text="Joueur a qui accorder le role broadcaster :\n"
-                 "(le token sera pushed via sa WebSocket ;\n"
-                 "il devra se reconnecter pour activer la touche)",
-            bg=BG_PANEL, fg=FG, justify="left",
-        ).pack(padx=12, pady=(12, 8))
-        import tkinter.ttk as ttk
-        var = tk.StringVar(value=connected[0])
-        combo = ttk.Combobox(
-            dlg, textvariable=var, values=connected, state="readonly", width=28
-        )
-        combo.pack(padx=12, pady=(0, 8))
-        combo.focus_set()
-        btns = tk.Frame(dlg, bg=BG_PANEL)
-        btns.pack(padx=12, pady=(0, 12), fill="x")
-        chosen = {"name": None}
+        def _do():
+            already = set(state.broadcasters)
+            connected = sorted(n for n in state.players.keys()
+                               if n and n not in already)
+            try:
+                self._add_bc_combo["values"] = connected
+                if connected:
+                    self._add_bc_combo["state"] = "readonly"
+                    if self._add_bc_var.get() not in connected:
+                        self._add_bc_var.set(connected[0])
+                else:
+                    self._add_bc_combo["state"] = "disabled"
+                    self._add_bc_var.set("")
+            except Exception:
+                pass
+        self._safe_after(_do)
 
-        def on_ok():
-            chosen["name"] = var.get()
-            dlg.destroy()
-
-        def on_cancel():
-            dlg.destroy()
-
-        tk.Button(btns, text="Accorder", command=on_ok, bg=BG_BTN, fg=FG,
-                  activebackground=BG_BTN_HOVER).pack(side="right", padx=4)
-        tk.Button(btns, text="Annuler", command=on_cancel, bg=BG_BTN, fg=FG,
-                  activebackground=BG_BTN_HOVER).pack(side="right")
-        dlg.bind("<Return>", lambda e: on_ok())
-        dlg.bind("<Escape>", lambda e: on_cancel())
-        # Position : centre approx sur la fenetre admin
-        self.root.update_idletasks()
-        x = self.root.winfo_rootx() + (self.root.winfo_width() // 2) - 150
-        y = self.root.winfo_rooty() + 120
-        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
-        dlg.wait_window()
-        if chosen["name"]:
-            self._send_cmd({"cmd": "grant_broadcaster", "name": chosen["name"]})
+    def _grant_selected_broadcaster(self):
+        """Clic sur le bouton 'Accorder'. Le dropdown ne propose que des
+        joueurs connectes non deja broadcasters, donc on n'a rien a
+        re-valider cote client : on envoie la commande au serveur, qui
+        push le token via la WS du joueur cible."""
+        name = (self._add_bc_var.get() or "").strip()
+        if not name:
+            return
+        self._send_cmd({"cmd": "grant_broadcaster", "name": name})
 
     def _remove_broadcaster(self, name: str):
         """Retire le role broadcaster. Effectif au prochain ticket du joueur

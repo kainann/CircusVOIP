@@ -624,6 +624,43 @@ def _save_client_cfg(cfg):
     CLIENT_CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 
+# ----- Broadcaster tokens : per-server, stockes dans le config client -----
+# Format : {"broadcaster_tokens": {"host:port": "<token_hex>"}}
+# Le token est emis par le serveur via push broadcaster_token_granted apres
+# que l'admin a accorde le role. Le client le sauve, le presente au join,
+# et l'efface sur push broadcaster_revoked. Multi-serveur : un token distinct
+# par serveur, isole par sa clef "host:port".
+
+def _server_key(ip: str, port) -> str:
+    """Clef d'index pour broadcaster_tokens. Stable a travers les reconnect."""
+    return f"{(ip or '').strip().lower()}:{port}"
+
+
+def _get_broadcaster_token(ip: str, port) -> str:
+    """Retourne le token broadcaster sauvegarde pour (ip, port), ou '' si absent."""
+    cfg = _load_client_cfg()
+    tokens = cfg.get("broadcaster_tokens") or {}
+    if not isinstance(tokens, dict):
+        return ""
+    return tokens.get(_server_key(ip, port), "") or ""
+
+
+def _set_broadcaster_token(ip: str, port, token: str):
+    """Sauvegarde le token broadcaster pour (ip, port). Token vide / None
+    supprime l'entree."""
+    cfg = _load_client_cfg()
+    tokens = cfg.get("broadcaster_tokens") or {}
+    if not isinstance(tokens, dict):
+        tokens = {}
+    key = _server_key(ip, port)
+    if token:
+        tokens[key] = token
+    else:
+        tokens.pop(key, None)
+    cfg["broadcaster_tokens"] = tokens
+    _save_client_cfg(cfg)
+
+
 # ======================================================================
 # Etat global partage
 # ======================================================================
@@ -748,9 +785,16 @@ class State:
     #   server_supports_broadcast_all : True si le serveur expose 'broadcast_all'
     #     dans welcome.server_caps. Permet de griser la touche cote UI
     #     sur les anciens serveurs.
-    #   is_broadcaster : True si l'admin a accorde le role au joueur courant.
+    #   is_broadcaster : True si l'admin a accorde le role au joueur courant
+    #     ET que le token a ete verifie au join.
     server_supports_broadcast_all = False
     is_broadcaster                = False
+    # Token broadcaster a presenter au join (recu via push admin
+    # broadcaster_token_granted, sauve dans le config). Per-server : indexe
+    # par "host:port". Charge au connect (cf NetWorker) et envoye dans le
+    # message join. Sans le bon token, un nom present dans la liste des
+    # broadcasters serveur est REFUSE au join.
+    broadcaster_token_for_current_server = ""
     # Touche pour cycler les canaux (descente, boucle en haut)
     cycle_channel_key    = None
     # CircusPhone (D4 etape 4) : 5 raccourcis configurables.

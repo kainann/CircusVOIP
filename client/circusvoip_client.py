@@ -2429,6 +2429,24 @@ class NetWorker(QObject):
                     except Exception:
                         pass
 
+                # [BROADCASTER_AUTH] Si on a un token broadcaster sauvegarde
+                # pour ce serveur, on le presente. Sinon champ vide : le
+                # serveur ne donne can_broadcast=True que si nom + token
+                # correspondent. Le token a ete pushed par broadcaster_token_granted
+                # (cf _handle_message) lors d'un grant precedent. Per-server :
+                # indexe par "host:port" de sorte qu'un meme client puisse
+                # avoir des roles differents sur plusieurs serveurs.
+                bcast_token = ""
+                if _CORE_AVAILABLE:
+                    try:
+                        bcast_token = _core._get_broadcaster_token(server_ip, SERVER_PORT)
+                    except Exception:
+                        bcast_token = ""
+                # On garde aussi en memoire la cle serveur pour les push
+                # ulterieurs (granted/revoked), evite de re-deviner ip/port.
+                self._server_key_ip = server_ip
+                self._server_key_port = SERVER_PORT
+
                 # Envoi du join. channel=None car 2a ne gere pas les canaux
                 # (sera ajoute en 2c).
                 await ws.send(json.dumps({
@@ -2436,6 +2454,7 @@ class NetWorker(QObject):
                     "name": name,
                     "token": token,
                     "channel": None,
+                    "broadcaster_token": bcast_token,
                 }))
 
                 # Bug fix 56 : marquer connected=True UNIQUEMENT apres
@@ -2503,6 +2522,46 @@ class NetWorker(QObject):
             if reason == "invalid_token":
                 self.sig_invalid_token.emit()
                 self._stop_requested = True
+            elif reason in ("name_in_use", "broadcaster_token_invalid"):
+                # Echec d'auth specifique : on log et on coupe. Pas de retry
+                # auto (l'utilisateur doit changer son setup : nom different,
+                # ou demander un re-grant a l'admin).
+                self._stop_requested = True
+            return
+
+        if msg_type == "broadcaster_token_granted":
+            # L'admin a accorde le role broadcaster a ce client. Le token clair
+            # est dans data["token"]. On le sauve indexe par le serveur courant
+            # pour qu'il soit represente automatiquement aux prochains join.
+            token = data.get("token", "") or ""
+            if token and _CORE_AVAILABLE:
+                try:
+                    ip = getattr(self, "_server_key_ip", "")
+                    port = getattr(self, "_server_key_port", SERVER_PORT)
+                    _core._set_broadcaster_token(ip, port, token)
+                    state.is_broadcaster = True
+                    self.sig_log.emit(
+                        "[NET] Role broadcaster accorde : token sauvegarde. "
+                        "Reconnecte-toi pour activer la touche."
+                    )
+                except Exception as e:
+                    self.sig_log.emit(f"[NET] broadcaster grant : sauvegarde KO : {e}")
+            return
+
+        if msg_type == "broadcaster_revoked":
+            # L'admin a revoque le role. On efface le token local pour eviter
+            # un join refuse a la prochaine reconnexion (le nom redevient
+            # libre cote serveur). La revocation est aussi appliquee au
+            # ticket actuel a la prochaine emission par le serveur.
+            if _CORE_AVAILABLE:
+                try:
+                    ip = getattr(self, "_server_key_ip", "")
+                    port = getattr(self, "_server_key_port", SERVER_PORT)
+                    _core._set_broadcaster_token(ip, port, "")
+                    state.is_broadcaster = False
+                    self.sig_log.emit("[NET] Role broadcaster revoque.")
+                except Exception as e:
+                    self.sig_log.emit(f"[NET] broadcaster revoke : nettoyage KO : {e}")
             return
 
         if msg_type == "welcome":

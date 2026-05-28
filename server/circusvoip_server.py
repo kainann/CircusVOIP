@@ -82,6 +82,15 @@ AUTH_BAN_SEC      = 600
 _BASE_DIR       = Path(__file__).resolve().parent
 _DEBUG_DIR      = _BASE_DIR / "circusvoip_debug"
 DEBUG_LOG_FILE  = _DEBUG_DIR / "circusvoip_server_debug.log"
+
+# === Log debug enrichi (ajout 25/05/2026) ===
+# Pour debug crackling audio / stats serveur positions, on prefere un
+# fichier par session dans /var/log/circusvoip-positions/positions_<TS>.log
+# (cohabite avec /var/log/circusvoip-audio/). Si le dossier n'est pas
+# accessible (pas root, droits manquants), on garde le comportement
+# historique (DEBUG_LOG_FILE ecrase a chaque demarrage).
+_POS_LOG_DIR = Path("/var/log/circusvoip-positions")
+_debug_log_actual_path = None  # chemin reellement utilise (rempli par _debug_log_init)
 _debug_log_fp   = None
 _last_pos_time: dict = {}  # dernier timestamp par joueur (pour dt)
 
@@ -240,17 +249,45 @@ def _validate_pos(pos) -> bool:
 
 
 def _debug_log_init():
-    """Ouvre/reinitialise le fichier de log debug serveur."""
-    global _debug_log_fp
+    """Ouvre/reinitialise le fichier de log debug serveur.
+
+    Modif 25/05/2026 : tente d'abord d'ouvrir un fichier par session dans
+    /var/log/circusvoip-positions/positions_YYYYMMDD_HHMMSS.log (cohabite
+    avec /var/log/circusvoip-audio/, permet de garder l'historique entre
+    redemarrages). Si le dossier n'est pas accessible (pas root / droits
+    manquants), fallback sur le DEBUG_LOG_FILE historique (ecrase a chaque
+    demarrage)."""
+    global _debug_log_fp, _debug_log_actual_path
+    # 1) Tentative /var/log/circusvoip-positions/positions_<TS>.log
+    try:
+        _POS_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        target_path = _POS_LOG_DIR / f"positions_{ts}.log"
+        _debug_log_fp = open(target_path, "w", encoding="utf-8", buffering=1)
+        _debug_log_fp.write(
+            f"=== Session demarree : {datetime.now():%Y-%m-%d %H:%M:%S} ===\n"
+        )
+        _debug_log_actual_path = target_path
+        print(f"[DEBUG LOG] Fichier : {target_path}", flush=True)
+        return
+    except Exception as e_varlog:
+        # /var/log inaccessible (pas root, FS readonly, etc.) : on tombe sur
+        # le chemin historique.
+        print(f"[DEBUG LOG] /var/log indisponible ({type(e_varlog).__name__}: "
+              f"{e_varlog}), fallback {DEBUG_LOG_FILE}", flush=True)
+
+    # 2) Fallback historique (DEBUG_LOG_FILE unique, ecrase a chaque demarrage)
     try:
         _DEBUG_DIR.mkdir(exist_ok=True)
         _debug_log_fp = open(DEBUG_LOG_FILE, "w", encoding="utf-8", buffering=1)
         _debug_log_fp.write(
             f"=== Session demarree : {datetime.now():%Y-%m-%d %H:%M:%S} ===\n"
         )
+        _debug_log_actual_path = DEBUG_LOG_FILE
     except Exception as e:
         print(f"[DEBUG LOG] Echec ouverture fichier : {e}")
         _debug_log_fp = None
+        _debug_log_actual_path = None
 
 
 def _debug_log(msg: str):
@@ -328,6 +365,24 @@ _server_running = False
 # positionnelle continue de fonctionner) ; c'est juste l'affichage cote
 # client qui est filtre. Pour du jeu de role.
 _anonymous_mode: bool = False
+
+# === Stats debug crackling (ajout 25/05/2026) ===
+# Compteurs cumulatifs par nom de client. Lus toutes les 30s par
+# _cleanup_loop pour produire [POS STATS DEBUG]. Niveau B : throttle 30s
+# pour log "premier drop" / "premier dead broadcast" par client.
+#
+# Pourquoi le serveur positions est utile pour le debug audio :
+# - Il route les volumes / autorisations HP (haut-parleur CircusPhone),
+#   les channels radio, les profils. Un client qui floode peut etre
+#   shoote ici (rate limiter pos), ce qui perturbe le calcul des
+#   autorisations VOIP cote autres clients.
+# - Les broadcasts pos vers clients morts permettent de detecter qu'un
+#   joueur a une WS pos qui lache (peut-etre correle a sa WS audio).
+_pos_rate_limit_drops_by_name: dict = {}   # {pseudo: count}
+_pos_rate_limit_first_drop_logged: dict = {}  # {pseudo: monotonic_ts}
+_pos_broadcast_dead_by_name: dict = {}     # {pseudo: count} - cumule sur les
+                                            # 4 fonctions _broadcast_* (sauf admins)
+_pos_broadcast_dead_first_logged: dict = {}  # {pseudo: monotonic_ts}
 
 # ─────────────────────────────────────────────
 #  CircusPhone - Feature 4 (D1 : table d'appels serveur)
@@ -613,6 +668,7 @@ async def _broadcast(sender_ws, message: str):
         except Exception:
             dead.append(ws)
     for ws in dead:
+        _track_dead_broadcast(ws, "_broadcast")
         clients.pop(ws, None)
     # Broadcast aussi aux admins (push event)
     await _broadcast_admins(message)
@@ -627,6 +683,7 @@ async def _broadcast_all(message: str):
         except Exception:
             dead.append(ws)
     for ws in dead:
+        _track_dead_broadcast(ws, "_broadcast_all")
         clients.pop(ws, None)
     await _broadcast_admins(message)
 
@@ -643,6 +700,7 @@ async def _broadcast_clients_only(message: str):
         except Exception:
             dead.append(ws)
     for ws in dead:
+        _track_dead_broadcast(ws, "_broadcast_clients_only")
         clients.pop(ws, None)
 
 
@@ -663,8 +721,39 @@ async def _broadcast_channel(channel, message: str):
         except Exception:
             dead.append(ws)
     for ws in dead:
+        _track_dead_broadcast(ws, "_broadcast_channel")
         clients.pop(ws, None)
     await _broadcast_admins(message)
+
+
+def _track_dead_broadcast(ws, fn_name: str):
+    """Helper : incremente le compteur de morts en broadcast pour le
+    client donne et logge "premier dead" avec throttle 30s. Appele
+    par les 4 fonctions _broadcast_* (pas _broadcast_admins, moins
+    critique pour le bug audio). Ajout 25/05/2026.
+
+    Note : ws peut etre une socket pas (ou plus) dans clients{}, dans
+    quel cas on enregistre sous "<unknown>". C'est rare (race condition
+    cleanup vs broadcast) mais possible."""
+    try:
+        info = clients.get(ws, {}) or {}
+        name = info.get("name") or "<unknown>"
+        _pos_broadcast_dead_by_name[name] = (
+            _pos_broadcast_dead_by_name.get(name, 0) + 1
+        )
+        now_log = time.monotonic()
+        last_logged = _pos_broadcast_dead_first_logged.get(name, 0.0)
+        if (now_log - last_logged) >= 30.0:
+            _debug_log(
+                f"[BROADCAST DEAD] client {name!r} deconnecte pendant "
+                f"un broadcast (fonction: {fn_name}, total: "
+                f"{_pos_broadcast_dead_by_name[name]})"
+            )
+            _pos_broadcast_dead_first_logged[name] = now_log
+    except Exception:
+        # Robustesse : si pour une raison X le log echoue, on ne casse
+        # pas la chaine de cleanup. Le clients.pop() qui suit DOIT marcher.
+        pass
 
 
 async def _broadcast_admins(message: str):
@@ -690,6 +779,12 @@ def _broadcast_admins_threadsafe(message: str):
 
 
 async def _cleanup_loop():
+    # === Stats debug crackling (25/05/2026) ===
+    # Compteur de ticks 5s pour produire un log [POS STATS DEBUG] toutes
+    # les 30s (6 ticks). Snapshots pour calculer les deltas.
+    _stats_tick = 0
+    _prev_rl_drops: dict = {}
+    _prev_bc_dead:  dict = {}
     while True:
         await asyncio.sleep(5)
         now = time.time()
@@ -707,6 +802,65 @@ async def _cleanup_loop():
             # par le finally du handler, d'ou cet appel explicite.
             await _phone_drop_calls_for(name, reason="peer_timeout")
             await _broadcast_all(json.dumps({"type": "leave", "name": name}))
+
+        # Stats agregees toutes les 30s (= 6 ticks de 5s). Affichees dans
+        # le fichier debug serveur (pas dans le log UI qui serait trop
+        # spamme pour rien). Niveau A : si tout est OK, ligne "RAS" pour
+        # confirmer que le mecanisme tourne. Si anomalies, deltas affiches.
+        _stats_tick += 1
+        if _stats_tick >= 6:
+            _stats_tick = 0
+            try:
+                # Calcul des deltas rate limit drops
+                rl_delta = {}
+                for name, total in _pos_rate_limit_drops_by_name.items():
+                    delta = total - _prev_rl_drops.get(name, 0)
+                    if delta > 0:
+                        rl_delta[name] = delta
+                    _prev_rl_drops[name] = total
+                # Calcul des deltas broadcast dead
+                bc_delta = {}
+                for name, total in _pos_broadcast_dead_by_name.items():
+                    delta = total - _prev_bc_dead.get(name, 0)
+                    if delta > 0:
+                        bc_delta[name] = delta
+                    _prev_bc_dead[name] = total
+
+                n_clients = len(clients)
+                client_names = ",".join(
+                    sorted(info.get("name", "?")
+                           for info in clients.values())
+                ) or "(aucun)"
+                if rl_delta or bc_delta:
+                    parts = []
+                    if rl_delta:
+                        parts.append("rate_drops=" + ",".join(
+                            f"{n}:{c}" for n, c in sorted(rl_delta.items())
+                        ))
+                    if bc_delta:
+                        parts.append("broadcast_dead=" + ",".join(
+                            f"{n}:{c}" for n, c in sorted(bc_delta.items())
+                        ))
+                    _debug_log(
+                        f"[POS STATS DEBUG] clients={n_clients} "
+                        f"({client_names}) | " + " | ".join(parts)
+                    )
+                else:
+                    _debug_log(
+                        f"[POS STATS DEBUG] clients={n_clients} "
+                        f"({client_names}) | rate_drops=0 | "
+                        f"broadcast_dead=0 | RAS"
+                    )
+            except Exception as e:
+                # Robustesse : le log stats ne doit jamais casser la
+                # boucle cleanup (qui detecte les timeouts joueurs).
+                try:
+                    _debug_log(
+                        f"[POS STATS DEBUG] erreur snapshot : "
+                        f"{type(e).__name__}: {e}"
+                    )
+                except Exception:
+                    pass
 
 
 # ─────────────────────────────────────────────
@@ -1285,11 +1439,32 @@ async def handler(ws):
             # applique un quota de messages. Le tout premier message
             # (join/auth_admin) n'est pas limite ici : il est deja couvert
             # par le lockout brute-force par IP plus bas.
+            # === Stats debug crackling (25/05/2026) ===
+            # Avant : drop silencieux. Maintenant : compteur + log "premier
+            # drop" avec throttle 30s par client. Permet de detecter qu'un
+            # client floode et que le serveur jette ses messages (typique
+            # OCR a haute frequence si client mal configure).
             if ws in clients:
                 if not _msg_rate.allow(ws):
                     # Quota depasse : on jette ce message. On ne FERME PAS
                     # la connexion - un pic ponctuel ne doit pas kicker un
                     # joueur legitime, juste ignorer le surplus.
+                    client_name = clients.get(ws, {}).get("name", "?")
+                    _pos_rate_limit_drops_by_name[client_name] = (
+                        _pos_rate_limit_drops_by_name.get(client_name, 0) + 1
+                    )
+                    now_log = time.monotonic()
+                    last_logged = _pos_rate_limit_first_drop_logged.get(
+                        client_name, 0.0
+                    )
+                    if (now_log - last_logged) >= 30.0:
+                        _debug_log(
+                            f"[RATE LIMIT POS] message jete de {client_name!r} "
+                            f"(total drops: "
+                            f"{_pos_rate_limit_drops_by_name[client_name]}, "
+                            f"rate={_msg_rate.rate}, burst={_msg_rate.burst})"
+                        )
+                        _pos_rate_limit_first_drop_logged[client_name] = now_log
                     continue
 
             # Premier message : on distingue connexion admin vs joueur.

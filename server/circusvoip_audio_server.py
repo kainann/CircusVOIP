@@ -20,10 +20,12 @@
 
 import asyncio
 import json
+import os
 import secrets
 import time
 import threading
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Tkinter n'est pas necessaire en mode headless. On l'importe seulement
@@ -64,15 +66,75 @@ MAX_AUDIO_CLIENTS = 64
 _auth_lockout = AuthLockout(max_failures=5, window_sec=60, ban_sec=600)
 
 # [P5 - rate limiting] Quota de trames audio par client authentifie.
-# L'audio tourne a ~50 trames/s en regime normal (20 ms/trame) : on
-# tolere 60/s en permanent et 120 de reserve pour absorber les a-coups.
-_audio_rate = RateLimiter(rate=60.0, burst=120.0)
+# L'audio tourne a ~50 trames/s en regime normal (20 ms/trame). En mode
+# CircusPhone HP avec voisin proximity, le client envoie en DOUBLE
+# (0x03 telephone + 0x00 proximity) = ~100 trames/s.
+#
+# Historique des valeurs :
+#   v0.1.x : rate=60.0, burst=120.0 (calibre pour mono-envoi seul)
+#   25/05/2026 : double a rate=120.0, burst=240.0 apres analyse logs
+#     session 25/05 (debug crackling) - 5 joueurs sur 7 subissaient des
+#     drops massifs (jusqu'a 3000+ drops cumules pour hugolisoir). Les
+#     pics observes vont jusqu'a ~70 trames/s en pointe sur 3 minutes.
+#     Marge : tolere 100 trames/s en permanent + 2s de burst a 150 trames/s.
+_audio_rate = RateLimiter(rate=120.0, burst=240.0)
 
 # [P4 - auth partagee] Registre de tickets partage avec le serveur
 # positions. Un client doit presenter un ticket emis par le serveur
 # positions pour etre accepte ici. Meme fichier des deux cotes.
 _AUTH_REGISTRY_FILE = Path(__file__).resolve().parent / "circusvoip_auth_tickets.json"
 _auth_registry = AuthRegistry(_AUTH_REGISTRY_FILE, ttl_sec=120.0)
+
+# === Log fichier debug crackling (ajout 25/05/2026) ===
+# Tous les logs ui.log() ainsi que update_stats() sont aussi ecrits dans
+# un fichier dedie /var/log/circusvoip-audio/audio_YYYYMMDD_HHMMSS.log.
+# Un fichier par demarrage du service (Option 3 : facile a correler avec
+# les logs debug clients qui suivent le meme schema).
+# Fallback silencieux : si le dossier n'existe pas ou n'est pas accessible
+# en ecriture, on log uniquement sur stdout comme aujourd'hui. Pas de crash.
+_LOG_DIR = Path("/var/log/circusvoip-audio")
+_log_file_handle = None     # writeable text handle ou None si echec ouverture
+_log_file_path   = None     # Path pour info au demarrage
+
+def _open_audio_log_file():
+    """Tente d'ouvrir le fichier de log fichier. Retourne True si OK, False
+    sinon. Stocke le handle dans _log_file_handle (None si echec). Pas
+    d'exception remontee : on degrade silencieusement vers stdout."""
+    global _log_file_handle, _log_file_path
+    try:
+        # Cree le dossier si possible. Si pas les droits, on capte plus bas.
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _log_file_path = _LOG_DIR / f"audio_{ts}.log"
+        # line buffering (=1) pour que les logs soient flushes ligne par
+        # ligne. Important pour debug live (tail -f).
+        _log_file_handle = open(_log_file_path, "w", encoding="utf-8",
+                                buffering=1)
+        return True
+    except Exception as e:
+        _log_file_handle = None
+        _log_file_path = None
+        # Affiche sur stdout que l'ouverture a echoue (visible journalctl)
+        # mais ne crash pas le serveur audio pour autant.
+        print(f"[WARN] Impossible d'ouvrir le log fichier audio : "
+              f"{type(e).__name__}: {e}. Fallback stdout uniquement.",
+              flush=True)
+        return False
+
+def _audio_log_write(line: str):
+    """Ecrit une ligne dans le fichier de log audio (si ouvert). Pas de
+    timestamp ajoute ici : c'est l'appelant qui doit prefixer si voulu.
+    No-op si le fichier n'a pas pu etre ouvert."""
+    h = _log_file_handle
+    if h is None:
+        return
+    try:
+        h.write(line)
+        if not line.endswith("\n"):
+            h.write("\n")
+    except Exception:
+        # Disque plein, fichier supprime, etc. : on ignore. stdout reste OK.
+        pass
 
 # Format audio utilise par les clients (pour info, pas enforced)
 # - 48000 Hz
@@ -106,6 +168,16 @@ class State:
     bytes_total     = 0
     frames_total    = 0
     last_report_ts  = 0.0
+
+    # === Stats debug crackling (ajout 25/05/2026) ===
+    # Compteurs par nom de client (= pseudo). Cumulatifs depuis le demarrage
+    # du service. La boucle _report_stats consulte et logge les deltas
+    # toutes les 30s (Niveau A).
+    rate_limit_drops_by_name: dict = {}     # {pseudo: count}
+    broadcast_dead_by_name: dict   = {}     # {pseudo: count} - websocket mort
+                                            # detecte pendant un broadcast OUT
+    # Niveau B : throttle 30s pour le log "premier drop" par client.
+    rate_limit_first_drop_logged: dict = {} # {pseudo: monotonic_ts}
 
 state = State()
 
@@ -147,7 +219,29 @@ async def handler(ws, ui):
                 # [P5 - rate limiting] Jette les trames excedentaires d'un
                 # client qui flood. On ne ferme pas la connexion : un pic
                 # ponctuel ne doit pas couper un joueur legitime.
+                # === Stats debug crackling (25/05/2026) ===
+                # Auparavant silencieux : le client ignorait quand le serveur
+                # jetait ses trames (typique en mode telephone avec double
+                # envoi 0x03+0x00 = ~100 trames/s ; cf. _audio_rate plus haut
+                # pour les valeurs courantes). On compte et on logue le
+                # premier drop par client + un toutes les 30s (anti-spam).
                 if not _audio_rate.allow(ws):
+                    state.rate_limit_drops_by_name[name] = (
+                        state.rate_limit_drops_by_name.get(name, 0) + 1
+                    )
+                    now_log = time.monotonic()
+                    last_logged = state.rate_limit_first_drop_logged.get(
+                        name, 0.0
+                    )
+                    if (now_log - last_logged) >= 30.0:
+                        ui.log(
+                            f"[RATE LIMIT] trame jetee de {name!r} "
+                            f"(total drops: "
+                            f"{state.rate_limit_drops_by_name[name]}, "
+                            f"rate={_audio_rate.rate}, "
+                            f"burst={_audio_rate.burst})"
+                        )
+                        state.rate_limit_first_drop_logged[name] = now_log
                     continue
                 # Trame audio : relayer a tous les autres clients
                 state.bytes_total  += len(msg)
@@ -270,10 +364,30 @@ async def _broadcast_binary(data: bytes, exclude=None):
         except Exception:
             dead.append(ws)
     for ws in dead:
+        # === Stats debug crackling (25/05/2026) ===
+        # Avant : suppression silencieuse. Maintenant : on tracke le pseudo
+        # et on incremente un compteur. Permet de detecter qu'un client
+        # decroche (sa websocket lache pendant un broadcast) sans message
+        # WS proprement clos. Le LEAVE qui suivra naturellement loggue
+        # mais ici on capte AVANT (qui = combien d'essais ?).
+        dead_name = state.clients.get(ws, "<unknown>")
+        state.broadcast_dead_by_name[dead_name] = (
+            state.broadcast_dead_by_name.get(dead_name, 0) + 1
+        )
         state.clients.pop(ws, None)
 
 async def _report_stats(ui):
-    """Affiche les stats de bande passante toutes les 5s."""
+    """Affiche les stats de bande passante toutes les 5s.
+
+    Modif 25/05/2026 : tous les 30s (= 6 ticks de 5s), log additionnel
+    [AUDIO STATS DEBUG] avec les compteurs de drops rate limiter et
+    de broadcasts vers clients morts (par pseudo). Permet d'identifier
+    si des trames sont jetees silencieusement pendant un test groupe.
+    """
+    tick = 0
+    # Snapshot pour calcul de delta sur 30s
+    prev_rl_drops = {}
+    prev_bc_dead  = {}
     while state.running:
         await asyncio.sleep(5)
         # Mettre a jour les stats meme si pas de trafic, sinon le compteur de
@@ -287,6 +401,50 @@ async def _report_stats(ui):
         ui.update_stats(kbs, frames, len(state.clients))
         state.bytes_total  = 0
         state.frames_total = 0
+
+        # Toutes les 30s = 6 ticks : log debug audio enrichi.
+        tick += 1
+        if tick >= 6:
+            tick = 0
+            # Calcul des deltas sur 30s pour chaque client.
+            rl_delta = {}
+            for name, total in state.rate_limit_drops_by_name.items():
+                delta = total - prev_rl_drops.get(name, 0)
+                if delta > 0:
+                    rl_delta[name] = delta
+                prev_rl_drops[name] = total
+            bc_delta = {}
+            for name, total in state.broadcast_dead_by_name.items():
+                delta = total - prev_bc_dead.get(name, 0)
+                if delta > 0:
+                    bc_delta[name] = delta
+                prev_bc_dead[name] = total
+
+            # Log AUDIO STATS DEBUG. Si tout est OK (aucun drop, aucun dead),
+            # on log quand meme pour avoir un signe de vie dans le log
+            # (rassure : oui le mecanisme tourne, et NON aucun drop).
+            n_clients = len(state.clients)
+            client_names = ",".join(sorted(state.clients.values())) or "(aucun)"
+            if rl_delta or bc_delta:
+                # Anomalies detectees pendant les 30 dernieres secondes
+                parts = []
+                if rl_delta:
+                    parts.append("rate_drops=" + ",".join(
+                        f"{n}:{c}" for n, c in sorted(rl_delta.items())
+                    ))
+                if bc_delta:
+                    parts.append("broadcast_dead=" + ",".join(
+                        f"{n}:{c}" for n, c in sorted(bc_delta.items())
+                    ))
+                ui.log(
+                    f"[AUDIO STATS DEBUG] clients={n_clients} ({client_names}) | "
+                    + " | ".join(parts)
+                )
+            else:
+                ui.log(
+                    f"[AUDIO STATS DEBUG] clients={n_clients} ({client_names}) | "
+                    f"rate_drops=0 | broadcast_dead=0 | RAS"
+                )
 
 async def _serve(ui):
     state.running = True
@@ -491,22 +649,29 @@ class ServerUI:
 class _HeadlessUI:
     """Stub UI pour le mode headless (deploiement sur VPS sans display).
     Implemente les memes methodes que ServerUI mais affiche tout dans la
-    console (stdout) au lieu d'une fenetre Tkinter."""
+    console (stdout) au lieu d'une fenetre Tkinter.
+
+    Modif 25/05/2026 : tous les logs sont aussi ecrits dans un fichier
+    dedie /var/log/circusvoip-audio/audio_YYYYMMDD_HHMMSS.log pour
+    debug ulterieur (fallback silencieux si le dossier n'est pas
+    accessible en ecriture)."""
 
     def log(self, msg: str):
-        from datetime import datetime
         ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[{ts}] {msg}", flush=True)
+        line = f"[{ts}] {msg}"
+        print(line, flush=True)
+        _audio_log_write(line)
 
     def refresh_clients(self):
         # Pas d'affichage de liste en headless (les events sont logges)
         pass
 
     def update_stats(self, kbs: float, frames: int, n_clients: int):
-        from datetime import datetime
         ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[{ts}] [STATS] {n_clients} client(s) | "
-              f"{frames} trames/s | {kbs:.1f} kB/s", flush=True)
+        line = (f"[{ts}] [STATS] {n_clients} client(s) | "
+                f"{frames} trames/s | {kbs:.1f} kB/s")
+        print(line, flush=True)
+        _audio_log_write(line)
 
 
 def _run_headless():
@@ -517,6 +682,12 @@ def _run_headless():
     print(f"Port audio   : {AUDIO_PORT}")
     print(f"Token        : {masked}  (visible complet dans la config)")
     print(f"Cap clients  : {MAX_AUDIO_CLIENTS}")
+    # Ouverture du fichier log (debug crackling, ajout 25/05/2026).
+    # Si echec : on continue sur stdout uniquement.
+    if _open_audio_log_file():
+        print(f"Log fichier  : {_log_file_path}")
+    else:
+        print("Log fichier  : DESACTIVE (echec ouverture, stdout uniquement)")
     print("=" * 60)
     print("Logs (Ctrl+C pour arreter) :")
     print()

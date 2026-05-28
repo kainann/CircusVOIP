@@ -2126,6 +2126,15 @@ def _update_rp_filter():
 # le callback sounddevice (qui tourne dans un thread audio realtime).
 _audio_send_queue: "queue.Queue[bytes]" = None
 
+# === Stats debug crackling (ajout 25/05/2026) ===
+# Compteurs cumulatifs depuis le demarrage du process. Lus par la boucle
+# [AUDIO STATS] toutes les 30s qui calcule les deltas. Pas de modification
+# du comportement existant, juste de l'observabilite.
+_audio_send_frames_total   = 0   # total trames mises dans la queue
+_audio_send_frames_dropped = 0   # total trames droppees (queue full -> drop oldest)
+_audio_send_first_drop_ts  = 0.0 # monotonic du dernier log "premier drop" (anti-spam 30s)
+_audio_send_stats_lock     = None  # threading.Lock() cree au demarrage
+
 
 def _flush_audio_send_queue() -> int:
     """Vide la queue d'envoi audio. Retourne le nombre de trames jetees.
@@ -2545,9 +2554,28 @@ def _on_audio_captured(frame_np):
         frame_bytes = frame_np.tobytes()
 
         def _put(data):
+            global _audio_send_frames_total, _audio_send_frames_dropped
+            global _audio_send_first_drop_ts
+            _audio_send_frames_total += 1
             if _audio_send_queue.full():
                 try:
                     _audio_send_queue.get_nowait()
+                    # === Stats debug crackling 25/05/2026 ===
+                    # Drop silencieux jusqu'a present, ce qui empechait de
+                    # detecter une saturation de la queue d'envoi cote client
+                    # (typique en mode telephone avec voisin proximity : double
+                    # envoi 0x03+0x00 = 100 trames/s vs 50 normalement). On
+                    # incremente un compteur global et on logge "premier drop"
+                    # avec throttle 30s pour avoir le timestamp sans flooder.
+                    _audio_send_frames_dropped += 1
+                    now_log = time.monotonic()
+                    if (now_log - _audio_send_first_drop_ts) >= 30.0:
+                        _dbg_log(
+                            f"[AUDIO DROP TX] _audio_send_queue pleine "
+                            f"(total drops: {_audio_send_frames_dropped}, "
+                            f"queue maxsize=50)"
+                        )
+                        _audio_send_first_drop_ts = now_log
                 except Exception:
                     pass
             _audio_send_queue.put_nowait(data)
@@ -2972,6 +3000,17 @@ def _ocr_loop_inner(ui: "ClientUI"):
     stats_rejected = 0    # rejetees par MAX_JUMP
     stats_cid_similar = 0 # corrections de container_id par _are_containers_similar
                           # (chiffres OCR confondus type 3 vs 8 sur l'id numerique)
+
+    # === Stats debug crackling (ajout 25/05/2026) ===
+    # Snapshots des compteurs audio pour calculer les deltas sur 30s.
+    # Le log [AUDIO STATS] est emis dans la meme boucle que [STATS XXs]
+    # et [METRICS] (cadence STATS_PERIOD_S = 30s).
+    prev_audio_send_total   = 0
+    prev_audio_send_dropped = 0
+    prev_audio_frames_dropped_rx: dict = {}   # {sender: prev_count}
+    prev_audio_underruns: dict           = {}   # {sender: prev_count}
+    prev_audio_truncations: dict         = {}   # {sender: prev_count}
+    prev_audio_silence_impl: dict        = {}   # {sender: prev_count}
     # v0.2 (optim perf) : cleanup VRAM CUDA garde sa cadence propre (30s)
     # decouplee de la cadence des stats (qui peut etre raccourcie en phase
     # d'optim). Sans ce decouplage, raccourcir stats provoquerait des
@@ -3146,6 +3185,109 @@ def _ocr_loop_inner(ui: "ClientUI"):
                 _log_profiling_metrics()
             except Exception:
                 pass
+
+            # === [AUDIO STATS] : log debug crackling (ajout 25/05/2026) ===
+            # Snapshot des compteurs audio (envoi + reception) et calcul
+            # des deltas sur la fenetre STATS_PERIOD_S (= 30s).
+            # Affiche uniquement les zones non-zero pour ne pas spammer
+            # le log quand tout va bien. Si tout a zero, ligne courte
+            # "RAS" pour confirmer que le mecanisme tourne.
+            try:
+                # 1) Envoi cote core (send queue)
+                cur_send_total   = _audio_send_frames_total
+                cur_send_dropped = _audio_send_frames_dropped
+                d_send_total     = cur_send_total - prev_audio_send_total
+                d_send_dropped   = cur_send_dropped - prev_audio_send_dropped
+                prev_audio_send_total   = cur_send_total
+                prev_audio_send_dropped = cur_send_dropped
+
+                # 2) Reception cote audio_io
+                d_rx_drops = {}
+                d_underruns = {}
+                d_truncations = {}
+                d_silence = {}
+                if state.audio_io is not None:
+                    try:
+                        snap = state.audio_io.get_audio_stats_snapshot()
+                    except Exception:
+                        snap = None
+                    if snap:
+                        # frames droppees feed_remote_frame
+                        for sender, total in snap.get(
+                            "frames_dropped_by_sender", {}
+                        ).items():
+                            delta = total - prev_audio_frames_dropped_rx.get(
+                                sender, 0
+                            )
+                            if delta > 0:
+                                d_rx_drops[sender] = delta
+                            prev_audio_frames_dropped_rx[sender] = total
+                        # underruns _on_output_block
+                        for sender, total in snap.get(
+                            "output_underruns_by_sender", {}
+                        ).items():
+                            delta = total - prev_audio_underruns.get(sender, 0)
+                            if delta > 0:
+                                d_underruns[sender] = delta
+                            prev_audio_underruns[sender] = total
+                        # truncations
+                        for sender, total in snap.get(
+                            "output_truncations_by_sender", {}
+                        ).items():
+                            delta = total - prev_audio_truncations.get(
+                                sender, 0
+                            )
+                            if delta > 0:
+                                d_truncations[sender] = delta
+                            prev_audio_truncations[sender] = total
+                        # silence implicite
+                        for sender, total in snap.get(
+                            "output_silence_implicite_by_sender", {}
+                        ).items():
+                            delta = total - prev_audio_silence_impl.get(
+                                sender, 0
+                            )
+                            if delta > 0:
+                                d_silence[sender] = delta
+                            prev_audio_silence_impl[sender] = total
+
+                # 3) Construction du log
+                any_anomaly = (
+                    d_send_dropped > 0 or d_rx_drops or d_underruns
+                    or d_truncations or d_silence
+                )
+                parts = [f"send_total={d_send_total}"]
+                if d_send_dropped > 0:
+                    parts.append(f"send_dropped={d_send_dropped}")
+                if d_rx_drops:
+                    parts.append("rx_drops=" + ",".join(
+                        f"{s}:{c}" for s, c in sorted(d_rx_drops.items())
+                    ))
+                if d_underruns:
+                    parts.append("underruns=" + ",".join(
+                        f"{s}:{c}" for s, c in sorted(d_underruns.items())
+                    ))
+                if d_truncations:
+                    parts.append("truncations=" + ",".join(
+                        f"{s}:{c}" for s, c in sorted(d_truncations.items())
+                    ))
+                if d_silence:
+                    parts.append("silence_implicite=" + ",".join(
+                        f"{s}:{c}" for s, c in sorted(d_silence.items())
+                    ))
+                if not any_anomaly:
+                    parts.append("RAS")
+                _dbg_log("[AUDIO STATS] " + " | ".join(parts))
+            except Exception as _audio_stats_err:
+                # Robustesse : meme si le log audio echoue, la boucle stats
+                # principale doit continuer (sinon plus de [STATS]/[METRICS]).
+                try:
+                    _dbg_log(f"[AUDIO STATS] erreur snapshot : "
+                             f"{type(_audio_stats_err).__name__}: "
+                             f"{_audio_stats_err}")
+                except Exception:
+                    pass
+
             stats_t0       = time.time()
             stats_tried    = 0
             stats_parsed   = 0

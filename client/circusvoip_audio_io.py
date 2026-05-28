@@ -77,6 +77,13 @@ FRAME_BYTES = BLOCK_SIZE * 4   # 960 samples * 4 bytes par float32 = 3840 bytes
 # Si la file devient trop grande, on jette les vieux (anti-drift)
 MAX_QUEUE_LEN = 10   # 200 ms de buffer max
 
+# Seuil pour distinguer un VRAI underrun (queue vide alors qu'on vient de
+# recevoir une trame = jitter/drift) d'un faux underrun (sender silencieux,
+# noise gate ferme). 25/05/2026 Kainan. A 50 trames/s, une trame arrive
+# toutes les 20 ms : on tolere 5 trames manquees = 100 ms. Au-dela on
+# considere que le sender s'est tu, pas un bug reseau.
+_UNDERRUN_GAP_S = 0.1
+
 
 # ---------------------------------------------
 #  Chargement de fichiers .wav (sonneries / notifs)
@@ -1028,6 +1035,57 @@ class AudioIO:
         self._frames_sent     = 0
         self._frames_received = 0
 
+        # === Stats debug crackling (ajout 25/05/2026) ===
+        # Compteurs pour tracker les pertes silencieuses de frames audio.
+        # Toutes valeurs cumulatives depuis le demarrage du process. Les
+        # logs [AUDIO STATS] periodiques (cf core) consultent ces compteurs
+        # et calculent les deltas sur 30s.
+        #
+        # Cote reception (feed_remote_frame) :
+        #   _frames_dropped_by_sender : dict {sender: count} - frames jetees
+        #     car la queue _remote_buffers[sender] etait pleine (anti-drift).
+        #   _first_drop_logged_by_sender : dict {sender: ts} - timestamp du
+        #     dernier log "premier drop" pour throttle (re-logger toutes les 30s).
+        #
+        # Cote playback (_on_output_block) :
+        #   _output_underruns_by_sender : dict {sender: count} - queue vide
+        #     quand sounddevice a besoin de samples (queue.Empty).
+        #   _output_truncations_by_sender : dict {sender: count} - frame plus
+        #     grande que block_size (rare mais possible si block_size sounddevice
+        #     est inferieur a BLOCK_SIZE source = 960).
+        #   _output_silence_implicite_by_sender : dict {sender: count} - frame
+        #     plus petite que block_size (= silence ajoute implicitement, click possible).
+        self._frames_dropped_by_sender: dict[str, int] = {}
+        self._first_drop_logged_by_sender: dict[str, float] = {}
+        self._output_underruns_by_sender: dict[str, int] = {}
+        self._output_truncations_by_sender: dict[str, int] = {}
+        self._output_silence_implicite_by_sender: dict[str, int] = {}
+        # Fix underrun 25/05/2026 Kainan : sans ce timestamp, le compteur
+        # underrun comptait aussi les periodes ou le sender ne parlait pas
+        # (queue vide naturellement car noise gate ferme cote emetteur ->
+        # aucune trame envoyee). Resultat : 1500 underruns/30s pour Skywat
+        # silencieux pendant 30s = faux positif. Maintenant on ne compte
+        # un underrun QUE si on a recu au moins une trame de ce sender
+        # depuis moins de _UNDERRUN_GAP_MS (100ms par defaut). Au-dela
+        # = sender silencieux = comportement normal, pas un bug reseau.
+        self._last_remote_frame_ts: dict[str, float] = {}
+
+    def get_audio_stats_snapshot(self) -> dict:
+        """Renvoie une copie atomique des compteurs internes pour les
+        logs [AUDIO STATS] periodiques. Toutes les valeurs sont cumulatives
+        depuis le demarrage : l'appelant doit calculer les deltas lui-meme."""
+        with self._lock:
+            return {
+                "frames_sent":     int(self._frames_sent),
+                "frames_received": int(self._frames_received),
+                "frames_dropped_by_sender": dict(self._frames_dropped_by_sender),
+                "output_underruns_by_sender": dict(self._output_underruns_by_sender),
+                "output_truncations_by_sender": dict(self._output_truncations_by_sender),
+                "output_silence_implicite_by_sender": dict(
+                    self._output_silence_implicite_by_sender
+                ),
+            }
+
     def is_available(self) -> bool:
         return _SD_AVAILABLE
 
@@ -1249,14 +1307,35 @@ class AudioIO:
                     try:
                         frame = buf.get_nowait()
                         is_phone = self._remote_is_phone.get(name, False)
+                        # Detecter taille frame vs block_size sounddevice
+                        # pour stats debug crackling (25/05/2026). Pas de
+                        # modification du comportement existant.
+                        len_frame = len(frame)
+                        if len_frame > frames:
+                            # Frame plus grande que ce que sounddevice demande
+                            # -> tronquee (perte de la fin). Tres rare en
+                            # regime normal (les emetteurs envoient BLOCK_SIZE=960
+                            # = ce que sounddevice consomme), mais peut arriver
+                            # si le block_size sounddevice cote receveur est
+                            # different (ex : driver custom, peripherique exotique).
+                            self._output_truncations_by_sender[name] = (
+                                self._output_truncations_by_sender.get(name, 0) + 1
+                            )
+                        elif len_frame < frames:
+                            # Frame plus petite -> on complete avec du silence
+                            # implicite (target reste a 0 sur la fin). Click
+                            # audible possible (discontinuite signal -> silence).
+                            self._output_silence_implicite_by_sender[name] = (
+                                self._output_silence_implicite_by_sender.get(name, 0) + 1
+                            )
                         # CircusPhone (D3) : voix telephone -> mix_phone
                         # direct. Court-circuite tout traitement radio /
                         # Mode RP / echo : la voix telephone est claire.
                         if is_phone:
-                            if len(frame) >= frames:
+                            if len_frame >= frames:
                                 mix_phone += frame[:frames] * final_vol
                             else:
-                                mix_phone[:len(frame)] += frame * final_vol
+                                mix_phone[:len_frame] += frame * final_vol
                             continue
                         is_radio = self._remote_is_radio.get(name, False)
                         # Mode RP : si le client a decide que ce sender doit
@@ -1275,12 +1354,35 @@ class AudioIO:
                             is_radio = True
                         target = mix_radio if is_radio else mix_prox
                         # Ajuster taille si necessaire
-                        if len(frame) >= frames:
+                        if len_frame >= frames:
                             target += frame[:frames] * final_vol
                         else:
-                            target[:len(frame)] += frame * final_vol
+                            target[:len_frame] += frame * final_vol
                     except queue.Empty:
-                        pass
+                        # Underrun POTENTIEL : la queue de ce sender etait vide
+                        # alors que sounddevice demandait des samples. Mais
+                        # attention au faux positif : si le sender ne parle pas
+                        # (noise gate ferme cote emetteur), sa queue est vide
+                        # naturellement et ce n'est PAS un bug.
+                        #
+                        # Fix 25/05/2026 : on ne compte un underrun QUE si on
+                        # a recu une trame de ce sender depuis moins de
+                        # _UNDERRUN_GAP_S secondes (100 ms par defaut). Au-dela
+                        # = sender silencieux = normal, on ne compte rien.
+                        # En-deca = on attendait une trame, elle n'est pas
+                        # arrivee = VRAI underrun (jitter reseau, drift, etc.)
+                        # qui peut causer du crackling cote ecoute.
+                        #
+                        # Note : on garde aussi le filtre final_vol > 0.001
+                        # pour exclure les senders mute (volume 0).
+                        if final_vol > 0.001:
+                            last_ts = self._last_remote_frame_ts.get(name, 0.0)
+                            if last_ts > 0 and (
+                                time.monotonic() - last_ts
+                            ) <= _UNDERRUN_GAP_S:
+                                self._output_underruns_by_sender[name] = (
+                                    self._output_underruns_by_sender.get(name, 0) + 1
+                                )
 
                 # Reverb grotte Schroeder (4 combs parallele + 2 all-pass serie).
                 # Applique sur le mix prox uniquement, tout le mix passe dans la
@@ -1474,9 +1576,31 @@ class AudioIO:
                 self._remote_is_phone[sender_name] = is_phone
 
             # Anti-drift : si la file est pleine, on jette le plus ancien
+            # NOTE 25/05/2026 : ce drop etait silencieux jusqu'a present, ce
+            # qui empechait de detecter une cause potentielle de crackling
+            # cote reception. Maintenant on incremente un compteur (lu par
+            # get_audio_stats_snapshot toutes les 30s) et on logge le premier
+            # drop par sender + un par 30s (anti-spam) avec [AUDIO DROP RX].
             if q.full():
                 try:
                     q.get_nowait()
+                    # Compteur cumulatif par sender.
+                    self._frames_dropped_by_sender[sender_name] = (
+                        self._frames_dropped_by_sender.get(sender_name, 0) + 1
+                    )
+                    # Niveau B : log throttle 30s.
+                    now_log = time.monotonic()
+                    last_logged = self._first_drop_logged_by_sender.get(
+                        sender_name, 0.0
+                    )
+                    if (now_log - last_logged) >= 30.0:
+                        _ns_log(
+                            f"[AUDIO DROP RX] queue pleine pour {sender_name!r} "
+                            f"(total drops: "
+                            f"{self._frames_dropped_by_sender[sender_name]}, "
+                            f"maxsize={MAX_QUEUE_LEN})"
+                        )
+                        self._first_drop_logged_by_sender[sender_name] = now_log
                 except queue.Empty:
                     pass
             try:
@@ -1485,6 +1609,12 @@ class AudioIO:
                 pass
 
             self._frames_received += 1
+            # Fix underrun 25/05/2026 : memoriser le timestamp de la derniere
+            # trame recue pour ce sender. _on_output_block s'en sert pour
+            # distinguer un VRAI underrun (queue vide alors qu'on vient de
+            # recevoir = jitter reel) d'un faux underrun (sender silencieux
+            # depuis > 100ms = comportement normal du noise gate emetteur).
+            self._last_remote_frame_ts[sender_name] = time.monotonic()
         except Exception as e:
             print(f"[AUDIO] Erreur feed : {e}")
 

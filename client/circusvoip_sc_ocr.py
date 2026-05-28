@@ -649,6 +649,21 @@ _KNOWN_ZONES_INTERIORS = [
     "hangar_mediumfront_rest_nyx",
     "hangar_smalltop_rest_nyx",
     "hangar_smallfront_rest_nyx",
+    # GrimHex (Green Imperial Housing Exchange, asteroide Yela).
+    # SC affiche "Hangar_MediumFront_GrimHEX_<cid>" (avec "HEX" en majuscules)
+    # mais la canonicalisation passe tout en lowercase donc le suffixe stocke
+    # est "_grimhex". Ajoute 23/05/2026 suite a observation Kainan :
+    # sans ces entrees, l'OCR mappait "hangar_mediumfront_grimhex" sur
+    # "hangar_mediumfront_rest_nyx" (Levski) par fuzzy match, ce qui creait
+    # une fausse proximite inter-stations entre Yela et Nyx.
+    "hangar_xltop_grimhex",
+    "hangar_xlfront_grimhex",
+    "hangar_largetop_grimhex",
+    "hangar_largefront_grimhex",
+    "hangar_mediumtop_grimhex",
+    "hangar_mediumfront_grimhex",
+    "hangar_smalltop_grimhex",
+    "hangar_smallfront_grimhex",
     "reststop_cargo_occu_0001",    # cargo habitat reststop (plusieurs instances)
     "reststop_cargo_occu_0002",
     "reststop_cargo_occu_0003",
@@ -667,11 +682,23 @@ _KNOWN_ZONES_INTERIORS = [
     "transitcarriage_lorville_tram",   # tram Lorville (gare centrale)
     "transitcarriage_ugfacilitylta",  # ascenseur UGF (underground facility)
     "transitcarriage_reststop_small",  # tram intra-reststop (Pyro R&R notamment)
+    "transitcarriage_newbabbage_hospital",  # ascenseur hopital New Babbage (microTech)
     # Shuttle A18 (Area18, ArcCorp)
     "transitcarriage_a18_shuttle_a",
     "transitcarriage_a18_shuttle_b",
     "transitcarriage_a18_shuttle_c",
     "transitcarriage_a18_shuttle_d",
+    # TransportCarriage GrimHex - ascenseurs principaux observes 23/05/2026
+    # ATTENTION : SC utilise DEUX nomenclatures distinctes :
+    #   - "TransitCarriage_*"   : trams/ascenseurs Levski, A18, Lorville, UGF, reststops
+    #   - "TransportCarriage_*" : ascenseurs GrimHex (au moins) - autre type d'asset
+    # Les deux coexistent dans le jeu (info confirmee par Kainan). Ne PAS
+    # mapper l'un sur l'autre. Forme observee : "TransportCarriage_Stanton_GrimHex_Elevator_<nom>_<cid>".
+    # Sans ces entrees, le fuzzy matcher canonicalisait correctement le nom complet
+    # (vu que c'est exact, juste lowercase) mais aucun rattrapage des variantes
+    # OCR pourries n'etait possible.
+    "transportcarriage_stanton_grimhex_elevator_default",
+    "transportcarriage_stanton_grimhex_elevator_mainconcourse",
     # Seraphim Station - entrees Crusader LEO (Low Earth Orbit)
     # Le "1" final est un CHIFFRE (leo1, leo2...), pas une lettre L
     "rs_entry_cru-leo1",
@@ -791,7 +818,27 @@ _KNOWN_ZONES_INTERIORS = [
     # le fuzzy fusionne les deux variantes.
     "lorville_l19_int",
     "objectcontainer-lorville_cbd_int",   # Central Business District
-    "objectcontainer-lorville_5p_int",    # Five Points (commerce)
+    # Fix 26/05/2026 Kainan : c'etait "5p_int" (Five Points, hypothese
+    # erronee initiale). Le screenshot du HUD SC affiche bien "sp_int"
+    # (Spaceport interieur). "5p" etait juste une lecture OCR pourrie
+    # de "sp" - on canonicalise sur la VRAIE valeur affichee par SC.
+    "objectcontainer-lorville_sp_int",    # Spaceport interieur
+    # Gates Lorville - 6 portes d'entree/sortie (gate_01 a gate_06).
+    # Observe 26/05/2026 Kainan via screenshots HUD SC. Le HUD utilise
+    # 2 formes orthographiques :
+    #   - "ObjectContainer-gate1_int"   (forme courte, sans zero-pad et
+    #     sans separateur entre "gate" et le numero)
+    #   - "ObjectContainer-gate_01_int" (forme longue avec underscore)
+    # On ajoute uniquement la forme courte "gate1" pour gate 1 (la seule
+    # observee en variante courte) et la forme longue pour 01-06. Le
+    # fuzzy matcher convergera les 2 quand l'OCR bave (distance 1-2).
+    "objectcontainer-gate1_int",
+    "objectcontainer-gate_01_int",
+    "objectcontainer-gate_02_int",
+    "objectcontainer-gate_03_int",
+    "objectcontainer-gate_04_int",
+    "objectcontainer-gate_05_int",
+    "objectcontainer-gate_06_int",
     "hangar_smalltop_lorville",
     "hangar_mediumtop_lorville",
     "hangar_largetop_lorville",
@@ -800,11 +847,52 @@ _KNOWN_ZONES_INTERIORS = [
     "newbabbage_shuttle",
     "newbabbage_metro",
     "objectcontainer-newbab_domes_int_001",  # Dome Newbab (interieur)
+    # Orison (Crusader / Stanton 2) - ville flottante.
+    # Zones observees 23/05/2026 Kainan (screen + log debug). Le HUD SC
+    # affiche les noms avec underscores et numerotation des elements
+    # (Util_A, Shuttle_A, etc.). Ne PAS extrapoler vers _B, _C... sans
+    # observation directe : la convention SC n'est pas systematique
+    # (ex: Lorville n'a qu'un tram, Levski a Large/Medium/Small).
+    "hangar_mediumfront_orison",   # screen + log, cid 304252274855
+    "oc_arcade_int_001",            # ObjectContainer arcade (commerce/loisirs)
+    "oc_orison_hospital_int_001",   # ObjectContainer hopital interieur
+    "spaceport_interior",           # interieur du spaceport
+    "spaceport_transit",            # zone de transit spaceport
+    # TransitCarriage Orison - ascenseurs et navettes intra-Orison.
+    # Convention "transitcarriage_orison_<usage>[_<index>]"
+    "transitcarriage_orison_hospital",            # ascenseur vers hopital
+    "transitcarriage_orison_elev_ht_circular",    # ascenseur hightech circular
+    "transitcarriage_orison_util_a",              # ascenseur utilitaire A
+    "transitcarriage_orison_shuttle_a",           # navette shuttle A
+    # "ObjectContainerModifier-NNN" : nouveau type d'asset observe a Orison
+    # (23/05/2026 Kainan). Le screen montre "ObjectContainerModifier-003"
+    # qui est un magasin. Comme pour ObjectContainer-NNN, le numero NNN
+    # identifie un emplacement specifique, pas un index generique.
+    # Ne JAMAIS ajouter d'autres numeros sans observation directe.
+    "objectcontainermodifier-003",
     # Containers generiques de zones de stations
     # SC affiche "ObjectContainer Entry" / "ObjectContainer Commercial"
     # comme zones generiques pour les entrees / zones commerce des stations.
     "objectcontainer_entry",       # zone d'entree de station
     "objectcontainer_commercial",  # zone commerce de station
+    # "ObjectContainer-NNN" : forme numerique observee. ATTENTION : le numero
+    # NNN identifie un LIEU specifique, pas un index generique. Ne JAMAIS
+    # ajouter des numeros non observes :
+    #   - "ObjectContainer-000" = GrimHex (observe 23/05/2026 Kainan)
+    #   - "ObjectContainer-028" = Orison (observe 23/05/2026 Kainan)
+    # Si on ajoute par exemple "001-006" sans preuve, le fuzzy matcher
+    # (distance Levenshtein 1-2 entre les 3 derniers chiffres) va mapper
+    # "ObjectContainer-028" sur "ObjectContainer-000" puisque les deux
+    # canoniques sont dans la liste -> fausse proximite inter-stations
+    # entre GrimHex et Orison.
+    # NOTE : le code expose ces zones avec cid="name:objectcontainer-NNN"
+    # (pas d'ID numerique dans le HUD), donc le canonical EST l'identifiant.
+    # L'OCR produit des variantes pourries pour le mot "ObjectContainer"
+    # qui sont rattrapees par _OCR_NAME_FIXES (cf "ObjedtContainer",
+    # "ObjectCortairer", "bjectContainer", etc.). Le suffixe -NNN reste
+    # exact (les chiffres OCR sont fiables sur 3 caracteres).
+    "objectcontainer-000",
+    "objectcontainer-028",
     # Pyro - containers generiques de batiments
     # ATTENTION : SC expose le MEME nom+ID pour plusieurs batiments distincts
     # (cf point 6 de la roadmap). On stabilise juste le nom canonique ici,
@@ -822,11 +910,26 @@ _KNOWN_ZONES_INTERIORS = [
     # SC affiche "dealership_rundown_001" (Rundown station, Pyro). Le suffixe
     # numerique distingue les multiples instances du meme dealership.
     "dealership_rundown_001",
-    # Contested zones Pyro - zones PvP a points d'interet (Pyro V Lagrange 2,
-    # etc.). Format observe : "p<num>l<num>_contestedzone".
-    # IMPORTANT : "p5l2" contient bien la lettre "l" (Lagrange), pas le
-    # chiffre "1". L'OCR peut confondre l/1, mais le canonique est avec "l".
+    # Contested zones Pyro - zones PvP a points d'interet.
+    # Format observe : "p<num>l<num>_contestedzone".
+    # IMPORTANT : "p5l2" / "p2l4" contiennent la lettre "l" (Lagrange),
+    # pas le chiffre "1". L'OCR peut confondre l/1, mais le canonique est
+    # avec "l".
+    # ATTENTION CRITIQUE : NE JAMAIS extrapoler vers des combinaisons non
+    # observees. Si "p3l1_contestedzone" n'est pas dans la liste mais que
+    # "p2l4" et "p5l2" y sont, le fuzzy match (distance Levenshtein 2 sur
+    # les chiffres) va mapper "p3l1" sur le plus proche -> fausse proximite
+    # PvP entre deux contested zones distinctes. Bug initial : "p2l4" lu
+    # correctement etait map sur "p5l2" car seul "p5l2" etait dans la liste
+    # (observe 23/05/2026 Kainan, session Checkmate). Ajouter UNIQUEMENT
+    # au fil des observations directes.
     "p5l2_contestedzone",
+    "p2l4_contestedzone",   # Pyro 2 Lagrange 4 (Checkmate Station), observe 23/05/2026 Kainan
+    # Contested zone rewards (loot terminal des contested zones Pyro).
+    # Observe a Checkmate (cid:name expose donc canonical = identifiant).
+    # Comme pour p<N>l<N>, le chiffre final identifie un lieu specifique.
+    # Ne pas extrapoler.
+    "rs_cz_rewards_001",
     # Interieurs de stations Pyro Lagrange (format "rs_int_p<num>l<num>").
     # Comme pour p5l2_contestedzone, le "l" est un L (Lagrange), pas un 1.
     # L'OCR le lit souvent en "p214" (l->1), mais l'equivalence OCR
@@ -1225,6 +1328,121 @@ _OCR_NAME_FIXES = [
     ("HangarSmallTop",  "Hangar SmallTop"),
     ("HangarMediumTop", "Hangar MediumTop"),
     ("HangarBigTop",    "Hangar BigTop"),
+    # ===== Fixes ajoutes 23/05/2026 (session GrimHex Kainan) =====
+    # "De fault" : OCR EasyOCR split visuellement "Default" en "De" + "fault"
+    # sur les TransportCarriage GrimHex. Sans fix, le canonical produit est
+    # "transportcarriage_..._de_fault" au lieu de "..._default", ce qui ne
+    # matche aucune entree connue et casse le rattrapage fuzzy.
+    ("De fault",        "Default"),
+    ("De faut",         "Default"),       # variante observee avec coupure
+    ("DE fault",        "Default"),
+    ("de fault",        "default"),
+    # "Starton" : OCR confond n -> r dans "Stanton" sur certains angles.
+    # Sans fix, "TransportCarriage_Starton_GrimHex_..." est canonicalise
+    # differemment de "TransportCarriage_Stanton_GrimHex_..." -> 2 joueurs
+    # cote a cote dans le meme ascenseur peuvent etre vus comme separes.
+    ("Starton",         "Stanton"),
+    ("starton",         "stanton"),
+    ("STARTON",         "Stanton"),
+    # "bjectContainer" / "bjectcontainer" : OCR perd le O initial sur certains
+    # cadrages (le O est mange par le bord de la zone OCR). Observe sur le
+    # hangar GrimHex (cid 304252101071).
+    # ATTENTION : ces fixes DOIVENT etre prefixes d'un espace pour eviter
+    # de matcher au milieu d'un mot comme "ObjectContainerModifier". Sans
+    # le prefixe espace, "ObjectContainerModifier" matche "bjectContainer"
+    # a l'interieur -> remplacement crash -> "OObjectContainerModifier".
+    (" bjectContainer", " ObjectContainer"),
+    (" bjectcontainer", " objectcontainer"),
+    (" BjectContainer", " ObjectContainer"),
+    # "ObjectContaine" (sans le r final) : OCR coupe le r final dans certains
+    # cadrages. Observe sur le hangar GrimHex.
+    ("ObjectContaine ",  "ObjectContainer "),   # espace evite de matcher "Container" au milieu
+    ("ObjectContaine-",  "ObjectContainer-"),
+    ("Objectcontaine ",  "Objectcontainer "),
+    ("Objectcontaine-",  "Objectcontainer-"),
+    # "ObjedtContainer" : c -> d apres O (OCR confond la cedille du c).
+    ("ObjedtContainer", "ObjectContainer"),
+    ("Objedtcontainer", "Objectcontainer"),
+    # "ObjectCortairer" : confusion lourde n->r et n->r sur "Container".
+    # Tres ponctuel (1 occurrence dans la session, parmi 31 lectures propres).
+    ("ObjectCortairer", "ObjectContainer"),
+    ("Objectcortairer", "Objectcontainer"),
+    # "Grimhe }" / "Grimhe *" / "Grimhe )" : OCR confond x -> caractere
+    # parasite sur GrimHex en bord de zone. Observe a 2 reprises.
+    ("Grimhe }",        "GrimHex"),
+    ("Grimhe *",        "GrimHex"),
+    ("Grimhe )",        "GrimHex"),
+    ("grimhe }",        "grimhex"),
+    ("grimhe *",        "grimhex"),
+    # "Flevator" : F au lieu de E sur Elevator (1 occurrence tres degradee).
+    ("Flevator",        "Elevator"),
+    ("flevator",        "elevator"),
+    # "Mainconcour se" : split visuel "MainConcourse" -> "Mainconcour se"
+    # sur les TransportCarriage GrimHex.
+    ("Mainconcour se",  "MainConcourse"),
+    ("mainconcour se",  "mainconcourse"),
+    ("MainConcour se",  "MainConcourse"),
+    # "TransportCal r Tage" : degradation tres lourde de "TransportCarriage"
+    # (1 occurrence parmi 6 lectures). Pattern specifique pour ne pas casser
+    # d'autres mots commencant par "Transport".
+    ("TransportCal r Tage", "TransportCarriage"),
+    ("Transportcal r tage", "Transportcarriage"),
+    # ===== Fixes ajoutes 23/05/2026 (session Orison Kainan) =====
+    # "Orisom" / "Orisori" / "Orisor" : variantes OCR de "Orison" (n -> m/ri/r).
+    # Observees sur les TransitCarriage Orison et zones internes.
+    # Fixes specifiques car m<->n et i parasites ne sont pas dans _OCR_CHAR_EQUIV
+    # (ajout global trop risque : casserait medium/main/etc.).
+    ("Orisom",          "Orison"),
+    ("orisom",          "orison"),
+    ("Orisori",         "Orison"),
+    ("orisori",         "orison"),
+    ("Orisor ",         "Orison "),     # espace evite de matcher "Orisor" au milieu d'un mot
+    ("Orisor_",         "Orison_"),
+    ("orisor ",         "orison "),
+    ("orisor_",         "orison_"),
+    # "risom" / "risori" : perte du "O" initial sur "Orison".
+    # Le contexte (precede par un mot, suivi de "Elev"/"Hospital"/etc.) limite
+    # le risque de faux positifs.
+    ("e risom",         "e Orison"),    # "TransitCarriage risom Elev" -> "TransitCarriage Orison Elev"
+    ("e risori",        "e Orison"),
+    # "Hlospital" / "nospital" : variantes OCR de "Hospital".
+    ("Hlospital",       "Hospital"),
+    ("hlospital",       "hospital"),
+    (" nospital",       " hospital"),   # espace avant pour eviter matcher au milieu
+    (" Nospital",       " Hospital"),
+    # "Trarisit" : "ri" parasite au lieu de "n" sur "Transit".
+    ("TrarisitCarriage", "TransitCarriage"),
+    ("trarisitcarriage", "transitcarriage"),
+    ("Trarisitcarriage", "Transitcarriage"),
+    # "Stantori" / "Stantor" : variantes OCR de "Stanton" (n -> ri/r).
+    # Vues sur les zones "OOC Stanton 2 Crusader".
+    ("Stantori",        "Stanton"),
+    ("stantori",        "stanton"),
+    ("Stantor ",        "Stanton "),
+    ("stantor ",        "stanton "),
+    # "Spacedort" / "Spacepori" / "Sparepoci" : variantes OCR de "Spaceport"
+    # (Orison spaceport). Le mot apparait dans "Spaceport_interior" et
+    # "Spaceport_transit".
+    ("Spacedort",       "Spaceport"),
+    ("spacedort",       "spaceport"),
+    ("Spacepori",       "Spaceport"),
+    ("spacepori",       "spaceport"),
+    ("Sparepoci",       "Spaceport"),
+    ("sparepoci",       "spaceport"),
+    # "Crhs sader" / "Crusader 3l GrOCo" : degradations lourdes ponctuelles
+    # de "Crusader" sur "OOC_Stanton_2_Crusader". Le contexte (precede par
+    # "2") limite le risque.
+    ("2 Crhs sader",    "2 Crusader"),
+    ("2 crhs sader",    "2 crusader"),
+    # "arcadle" / "arcarle" / "argade" : variantes OCR de "arcade"
+    # (OC_arcade_int_001 a Orison). Le mot "arcade" est specifique a Orison
+    # dans le HUD SC, donc fix global est safe.
+    ("arcadle",         "arcade"),
+    ("Arcadle",         "Arcade"),
+    ("arcarle",         "arcade"),
+    ("Arcarle",         "Arcade"),
+    ("argade",          "arcade"),
+    ("Argade",          "Arcade"),
 ]
 
 def _pretty_container_name(raw_name: str) -> str:

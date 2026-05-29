@@ -61,6 +61,53 @@ Fonctions :
         toute initialisation. Defaut : ./cache/easyocr.
 
 
+API publique etendue (pour forks / packages externes)
+=====================================================
+
+Ces fonctions/aliases sont exposees pour les consommateurs qui ont besoin
+d'aller plus loin que le pipeline encapsule par SCOCRReader/read_coords
+(typiquement : un package qui wrappe ce module pour offrir un service OCR
+multi-clients, comme circus_ocr de firesstones).
+
+Pipeline OCR direct (capture + EasyOCR sans parsing metier) :
+    ocr_texts_from_region(region) -> dict
+        Capture + preprocessing image (gamma/denoise/resize x4) + OCR
+        EasyOCR (avec fallback Tesseract). Retourne le texte brut, pas
+        de parsing metier de coordonnees. Le consommateur applique
+        ensuite ses propres normalisations.
+
+Initialisation et acces moteur OCR :
+    ensure_imaging()         Charge mss/cv2/numpy en imports lazy.
+    get_easy_ocr()           Recupere/initialise l'instance EasyOCR.
+    easy_ocr_image(img_bgr)  Lance EasyOCR sur une image deja capturee.
+    capture_region(region)   Capture mss d'une region (deja publique).
+    capture_with_backoff(region)  Capture avec retry sur erreur mss.
+    set_force_cpu(flag)      Force EasyOCR en mode CPU avant init.
+    get_minus_was_restored() Indique si la derniere lecture OCR a beneficie
+                             de la restauration visuelle des tirets.
+
+Helpers de filtrage / validation / parsing (consommes par circusvoip_core
+et par les forks externes pour reutiliser la logique metier sans
+reimplementer le parsing) :
+    parse_coords(text)           Parse interne complet (regex multi-passes,
+                                 correction tirets, restauration noms). Plus
+                                 puissant que parse_ocr_text pour les forks.
+    normalize_numbers(text)      Normalise un texte OCR : corrige les
+                                 confusions de chiffres (0/O, 1/l, etc.)
+                                 avant parsing.
+    apply_sign_memory(pos)       Corrige le signe (memoire signe par axe).
+    is_sign_flip(pos_a, pos_b)   Detecte un flip de signe suspect entre
+                                 deux lectures consecutives.
+    are_containers_similar(a, b) Compare deux ids/noms de zones SC en
+                                 tolerant les fautes OCR (3 vs 8, etc.).
+    is_cave_container(cid, name) True si la zone est un container "cave".
+
+Note : ces noms sont des alias des fonctions internes prefixees par _ qui
+existent depuis l'origine. Le code historique du module continue d'utiliser
+les noms prives ; les noms publics sont disponibles pour les forks et le
+nouveau code, et garantissent un contrat stable.
+
+
 Format de la position retournee
 ================================
 
@@ -4377,6 +4424,113 @@ _ZONE_MAP = {
 # On exclut les noms contenant uniquement des chiffres (ship IDs)
 # et le mot "Root"
 
+
+def ocr_texts_from_region(region):
+    """Capture une region et retourne le texte OCR brut.
+
+    Ce chemin garde le preprocessing image historique de Circus VOIP
+    (gamma, denoise, resize x4, restauration visuelle des tirets), mais ne
+    lance aucun parsing metier de coordonnees. Les clients VOIP/Racing font
+    ensuite leurs propres normalisations et filtres.
+    """
+    _ensure_imaging()
+    img = capture_region(region)
+    h, w = img.shape[:2]
+    gamma_val = float((region or {}).get("gamma", 0.5))
+
+    def _apply_gamma(arr, g):
+        inv = 1.0 / g
+        lut = _np.array([((i / 255.0) ** inv) * 255
+                        for i in range(256)], dtype=_np.uint8)
+        return _cv2.LUT(arr, lut)
+
+    if gamma_val <= 0.35:
+        img_gamma = _apply_gamma(img, gamma_val)
+        easy_img = _cv2.resize(
+            img_gamma, (w * 4, h * 4),
+            interpolation=_cv2.INTER_CUBIC
+        )
+        gray = _cv2.cvtColor(img_gamma, _cv2.COLOR_BGR2GRAY)
+        _, otsu = _cv2.threshold(
+            gray, 0, 255, _cv2.THRESH_BINARY + _cv2.THRESH_OTSU
+        )
+        tess_img = _cv2.resize(
+            otsu, (w * 4, h * 4),
+            interpolation=_cv2.INTER_CUBIC
+        )
+    else:
+        denoised = _cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 21)
+        gray = _cv2.cvtColor(denoised, _cv2.COLOR_BGR2GRAY)
+        big = _cv2.resize(
+            gray, (w * 4, h * 4),
+            interpolation=_cv2.INTER_CUBIC
+        )
+        easy_img = _apply_gamma(big, gamma_val)
+        _, tess_img = _cv2.threshold(
+            easy_img, 0, 255, _cv2.THRESH_BINARY + _cv2.THRESH_OTSU
+        )
+
+    _dbg_save(img, "coords_raw", "image brute capturee")
+    _dbg_save(easy_img, "coords_easy_in", f"EasyOCR input (gamma={gamma_val} x4)")
+    _dbg_save(tess_img, "coords_tess_in", f"Tesseract input (gamma={gamma_val}+Otsu x4)")
+
+    texts = []
+    easy_texts = []
+    easy = _get_easy_ocr()
+    if easy:
+        t0 = _easy_ocr_image(easy_img)
+        _dbg_save(easy_img, "coords_easyocr", t0)
+        if t0.strip():
+            easy_texts.append(t0)
+            texts.append(t0)
+        else:
+            eh, ew = easy_img.shape[:2]
+            n_lines = 2
+            line_h = max(1, eh // n_lines)
+            for i in range(n_lines):
+                y1 = i * line_h
+                y2 = min(eh, y1 + line_h)
+                crop = easy_img[y1:y2, :]
+                if crop.shape[0] >= 5:
+                    t = _easy_ocr_image(crop)
+                    if t.strip():
+                        easy_texts.append(t)
+                        texts.append(t)
+
+    if easy_texts:
+        combined_preview = " | ".join(t.replace("\n", " ") for t in easy_texts)[:300]
+        _logger_dedup(
+            "easyocr_text_raw",
+            f"[EASYOCR RAW] {combined_preview}",
+            value=combined_preview,
+            min_interval=30.0,
+        )
+    else:
+        try:
+            import pytesseract as _pytesseract
+            t = _pytesseract.image_to_string(tess_img, config="--psm 6 --oem 1")
+            if t.strip():
+                texts.append(t)
+        except Exception:
+            pass
+
+    seen = set()
+    unique_texts = []
+    for text in texts:
+        clean = str(text).strip()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        unique_texts.append(clean)
+
+    return {
+        "text": "\n".join(unique_texts),
+        "texts": unique_texts,
+        "pipeline": "ocr_text",
+        "minus_was_restored": bool(globals().get("_minus_was_restored", False)),
+    }
+
+
 def read_coords(region):
     """Capture la zone de l'ecran et lance le pipeline OCR."""
     """Retourne le dict avec zone/x/y/z/etc., ou None."""
@@ -4552,3 +4706,83 @@ class SCOCRReader:
 #
 # Cote application, il faut etre PER_MONITOR_AWARE_V2 pour que mss
 # voie correctement les pixels physiques sur tous les ecrans.
+
+
+# =============================================================================
+# API publique etendue (ajout pour faciliter la consommation par des forks
+# / packages externes type circus_ocr de firesstones).
+#
+# Historique : ce module exposait deja une API publique propre (SCOCRReader,
+# read_coords, parse_ocr_text, distance, list_monitors, auto_ocr_zone,
+# set_logger, set_cache_dir, capture_region, compute_proximity_volume,
+# ocr_texts_from_region). Mais certaines fonctions internes etaient en
+# realite consommees par circusvoip_core.py et par des forks externes -
+# typiquement les correcteurs de signe et les comparateurs de zones. On
+# les exposait via leur nom prive (prefixe _), ce qui rend les forks plus
+# fragiles aux refactos internes.
+#
+# Cette section ajoute des ALIAS publics vers les fonctions privees
+# existantes (zero changement de logique : meme objet, juste un autre nom).
+# Les noms prives restent disponibles pour ne rien casser des appelants
+# existants. Les forks et nouveau code peuvent utiliser les noms publics.
+#
+# Symboles concernes (consommes par engine.py de circus_ocr, par
+# circusvoip_circus_ocr_client.py du fork firesstones, ou par
+# circusvoip_core.py) :
+#   - ensure_imaging         (= _ensure_imaging)
+#   - get_easy_ocr           (= _get_easy_ocr)
+#   - easy_ocr_image         (= _easy_ocr_image)
+#   - apply_sign_memory      (= _apply_sign_memory)
+#   - is_sign_flip           (= _is_sign_flip)
+#   - are_containers_similar (= _are_containers_similar)
+#   - is_cave_container      (= _is_cave_container)
+#   - capture_with_backoff   (= _capture_with_backoff)
+#   - parse_coords           (= _parse_coords)        [parseur prefere]
+#   - normalize_numbers      (= _normalize_numbers)   [normaliseur OCR]
+#   - pretty_container_name  (= _pretty_container_name) [affichage zone]
+#   - set_force_cpu(flag)    (setter pour _ocr_force_cpu_flag)
+#   - get_minus_was_restored()  (getter pour _minus_was_restored)
+# =============================================================================
+
+# Alias publics : memes objets, juste exposes sous des noms sans le prefixe _.
+ensure_imaging         = _ensure_imaging
+get_easy_ocr           = _get_easy_ocr
+easy_ocr_image         = _easy_ocr_image
+apply_sign_memory      = _apply_sign_memory
+is_sign_flip           = _is_sign_flip
+are_containers_similar = _are_containers_similar
+is_cave_container      = _is_cave_container
+capture_with_backoff   = _capture_with_backoff
+parse_coords           = _parse_coords
+normalize_numbers      = _normalize_numbers
+pretty_container_name  = _pretty_container_name
+
+
+def set_force_cpu(flag: bool) -> None:
+    """Force EasyOCR en mode CPU (ou laisse l'auto-detection GPU).
+
+    A appeler AVANT le premier _get_easy_ocr() / ensure_imaging(), car le
+    flag est lu une seule fois lors de l'initialisation paresseuse du
+    reader EasyOCR. Apres init, ce setter n'a plus d'effet.
+
+    Exposition publique propre du flag global _ocr_force_cpu_flag utilise
+    en interne et par SCOCRReader.set_force_cpu().
+    """
+    global _ocr_force_cpu_flag
+    _ocr_force_cpu_flag = bool(flag)
+
+
+def get_minus_was_restored() -> bool:
+    """Indique si la derniere lecture OCR a beneficie de la restauration
+    visuelle des tirets (detection des signes moins par traitement image,
+    appliques quand EasyOCR a "mange" un - en tete de coordonnee).
+
+    Lorsque ce flag est True, le filtre de detection de flip de signe
+    (is_sign_flip) ne doit pas court-circuiter la lecture : le signe a
+    deja ete corrige visuellement avant le parsing. Le flag est reset
+    a chaque nouvelle lecture par read_coords().
+
+    Exposition publique propre de la variable module _minus_was_restored,
+    consommee par engine.py de circus_ocr et par circusvoip_core.
+    """
+    return bool(_minus_was_restored)

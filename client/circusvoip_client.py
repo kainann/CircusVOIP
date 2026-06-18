@@ -10574,17 +10574,18 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-        # Check des mises a jour en arriere-plan : REACTIVE en v0.2.0 dev
-        # pour les tests joueurs. Le serveur d'update tourne sur le VPS
-        # port 8080. Le worker interroge en background 2s apres le boot,
-        # signale via _sig_update_available si une MAJ est dispo, et le
-        # bouton "Verifier les MAJ" (page Parametres) passe en orange.
-        # Pour redesactiver : recommenter le bloc ci-dessous.
-        threading.Thread(
-            target=self._update_check_worker,
-            daemon=True,
-            name="c2-update-check",
-        ).start()
+        # Check des mises a jour en arriere-plan : DESACTIVE pour la release
+        # publique (le systeme de MAJ ne sert qu'au dev / tests joueurs).
+        # Le serveur d'update tourne sur le VPS port 8080. Le worker
+        # interroge en background 2s apres le boot, signale via
+        # _sig_update_available si une MAJ est dispo, et le bouton
+        # "Verifier les MAJ" (page Parametres) passe en orange.
+        # Pour reactiver (dev / tests joueurs) : decommenter le bloc ci-dessous.
+        # threading.Thread(
+        #     target=self._update_check_worker,
+        #     daemon=True,
+        #     name="c2-update-check",
+        # ).start()
 
     # ------------------------------------------------------------------
     # UI
@@ -11130,10 +11131,13 @@ class MainWindow(QMainWindow):
         # Initialiser l'affichage des touches depuis state
         self._refresh_radio_key_labels()
 
-        # Section Mise a jour : REACTIVEE en v0.2.0 dev pour les tests joueurs.
-        # Le QPushButton est instancie, stylise et ajoute au layout.
-        # Pour redesactiver (release publique sans MAJ visible) : recommenter
-        # les deux v_upd.addWidget / v_left.addWidget en bas du bloc.
+        # Section Mise a jour : DESACTIVEE pour la release publique (le
+        # systeme de MAJ ne sert qu'au dev / tests joueurs). Le QPushButton
+        # est tout de meme instancie et stylise (le reste du code le
+        # reference : _on_update_available, _set_update_button_style, etc.),
+        # mais il n'est PAS ajoute au layout, donc invisible.
+        # Pour reactiver (dev / tests joueurs) : decommenter les deux
+        # v_upd.addWidget / v_left.addWidget en bas du bloc.
         gb_upd = QGroupBox("Mise a jour")
         gb_upd.setStyleSheet("QGroupBox { font-weight: bold; padding-top: 14px; }")
         v_upd = QVBoxLayout(gb_upd)
@@ -11142,8 +11146,8 @@ class MainWindow(QMainWindow):
         self.btn_check_update.setMinimumHeight(28)
         self._set_update_button_style(False)
         self.btn_check_update.clicked.connect(self._on_check_update_clicked)
-        v_upd.addWidget(self.btn_check_update)
-        v_left.addWidget(gb_upd)
+        # v_upd.addWidget(self.btn_check_update)
+        # v_left.addWidget(gb_upd)
 
         v_left.addStretch(1)
         cols.addWidget(col_left, stretch=1)
@@ -12705,6 +12709,107 @@ class MainWindow(QMainWindow):
             )
 
     # ------------------------------------------------------------
+    # Log audio RX detaille (diagnostic crackling, ajout 02/06/2026)
+    # ------------------------------------------------------------
+
+    @Slot(bool)
+    def _on_audio_rx_log_toggled(self, checked: bool):
+        """Toggle de la case 'Activer le log audio detaille'.
+
+        Activation a chaud : pas de redemarrage client necessaire.
+        - Sauve l'etat dans _cfg pour persistance entre sessions.
+        - Appelle state.audio_io.set_audio_rx_log_enabled() qui ouvre
+          ou ferme le fichier CSV dans circusvoip_debug/audio_rx/.
+        - Met a jour le label d'info sous la case.
+
+        Le module circusvoip_audio_rx_logger est autonome : si l'init
+        echoue (disque plein, perms), on remet la case decochee et on
+        previent l'utilisateur via le log debug.
+        """
+        self._cfg["audio_rx_log_enabled"] = bool(checked)
+        _save_cfg(self._cfg)
+
+        # Recuperer audio_io depuis le core (instance partagee)
+        audio_io = None
+        if _CORE_AVAILABLE:
+            try:
+                audio_io = _core.state.audio_io
+            except Exception:
+                audio_io = None
+
+        if audio_io is None:
+            self._on_log(
+                "[AUDIO RX LOG] audio_io non disponible, toggle ignore"
+            )
+            self._refresh_audio_rx_log_info()
+            return
+
+        # Pseudo (necessaire pour le nom de fichier)
+        try:
+            pseudo = _core.state.player_name or "Joueur"
+        except Exception:
+            pseudo = "Joueur"
+
+        # Dossier debug (ou ecrire le sous-dossier audio_rx/)
+        debug_dir = None
+        if _CORE_AVAILABLE:
+            try:
+                debug_dir = _core._DEBUG_DIR
+            except Exception:
+                debug_dir = None
+        if debug_dir is None:
+            from pathlib import Path
+            debug_dir = Path("circusvoip_debug")
+
+        # Appel a chaud (le module logger gere thread-safe l'ouverture
+        # ou fermeture du fichier CSV).
+        try:
+            ok = audio_io.set_audio_rx_log_enabled(
+                bool(checked), pseudo=pseudo, debug_dir=debug_dir
+            )
+            if checked and not ok:
+                self._on_log(
+                    "[AUDIO RX LOG] Echec activation : "
+                    "verifier perms / disque dispo / module present"
+                )
+            elif checked and ok:
+                self._on_log(
+                    f"[AUDIO RX LOG] Active. Fichier dans "
+                    f"{debug_dir / 'audio_rx'}/"
+                )
+            elif not checked:
+                self._on_log("[AUDIO RX LOG] Desactive")
+        except Exception as e:
+            self._on_log(f"[AUDIO RX LOG] Erreur toggle : {e}")
+
+        self._refresh_audio_rx_log_info()
+
+    def _refresh_audio_rx_log_info(self):
+        """Met a jour le texte d'info sous la case 'log audio detaille'."""
+        if not hasattr(self, "lbl_audio_rx_log_info"):
+            return
+        if self.cb_audio_rx_log.isChecked():
+            self.lbl_audio_rx_log_info.setText(
+                "Actif : trames audio recues + callbacks sounddevice + "
+                "stats 30s sont enregistres dans un CSV separe "
+                "(circusvoip_debug/audio_rx/). Volume eleve : "
+                "~80-160 MB par heure selon le nombre de senders. "
+                "Desactiver des que le diagnostic est fait."
+            )
+            self.lbl_audio_rx_log_info.setStyleSheet(
+                "color: #ffaa44; font-size: 9pt;"
+            )
+        else:
+            self.lbl_audio_rx_log_info.setText(
+                "Desactive : pas d'enregistrement detaille. Les logs "
+                "habituels [AUDIO STATS] toutes les 30s restent actifs "
+                "dans le log debug principal."
+            )
+            self.lbl_audio_rx_log_info.setStyleSheet(
+                "color: #888; font-size: 9pt;"
+            )
+
+    # ------------------------------------------------------------
     # Masque DisplayInfo (v0.2, feature 3)
     # ------------------------------------------------------------
     # Voir la classe DisplayInfoMaskWindow et la constante
@@ -14070,6 +14175,48 @@ class MainWindow(QMainWindow):
             "sl_phone_ring_vol",
         )
 
+        # ──────────────────────────────────────────────────────────────
+        # Diagnostic crackling : log audio RX detaille (ajout 02/06/2026)
+        # ──────────────────────────────────────────────────────────────
+        # Active un log CSV separe (circusvoip_debug/audio_rx/) qui trace
+        # chaque trame audio recue + chaque callback sounddevice + des
+        # stats agregees 30s. Volume eleve (~80-160 MB/h) donc desactive
+        # par defaut. A activer ponctuellement pour diagnostiquer un
+        # probleme de crackling/pop.
+        sep_audio_diag = QFrame()
+        sep_audio_diag.setFrameShape(QFrame.HLine)
+        sep_audio_diag.setFrameShadow(QFrame.Sunken)
+        sep_audio_diag.setStyleSheet("color: #444;")
+        v.addWidget(sep_audio_diag)
+
+        self.cb_audio_rx_log = QCheckBox(
+            "Activer le log audio detaille (diagnostic crackling)"
+        )
+        audio_rx_log_enabled = bool(
+            self._cfg.get("audio_rx_log_enabled", False)
+        )
+        self.cb_audio_rx_log.setChecked(audio_rx_log_enabled)
+        self.cb_audio_rx_log.setToolTip(
+            "Enregistre dans un fichier CSV separe "
+            "(circusvoip_debug/audio_rx/) chaque trame audio recue, "
+            "chaque callback sounddevice, et des stats agregees toutes "
+            "les 30s. Permet de diagnostiquer un probleme de crackling "
+            "ou de pop audio.\n\n"
+            "ATTENTION : volume eleve (~80-160 MB/h). Ne laisser actif "
+            "que le temps du diagnostic, puis decocher.\n\n"
+            "Activation a chaud : pas besoin de redemarrer le client."
+        )
+        self.cb_audio_rx_log.toggled.connect(self._on_audio_rx_log_toggled)
+        v.addWidget(self.cb_audio_rx_log)
+
+        self.lbl_audio_rx_log_info = QLabel("")
+        self.lbl_audio_rx_log_info.setStyleSheet(
+            "color: #888; font-size: 9pt;"
+        )
+        self.lbl_audio_rx_log_info.setWordWrap(True)
+        self._refresh_audio_rx_log_info()
+        v.addWidget(self.lbl_audio_rx_log_info)
+
         parent_layout.addWidget(box)
 
     def _apply_vu_style(self, level_0_100: int):
@@ -14430,6 +14577,19 @@ class MainWindow(QMainWindow):
                     state.audio_io.set_phone_ring_volume(
                         self.sl_phone_ring_vol.value() / 100.0
                     )
+                # Reactivation du log audio RX detaille si l'utilisateur
+                # l'avait coche dans une session precedente (audit
+                # 02/06/2026). La case est deja dans son etat coche grace
+                # a _build_audio_panel + audio_rx_log_enabled lu de _cfg ;
+                # on declenche maintenant le handler pour reellement
+                # ouvrir le fichier CSV.
+                if hasattr(self, "cb_audio_rx_log") and self.cb_audio_rx_log.isChecked():
+                    try:
+                        self._on_audio_rx_log_toggled(True)
+                    except Exception as e:
+                        self._on_log(
+                            f"[AUDIO RX LOG] Echec reactivation au boot : {e}"
+                        )
             except Exception as e:
                 self._on_log(f"[AUDIO] set_mic_gain/gate KO : {e}")
 

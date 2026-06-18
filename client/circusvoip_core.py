@@ -70,6 +70,14 @@ try:
 except ImportError:
     _WS_AVAILABLE = False
 
+# Log audio RX detaille (ajout 02/06/2026). Module autonome qui ecrit
+# dans un CSV separe pour diagnostic crackling. Optionnel : si absent,
+# tous les appels seront no-op.
+try:
+    import circusvoip_audio_rx_logger as _audio_rx_logger
+except Exception:
+    _audio_rx_logger = None
+
 
 
 # ======================================================================
@@ -3278,6 +3286,39 @@ def _ocr_loop_inner(ui: "ClientUI"):
                 if not any_anomaly:
                     parts.append("RAS")
                 _dbg_log("[AUDIO STATS] " + " | ".join(parts))
+
+                # Log audio RX detaille : event STATS par sender (no-op si
+                # toggle desactive). On envoie un agregat JSON compact :
+                # le post-process (Excel/Python) peut alors corriger en
+                # croisant avec les events RX/OUT par-trame.
+                if _audio_rx_logger is not None:
+                    try:
+                        # Resumer per-sender : on regroupe par pseudo
+                        # toutes les metriques associees a ce sender.
+                        _all_senders = (
+                            set(d_rx_drops)
+                            | set(d_underruns)
+                            | set(d_truncations)
+                            | set(d_silence)
+                        )
+                        # Toujours un event "global" pour suivre le send_total
+                        # cote emission locale, et un event par sender ayant
+                        # eu de l'activite.
+                        _audio_rx_logger.log_stats("__local__", {
+                            "send_total": d_send_total,
+                            "send_dropped": d_send_dropped,
+                            "window_s": int(STATS_PERIOD_S),
+                        })
+                        for _s in sorted(_all_senders):
+                            _audio_rx_logger.log_stats(_s, {
+                                "rx_drop_queue_full": d_rx_drops.get(_s, 0),
+                                "underruns": d_underruns.get(_s, 0),
+                                "truncations": d_truncations.get(_s, 0),
+                                "silence_implicite": d_silence.get(_s, 0),
+                                "window_s": int(STATS_PERIOD_S),
+                            })
+                    except Exception:
+                        pass
             except Exception as _audio_stats_err:
                 # Robustesse : meme si le log audio echoue, la boucle stats
                 # principale doit continuer (sinon plus de [STATS]/[METRICS]).

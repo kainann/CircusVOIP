@@ -492,7 +492,6 @@ _KNOWN_ZONES_SHIPS = [
     "aegis_redeemer",
     "aegis_retaliator",
     "aegis_vanguard",
-    "anvil_carrack",
     "anvil_hornet",
     "anvil_terrapin",
     "anvil_valkyrie",
@@ -711,6 +710,25 @@ _KNOWN_ZONES_INTERIORS = [
     "hangar_mediumfront_grimhex",
     "hangar_smalltop_grimhex",
     "hangar_smallfront_grimhex",
+    # DistributionCenter (Stanton) - nouvelle famille observee 04/06/2026.
+    # SC affiche "Hangar_<Taille><Position>_DistributionCenter_<cid>" dans
+    # le HUD (ex : "Hangar_LargeTop_DistributionCenter_420059395203").
+    # Sans ces entrees, l'OCR de chaque joueur peut donner une variante
+    # legerement differente (espaces vs underscores selon le rendu visuel)
+    # -> container_id divergent entre clients -> joueurs "hors de portee"
+    # a tort dans le meme hangar physique. Observe sur Skywat vs Kainan/Hugo :
+    # Skywat lisait "HangarLargeTop" (HUD brut) et Kainan/Hugo lisaient
+    # "Hangar LargeTop" -> 2 zones differentes cote serveur.
+    # 8 tailles ajoutees par anticipation (cf. convention reststop/grimhex).
+    # Si la famille existe aussi a Pyro, on ajoutera "_pyro" plus tard.
+    "hangar_xltop_distributioncenter",
+    "hangar_xlfront_distributioncenter",
+    "hangar_largetop_distributioncenter",
+    "hangar_largefront_distributioncenter",
+    "hangar_mediumtop_distributioncenter",
+    "hangar_mediumfront_distributioncenter",
+    "hangar_smalltop_distributioncenter",
+    "hangar_smallfront_distributioncenter",
     "reststop_cargo_occu_0001",    # cargo habitat reststop (plusieurs instances)
     "reststop_cargo_occu_0002",
     "reststop_cargo_occu_0003",
@@ -735,6 +753,15 @@ _KNOWN_ZONES_INTERIORS = [
     "transitcarriage_a18_shuttle_b",
     "transitcarriage_a18_shuttle_c",
     "transitcarriage_a18_shuttle_d",
+    # Ascenseurs intra-vaisseaux (assets propres au vaisseau, distincts du
+    # container_id du vaisseau lui-meme). Observe 04/06/2026 sur le Carrack
+    # Anvil : un joueur dans l'ascenseur intra-Carrack a un cid different
+    # du Carrack lui-meme (-> "TransitCarriage ANVL Carrack Elevator <cid>"
+    # dans le HUD SC). Sans cette entree, le fuzzy match pouvait le mapper
+    # par erreur sur un autre transitcarriage_*.
+    # Si d'autres vaisseaux ont un ascenseur intra (Reclaimer, 890 Jump,
+    # Hammerhead...), ajouter sous la meme convention en les observant.
+    "transitcarriage_anvl_carrack_elevator",
     # TransportCarriage GrimHex - ascenseurs principaux observes 23/05/2026
     # ATTENTION : SC utilise DEUX nomenclatures distinctes :
     #   - "TransitCarriage_*"   : trams/ascenseurs Levski, A18, Lorville, UGF, reststops

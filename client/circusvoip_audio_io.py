@@ -48,6 +48,15 @@ except Exception as e:
     NOISE_SUPPRESSION_AVAILABLE = False
     _NS_IMPORT_ERR = str(e)
 
+# Log audio RX detaille pour diagnostic crackling (ajout 02/06/2026).
+# Module autonome qui ecrit dans un CSV separe quand active via l'UI.
+# Si le module est absent (cas tres improbable, fichier manquant), on
+# laisse _audio_rx_logger = None et tous les appels seront no-op.
+try:
+    import circusvoip_audio_rx_logger as _audio_rx_logger
+except Exception:
+    _audio_rx_logger = None
+
 
 def _ns_log(msg: str):
     """Helper : log dans le fichier debug du core si possible, sinon
@@ -83,6 +92,65 @@ MAX_QUEUE_LEN = 10   # 200 ms de buffer max
 # toutes les 20 ms : on tolere 5 trames manquees = 100 ms. Au-dela on
 # considere que le sender s'est tu, pas un bug reseau.
 _UNDERRUN_GAP_S = 0.1
+
+# Jitter buffer warmup (ajout 02/06/2026). Diagnostic CSV du 02/06 avec
+# Skywat : 82.6% des callbacks output trouvent la queue Skywat a 0-1 trame,
+# alors meme que 98% des trames arrivent dans la fenetre 10-25 ms (jitter
+# reseau normal). Cause : on commence a pop la queue des la 1ere trame
+# recue, sans laisser le temps a la queue d'absorber un peu de jitter ->
+# 1439 underruns / 8514 callbacks (= 16.9%) en 170s d'appel telephone.
+#
+# Fix : par sender, on a un etat "waiting" tant que la queue n'a pas
+# atteint ce nombre de trames. Pendant ce temps, le sender contribue
+# silence au mix (pas d'underrun compte, pas de pop). Une fois ce seuil
+# atteint, on passe en "playing" et on consomme normalement. Si la queue
+# se vide (sender silencieux ou pertes), retour en "waiting" pour le
+# prochain warmup.
+#
+# Valeur 5 = 100 ms de latence supplementaire (depuis 02/06/2026 v3,
+# anciennement 3 = 60 ms). Le test avec Alex le 02/06 a montre que 3 trames
+# etaient insuffisantes : selon la microdynamique du demarrage de talkspurt,
+# la queue pouvait se stabiliser a 1 trame seulement, et un sender tres
+# regulier (49.5-50.5 tr/s) suffisait a generer ~1000 underruns sur 73s
+# d'audio actif. Passage a 5 : queue cible 4 trames en regime, marge
+# confortable contre le drift et le jitter cumule.
+JITTER_BUFFER_WARMUP_FRAMES = 5
+
+# Hysteresis sur le retour en "waiting" (ajout 02/06/2026 v2).
+# Sans hysteresis : queue=0 -> immediat re-warmup (60ms de silence).
+# Probleme observe sur tests Firesstones : des mini-trous de 50-100ms
+# dans son flux declenchaient un re-warmup -> 60ms de silence supp ->
+# pop a la reprise. Resultat : 71 pops residuels sur 222s d'appel.
+#
+# Fix : on ne re-bascule en "waiting" que si la queue reste a 0 sur
+# JITTER_BUFFER_ZERO_STREAK callbacks consecutifs (= tolere un trou
+# de N*20ms = 100ms par defaut). En-deca, on accepte l'underrun
+# ponctuel (silence d'une trame = 20ms) plutot que de re-warmup
+# (silence de 3 trames = 60ms). Le silence pondere mieux : 20ms est
+# inaudible la plupart du temps, 60ms est un click net.
+JITTER_BUFFER_ZERO_STREAK = 5
+
+# PLC (Packet Loss Concealment) — ajout 02/06/2026 v3.
+# Sur underrun en mode "playing" (queue vide alors qu'on attendait une
+# trame), on ne plus ecrire silence mais on rejoue la DERNIERE trame
+# audio recue de ce sender, attenuee de PLC_GAIN. Effet : on couvre le
+# trou de 20ms par "quelque chose de proche" plutot que par du silence,
+# ce qui supprime le pop audible.
+#
+# Limitations volontaires :
+#   - On rejoue UN AU PLUS la derniere trame (pas en cascade). Si plusieurs
+#     callbacks consecutifs ont la queue vide, seul le PREMIER beneficie
+#     du PLC ; les suivants ecrivent silence comme avant. Sinon on
+#     boucle 50ms d'audio en boucle pendant un long trou = artefact.
+#   - On utilise la TRAME BRUTE (avant traitement radio/effet phone)
+#     parce que c'est ce qui est stocke. Pour le mix phone c'est OK,
+#     pour le mix radio le filtre biquad n'a pas son etat coherent
+#     mais c'est masque par l'attenuation -6dB.
+#
+# PLC_GAIN = 0.5 = -6 dB d'attenuation. Compromis classique en VOIP :
+# assez audible pour masquer le pop, assez attenue pour ne pas creer
+# une "doublure" perceptible si on repete la meme trame.
+PLC_GAIN = 0.5
 
 
 # ---------------------------------------------
@@ -1060,6 +1128,33 @@ class AudioIO:
         self._output_underruns_by_sender: dict[str, int] = {}
         self._output_truncations_by_sender: dict[str, int] = {}
         self._output_silence_implicite_by_sender: dict[str, int] = {}
+        # Jitter buffer warmup (ajout 02/06/2026, cf JITTER_BUFFER_WARMUP_FRAMES).
+        #   _jb_state            : "waiting" (warmup en cours) | "playing"
+        #   _jb_warmup_count     : nb fois ou on est passe en waiting (cumul)
+        #   _jb_silent_blocks    : nb de blocks audio ecrits silence pendant
+        #                          warmup (cumul). Stat utile car ces silences
+        #                          NE SONT PAS comptes comme underruns (c'est
+        #                          un comportement volontaire, pas un bug).
+        #   _jb_zero_streak      : nb de callbacks consecutifs ou la queue
+        #                          etait a 0 alors qu'on etait en playing
+        #                          (cf hysteresis JITTER_BUFFER_ZERO_STREAK).
+        #                          Reset quand une trame est pop avec succes.
+        self._jb_state: dict[str, str] = {}
+        self._jb_warmup_count: dict[str, int] = {}
+        self._jb_silent_blocks: dict[str, int] = {}
+        self._jb_zero_streak: dict[str, int] = {}
+
+        # PLC (ajout 02/06/2026 v3) :
+        #   _plc_last_frame  : derniere trame brute recue par sender (np.ndarray)
+        #                      utilisee pour rejouer sur underrun. Mise a jour
+        #                      a chaque pop dans _on_output_block.
+        #   _plc_used        : True si la derniere trame a deja servi pour
+        #                      un PLC -> on n'en fait pas un 2eme (sinon
+        #                      bouclage audible). Reset a chaque nouveau pop.
+        #   _plc_applied_total : compteur cumulatif pour stats CSV.
+        self._plc_last_frame: dict[str, "np.ndarray | None"] = {}
+        self._plc_used: dict[str, bool] = {}
+        self._plc_applied_total: dict[str, int] = {}
         # Fix underrun 25/05/2026 Kainan : sans ce timestamp, le compteur
         # underrun comptait aussi les periodes ou le sender ne parlait pas
         # (queue vide naturellement car noise gate ferme cote emetteur ->
@@ -1069,6 +1164,45 @@ class AudioIO:
         # depuis moins de _UNDERRUN_GAP_MS (100ms par defaut). Au-dela
         # = sender silencieux = comportement normal, pas un bug reseau.
         self._last_remote_frame_ts: dict[str, float] = {}
+
+        # Log audio RX detaille (ajout 02/06/2026, optionnel via UI).
+        # _last_callback_ts : timestamp du dernier appel _on_output_block,
+        #   utilise pour mesurer callback_period_ms (jitter sounddevice).
+        #   Initialise a 0.0, mis a jour a chaque callback.
+        self._last_callback_ts: float = 0.0
+
+    def set_audio_rx_log_enabled(self, enabled: bool, pseudo: str = "",
+                                 debug_dir=None) -> bool:
+        """Active ou desactive le log audio RX detaille (CSV separe pour
+        diagnostic crackling). Appele depuis l'UI quand l'utilisateur
+        coche/decoche "Activer le log audio detaille" dans les Parametres.
+
+        enabled   : True pour activer, False pour desactiver.
+        pseudo    : nom du joueur (utilise dans le nom du fichier CSV).
+                    Ignore si enabled=False.
+        debug_dir : pathlib.Path vers le dossier 'circusvoip_debug' du
+                    client. Le sous-dossier 'audio_rx/' sera cree dedans.
+                    Ignore si enabled=False.
+
+        Retourne True si l'operation a abouti, False sinon (module logger
+        non importable, deja dans l'etat demande, ou echec ouverture
+        fichier).
+        """
+        if _audio_rx_logger is None:
+            return False
+        try:
+            if enabled:
+                if _audio_rx_logger.is_enabled():
+                    return False  # deja actif
+                return _audio_rx_logger.enable(pseudo, debug_dir)
+            else:
+                if not _audio_rx_logger.is_enabled():
+                    return False  # deja inactif
+                _audio_rx_logger.disable()
+                return True
+        except Exception as e:
+            print(f"[AUDIO RX LOG] Echec toggle : {e}")
+            return False
 
     def get_audio_stats_snapshot(self) -> dict:
         """Renvoie une copie atomique des compteurs internes pour les
@@ -1304,8 +1438,36 @@ class AudioIO:
                         except queue.Empty:
                             pass
                         continue
+
+                    # ─── Jitter buffer warmup (ajout 02/06/2026) ───
+                    # Si on est en mode "waiting", on attend d'avoir au moins
+                    # JITTER_BUFFER_WARMUP_FRAMES dans la queue avant de pop.
+                    # Pendant ce temps, ce sender contribue silence au mix
+                    # (PAS d'underrun compte : c'est un silence volontaire).
+                    # Une fois le seuil atteint, on passe en "playing".
+                    # Effet : la queue oscille en regime entre WARMUP et
+                    # WARMUP+1 trames, ce qui donne ~60ms de marge de jitter
+                    # au lieu de 0 (cf. diagnostic CSV Skywat 02/06).
+                    _jb_st = self._jb_state.get(name, "waiting")
+                    if _jb_st == "waiting":
+                        if buf.qsize() < JITTER_BUFFER_WARMUP_FRAMES:
+                            # Pas encore assez : silence contribue, on attend.
+                            self._jb_silent_blocks[name] = (
+                                self._jb_silent_blocks.get(name, 0) + 1
+                            )
+                            continue
+                        # Seuil atteint : on passe en playing pour ce callback.
+                        self._jb_state[name] = "playing"
+
                     try:
                         frame = buf.get_nowait()
+                        # PLC (02/06/2026 v3) : memoriser la trame pour la
+                        # rejouer en cas de prochain underrun. Reset du flag
+                        # _plc_used : on a une "nouvelle" derniere trame, on
+                        # peut donc faire un PLC dessus a la prochaine
+                        # occasion sans risque de bouclage audible.
+                        self._plc_last_frame[name] = frame
+                        self._plc_used[name] = False
                         is_phone = self._remote_is_phone.get(name, False)
                         # Detecter taille frame vs block_size sounddevice
                         # pour stats debug crackling (25/05/2026). Pas de
@@ -1328,6 +1490,16 @@ class AudioIO:
                             self._output_silence_implicite_by_sender[name] = (
                                 self._output_silence_implicite_by_sender.get(name, 0) + 1
                             )
+                        # Jitter buffer (hysteresis) : un pop reussi reinit
+                        # le streak de queue vide. Le retour en "waiting"
+                        # n'est plus declenche ici (qsize=0 apres pop est
+                        # un cas normal et frequent), mais dans le handler
+                        # queue.Empty ci-dessous, apres
+                        # JITTER_BUFFER_ZERO_STREAK callbacks consecutifs
+                        # avec queue vide. Cela tolere les mini-trous
+                        # de 50-100ms dans le flux du sender sans imposer
+                        # un re-warmup penalisant (60ms de silence supp).
+                        self._jb_zero_streak[name] = 0
                         # CircusPhone (D3) : voix telephone -> mix_phone
                         # direct. Court-circuite tout traitement radio /
                         # Mode RP / echo : la voix telephone est claire.
@@ -1375,6 +1547,7 @@ class AudioIO:
                         #
                         # Note : on garde aussi le filtre final_vol > 0.001
                         # pour exclure les senders mute (volume 0).
+                        _is_real_underrun = False
                         if final_vol > 0.001:
                             last_ts = self._last_remote_frame_ts.get(name, 0.0)
                             if last_ts > 0 and (
@@ -1383,6 +1556,72 @@ class AudioIO:
                                 self._output_underruns_by_sender[name] = (
                                     self._output_underruns_by_sender.get(name, 0) + 1
                                 )
+                                _is_real_underrun = True
+
+                        # PLC (02/06/2026 v3) : si on est en VRAI underrun
+                        # (sender actif, trame manquante) ET qu'on a une
+                        # derniere trame memorisee ET qu'elle n'a pas deja
+                        # servi pour un PLC, on la rejoue attenuee a la
+                        # place du silence. Effet attendu : le pop audible
+                        # devient un micro-prolongement de la derniere
+                        # trame entendue, beaucoup plus discret a l'oreille.
+                        # Conditions strictes (anti-bouclage) :
+                        #   - _is_real_underrun : sender actif, pas mute
+                        #   - last_frame existe (au moins 1 pop deja fait)
+                        #   - _plc_used = False : on n'a pas deja PLC sur cette trame
+                        # Apres usage, _plc_used = True : si nouveau underrun
+                        # consecutif, on ecrira silence (pas de boucle).
+                        if (_is_real_underrun
+                                and self._plc_last_frame.get(name) is not None
+                                and not self._plc_used.get(name, False)):
+                            _plc_frame = self._plc_last_frame[name]
+                            _plc_len = len(_plc_frame)
+                            _plc_vol = final_vol * PLC_GAIN
+                            # Routage identique au cas pop normal : telephone
+                            # -> mix_phone, sinon mix_radio ou mix_prox selon
+                            # is_radio. Le filtre radio (apply_radio_effect)
+                            # n'est PAS reapplique sur la trame PLC : son
+                            # etat biquad serait incoherent, et l'attenuation
+                            # -6dB masque suffisamment l'artefact.
+                            _plc_is_phone = self._remote_is_phone.get(name, False)
+                            _plc_is_radio = self._remote_is_radio.get(name, False)
+                            if _plc_is_phone:
+                                if _plc_len >= frames:
+                                    mix_phone += _plc_frame[:frames] * _plc_vol
+                                else:
+                                    mix_phone[:_plc_len] += _plc_frame * _plc_vol
+                            else:
+                                _plc_target = mix_radio if _plc_is_radio else mix_prox
+                                if _plc_len >= frames:
+                                    _plc_target += _plc_frame[:frames] * _plc_vol
+                                else:
+                                    _plc_target[:_plc_len] += _plc_frame * _plc_vol
+                            # Marquer la trame comme "deja PLC-utilisee"
+                            self._plc_used[name] = True
+                            self._plc_applied_total[name] = (
+                                self._plc_applied_total.get(name, 0) + 1
+                            )
+
+                        # Hysteresis jitter buffer (02/06/2026 v2) : on
+                        # arrive ici parce que la queue etait vide alors
+                        # qu'on etait en "playing". Au lieu de basculer
+                        # immediatement en "waiting" (qui imposerait 60ms
+                        # de silence pour rewarmup), on incremente un
+                        # streak. Tant que streak < JITTER_BUFFER_ZERO_STREAK,
+                        # on reste en "playing" : le silence d'une trame
+                        # (20ms) est moins gravant qu'un re-warmup (60ms).
+                        # Au-dela du seuil, on considere que le sender
+                        # s'est vraiment tu et on bascule en "waiting".
+                        _streak = self._jb_zero_streak.get(name, 0) + 1
+                        self._jb_zero_streak[name] = _streak
+                        if _streak >= JITTER_BUFFER_ZERO_STREAK:
+                            self._jb_state[name] = "waiting"
+                            self._jb_warmup_count[name] = (
+                                self._jb_warmup_count.get(name, 0) + 1
+                            )
+                            # Reset du streak : le prochain "warmup atteint"
+                            # repartira proprement.
+                            self._jb_zero_streak[name] = 0
 
                 # Reverb grotte Schroeder (4 combs parallele + 2 all-pass serie).
                 # Applique sur le mix prox uniquement, tout le mix passe dans la
@@ -1496,6 +1735,16 @@ class AudioIO:
                     if self._phone_notif_idx >= len(self._phone_notif_buffer):
                         self._phone_notif_buffer = None
                         self._phone_notif_idx = 0
+            # Log audio RX detaille (no-op si toggle desactive). On collecte
+            # le state APRES tous les pops et tous les ajouts (sonnerie,
+            # beep, etc.), juste avant le soft clip tanh, pour avoir le
+            # mix_peak_pre_tanh "vrai". On mesure aussi le peak APRES tanh.
+            # Branchement conditionnel : on evite tout calcul si le log
+            # n'est pas actif (callback temps-reel a 50 Hz).
+            _log_active = (_audio_rx_logger is not None
+                           and _audio_rx_logger.is_enabled())
+            if _log_active:
+                _peak_pre = float(np.max(np.abs(mixed))) if frames > 0 else 0.0
             # Soft clip sur le mix final via tanh : transparent jusqu'a ~0.9,
             # saturation douce au-dela. Evite les distorsions en dents de scie
             # du hard clip quand plusieurs joueurs parlent fort en meme temps
@@ -1504,6 +1753,74 @@ class AudioIO:
             # de clip dur ensuite.
             np.tanh(mixed, out=mixed)
             outdata[:, 0] = mixed
+            # Suite du log_out apres ecriture outdata : peak post-tanh,
+            # senders_state (snapshot des queues APRES pops), flags.
+            if _log_active:
+                _peak_post = float(np.max(np.abs(mixed))) if frames > 0 else 0.0
+                _now_cb = time.monotonic()
+                _cb_period_ms = ((_now_cb - self._last_callback_ts) * 1000.0
+                                 if self._last_callback_ts > 0 else -1.0)
+                self._last_callback_ts = _now_cb
+                # Snapshot etat des queues APRES les pops effectues dans le
+                # callback. On parcourt _remote_buffers et on lit qsize.
+                # Detection underrun : approximation via _last_remote_frame_ts
+                # (sender ayant recu une trame il y a < _UNDERRUN_GAP_S
+                # secondes ET dont la queue est vide = under=True).
+                _senders_state = {}
+                try:
+                    with self._lock:
+                        for _sname, _sbuf in self._remote_buffers.items():
+                            _svol = self._remote_volumes.get(_sname, 1.0)
+                            _smult = self._remote_multipliers.get(_sname, 1.0)
+                            _sfinal = _svol * _smult
+                            _sqsz = _sbuf.qsize()
+                            _slast = self._last_remote_frame_ts.get(_sname, 0.0)
+                            _sunder = (
+                                _sfinal > 0.001
+                                and _sqsz == 0
+                                and _slast > 0
+                                and (_now_cb - _slast) <= _UNDERRUN_GAP_S
+                            )
+                            _senders_state[_sname] = {
+                                "q": _sqsz,
+                                "vol": round(_sfinal, 3),
+                                "under": bool(_sunder),
+                                "jb": self._jb_state.get(_sname, "?"),
+                                "streak": self._jb_zero_streak.get(_sname, 0),
+                                "plc": self._plc_applied_total.get(_sname, 0),
+                            }
+                except Exception:
+                    _senders_state = {}
+                # Cumuls truncations / silence implicite (somme sur tous les
+                # senders, pas par-sender pour rester compact dans le CSV).
+                try:
+                    _trunc_total = sum(
+                        self._output_truncations_by_sender.values()
+                    )
+                    _silence_total = sum(
+                        self._output_silence_implicite_by_sender.values()
+                    )
+                except Exception:
+                    _trunc_total = 0
+                    _silence_total = 0
+                _flags = {
+                    "cave_echo": bool(self._cave_echo_active),
+                    "beep": self._beep_buffer is not None,
+                    "soundboard": self._soundboard_buffer is not None,
+                    "sonnerie": self._phone_ring_buffer is not None,
+                }
+                try:
+                    _audio_rx_logger.log_out(
+                        callback_period_ms=_cb_period_ms,
+                        senders_state=_senders_state,
+                        mix_peak_pre_tanh=_peak_pre,
+                        mix_peak_post_tanh=_peak_post,
+                        trunc_total=_trunc_total,
+                        silence_impl_total=_silence_total,
+                        flags=_flags,
+                    )
+                except Exception:
+                    pass
         except Exception as e:
             print(f"[AUDIO] Erreur lecture : {e}")
             outdata.fill(0)
@@ -1564,16 +1881,30 @@ class AudioIO:
             if len(frame) == 0:
                 return
 
+            # Variables pour log audio RX detaille (si actif). Calculees au
+            # fil du flow normal, consommees dans l'appel log_rx en fin de
+            # methode. Cout negligeable meme si log inactif (juste qsize()
+            # et un get sur dict).
+            _rx_outcome = "OK"
+
             with self._lock:
                 if sender_name not in self._remote_buffers:
                     self._remote_buffers[sender_name] = queue.Queue(maxsize=MAX_QUEUE_LEN)
                     # Volume par defaut 0 : pas audible tant qu'on ne le configure pas
                     self._remote_volumes[sender_name] = 0.0
+                    # Nouveau sender : on demarre en mode warmup pour
+                    # laisser la queue se remplir avant de jouer (anti-crackling).
+                    self._jb_state[sender_name] = "waiting"
                 q = self._remote_buffers[sender_name]
                 # Memoriser is_radio / is_phone de la derniere trame
                 # (utilises au mix dans _on_output_block).
                 self._remote_is_radio[sender_name] = is_radio
                 self._remote_is_phone[sender_name] = is_phone
+
+            # Snapshot taille queue AVANT push (utile pour log_rx). On le
+            # capture hors lock : qsize() est une operation atomique sur
+            # queue.Queue et reste indicative.
+            _rx_q_before = q.qsize()
 
             # Anti-drift : si la file est pleine, on jette le plus ancien
             # NOTE 25/05/2026 : ce drop etait silencieux jusqu'a present, ce
@@ -1588,6 +1919,7 @@ class AudioIO:
                     self._frames_dropped_by_sender[sender_name] = (
                         self._frames_dropped_by_sender.get(sender_name, 0) + 1
                     )
+                    _rx_outcome = "DROP_QUEUE_FULL"
                     # Niveau B : log throttle 30s.
                     now_log = time.monotonic()
                     last_logged = self._first_drop_logged_by_sender.get(
@@ -1608,13 +1940,45 @@ class AudioIO:
             except queue.Full:
                 pass
 
+            # Snapshot taille queue APRES push.
+            _rx_q_after = q.qsize()
+
             self._frames_received += 1
             # Fix underrun 25/05/2026 : memoriser le timestamp de la derniere
             # trame recue pour ce sender. _on_output_block s'en sert pour
             # distinguer un VRAI underrun (queue vide alors qu'on vient de
             # recevoir = jitter reel) d'un faux underrun (sender silencieux
             # depuis > 100ms = comportement normal du noise gate emetteur).
-            self._last_remote_frame_ts[sender_name] = time.monotonic()
+            # NB : on calcule delta_ms (depuis trame precedente du meme
+            # sender) AVANT d'ecraser _last_remote_frame_ts, pour log_rx.
+            _now_mono = time.monotonic()
+            _prev_ts = self._last_remote_frame_ts.get(sender_name, 0.0)
+            _rx_delta_ms = ((_now_mono - _prev_ts) * 1000.0
+                            if _prev_ts > 0 else -1.0)
+            self._last_remote_frame_ts[sender_name] = _now_mono
+
+            # Log audio RX detaille (no-op si toggle desactive).
+            if _audio_rx_logger is not None:
+                # Reconstruction du flag depuis is_radio/is_phone. Note :
+                # is_radio melange 0x01 (radio canal) et 0x02 (radio profil),
+                # on ne peut pas les distinguer ici. On utilise 0x01 par
+                # convention pour les 2 cas radio. Si tu veux la distinction,
+                # il faut faire remonter le flag exact depuis core.
+                if is_phone:
+                    _rx_type = 0x03
+                elif is_radio:
+                    _rx_type = 0x01
+                else:
+                    _rx_type = 0x00
+                _audio_rx_logger.log_rx(
+                    sender=sender_name,
+                    msg_type=_rx_type,
+                    size=len(frame_bytes),
+                    delta_ms=_rx_delta_ms,
+                    q_before=_rx_q_before,
+                    q_after=_rx_q_after,
+                    outcome=_rx_outcome,
+                )
         except Exception as e:
             print(f"[AUDIO] Erreur feed : {e}")
 

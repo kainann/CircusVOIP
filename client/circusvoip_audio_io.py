@@ -48,6 +48,15 @@ except Exception as e:
     NOISE_SUPPRESSION_AVAILABLE = False
     _NS_IMPORT_ERR = str(e)
 
+# Log audio RX detaille pour diagnostic crackling (ajout 02/06/2026).
+# Module autonome qui ecrit dans un CSV separe quand active via l'UI.
+# Si le module est absent (cas tres improbable, fichier manquant), on
+# laisse _audio_rx_logger = None et tous les appels seront no-op.
+try:
+    import circusvoip_audio_rx_logger as _audio_rx_logger
+except Exception:
+    _audio_rx_logger = None
+
 
 def _ns_log(msg: str):
     """Helper : log dans le fichier debug du core si possible, sinon
@@ -76,6 +85,224 @@ FRAME_BYTES = BLOCK_SIZE * 4   # 960 samples * 4 bytes par float32 = 3840 bytes
 # Pour chaque emetteur, on garde une file de buffers a jouer
 # Si la file devient trop grande, on jette les vieux (anti-drift)
 MAX_QUEUE_LEN = 10   # 200 ms de buffer max
+
+# Seuil pour distinguer un VRAI underrun (queue vide alors qu'on vient de
+# recevoir une trame = jitter/drift) d'un faux underrun (sender silencieux,
+# noise gate ferme). 25/05/2026 Kainan. A 50 trames/s, une trame arrive
+# toutes les 20 ms : on tolere 5 trames manquees = 100 ms. Au-dela on
+# considere que le sender s'est tu, pas un bug reseau.
+_UNDERRUN_GAP_S = 0.1
+
+# Jitter buffer warmup (ajout 02/06/2026). Diagnostic CSV du 02/06 avec
+# Skywat : 82.6% des callbacks output trouvent la queue Skywat a 0-1 trame,
+# alors meme que 98% des trames arrivent dans la fenetre 10-25 ms (jitter
+# reseau normal). Cause : on commence a pop la queue des la 1ere trame
+# recue, sans laisser le temps a la queue d'absorber un peu de jitter ->
+# 1439 underruns / 8514 callbacks (= 16.9%) en 170s d'appel telephone.
+#
+# Fix : par sender, on a un etat "waiting" tant que la queue n'a pas
+# atteint ce nombre de trames. Pendant ce temps, le sender contribue
+# silence au mix (pas d'underrun compte, pas de pop). Une fois ce seuil
+# atteint, on passe en "playing" et on consomme normalement. Si la queue
+# se vide (sender silencieux ou pertes), retour en "waiting" pour le
+# prochain warmup.
+#
+# Valeur 5 = 100 ms de latence supplementaire (depuis 02/06/2026 v3,
+# anciennement 3 = 60 ms). Le test avec Alex le 02/06 a montre que 3 trames
+# etaient insuffisantes : selon la microdynamique du demarrage de talkspurt,
+# la queue pouvait se stabiliser a 1 trame seulement, et un sender tres
+# regulier (49.5-50.5 tr/s) suffisait a generer ~1000 underruns sur 73s
+# d'audio actif. Passage a 5 : queue cible 4 trames en regime, marge
+# confortable contre le drift et le jitter cumule.
+JITTER_BUFFER_WARMUP_FRAMES = 5
+
+# Hysteresis sur le retour en "waiting" (ajout 02/06/2026 v2).
+# Sans hysteresis : queue=0 -> immediat re-warmup (60ms de silence).
+# Probleme observe sur tests Firesstones : des mini-trous de 50-100ms
+# dans son flux declenchaient un re-warmup -> 60ms de silence supp ->
+# pop a la reprise. Resultat : 71 pops residuels sur 222s d'appel.
+#
+# Fix : on ne re-bascule en "waiting" que si la queue reste a 0 sur
+# JITTER_BUFFER_ZERO_STREAK callbacks consecutifs (= tolere un trou
+# de N*20ms = 100ms par defaut). En-deca, on accepte l'underrun
+# ponctuel (silence d'une trame = 20ms) plutot que de re-warmup
+# (silence de 3 trames = 60ms). Le silence pondere mieux : 20ms est
+# inaudible la plupart du temps, 60ms est un click net.
+JITTER_BUFFER_ZERO_STREAK = 5
+
+# PLC (Packet Loss Concealment) — ajout 02/06/2026 v3.
+# Sur underrun en mode "playing" (queue vide alors qu'on attendait une
+# trame), on ne plus ecrire silence mais on rejoue la DERNIERE trame
+# audio recue de ce sender, attenuee de PLC_GAIN. Effet : on couvre le
+# trou de 20ms par "quelque chose de proche" plutot que par du silence,
+# ce qui supprime le pop audible.
+#
+# Limitations volontaires :
+#   - On rejoue UN AU PLUS la derniere trame (pas en cascade). Si plusieurs
+#     callbacks consecutifs ont la queue vide, seul le PREMIER beneficie
+#     du PLC ; les suivants ecrivent silence comme avant. Sinon on
+#     boucle 50ms d'audio en boucle pendant un long trou = artefact.
+#   - On utilise la TRAME BRUTE (avant traitement radio/effet phone)
+#     parce que c'est ce qui est stocke. Pour le mix phone c'est OK,
+#     pour le mix radio le filtre biquad n'a pas son etat coherent
+#     mais c'est masque par l'attenuation -6dB.
+#
+# PLC_GAIN = 0.5 = -6 dB d'attenuation. Compromis classique en VOIP :
+# assez audible pour masquer le pop, assez attenue pour ne pas creer
+# une "doublure" perceptible si on repete la meme trame.
+PLC_GAIN = 0.5
+
+
+# ---------------------------------------------
+#  Chargement de fichiers .wav (sonneries / notifs)
+# ---------------------------------------------
+#
+# Les sonneries telephone (ring/dial) et la notification MP peuvent etre
+# fournies sous forme de fichier .wav dans le dossier "sounds/" a cote du
+# script (ou dans le dossier app/ embarque par l'installateur).
+#
+# Contraintes attendues sur les .wav :
+#   - Sample rate : 48 kHz (= SAMPLE_RATE) pour ne pas avoir a resampler
+#   - Mono (1 canal)
+#   - 16-bit PCM (sw=2). Le 24-bit (sw=3) n'est pas decode trivialement par
+#     stdlib wave : convertir en 16-bit avec Audacity/sox/ffmpeg avant
+#     embarquage. Le 32-bit float (sw=4) est accepte aussi.
+#
+# Si le .wav est absent, illisible, ou dans un format non gere, on tombe
+# sur le pattern synthetique de secours (parametre synth_fallback). C'est
+# voulu : la fonctionnalite degrade en douceur, jamais de crash.
+#
+# Calibration du volume :
+#   Le gain est applique au chargement pour que le RMS du .wav matche le
+#   RMS du pattern synthetique de reference (= "meme volume percu" que le
+#   son d'avant). Si le .wav est silencieux, le gain n'est pas applique
+#   (eviterait une division par 0).
+#
+# Le fichier est lu UNE FOIS au demarrage (_AudioIO.__init__), pas a chaque
+# play_phone_ring. Le buffer numpy est garde en RAM pour rejouer instantanement.
+
+# Dossier ou chercher les sons. Calcule relativement a CE fichier .py.
+# Si circusvoip_audio_io.py est dans app/, alors les sons sont dans
+# app/sounds/<nom>.wav. C'est compatible avec le packaging par l'installateur
+# Inno Setup ([Files] embarque app/* recursivement).
+import os as _os_for_sounds
+_SOUNDS_DIR = _os_for_sounds.path.join(
+    _os_for_sounds.path.dirname(_os_for_sounds.path.abspath(__file__)),
+    "sounds",
+)
+
+
+def _load_wav_as_float32(path: str) -> "np.ndarray | None":
+    """Charge un fichier .wav en float32 mono 48 kHz.
+
+    Retourne None si :
+      - le fichier n'existe pas
+      - il est dans un format non gere (sample rate != 48000, stereo,
+        24-bit PCM, etc.)
+      - une erreur survient au decodage
+
+    On utilise stdlib wave (pas de dep pip). 16-bit PCM (sw=2) et 32-bit
+    float (sw=4) sont supportes. Pour du 24-bit, il faut convertir le
+    fichier en amont (cf docstring du module).
+    """
+    import wave
+    try:
+        if not _os_for_sounds.path.exists(path):
+            return None
+        with wave.open(path, "rb") as w:
+            sr      = w.getframerate()
+            nch     = w.getnchannels()
+            sw      = w.getsampwidth()
+            nframes = w.getnframes()
+            raw     = w.readframes(nframes)
+        # Validation format
+        if sr != SAMPLE_RATE:
+            _ns_log(f"[SOUNDS] {path} sample_rate={sr} (attendu {SAMPLE_RATE}), ignore")
+            return None
+        if nch != 1:
+            _ns_log(f"[SOUNDS] {path} channels={nch} (attendu 1=mono), ignore")
+            return None
+        # Decodage selon largeur d'echantillon
+        if sw == 2:
+            # 16-bit PCM signed little-endian -> float32 [-1, 1]
+            arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        elif sw == 4:
+            # 32-bit IEEE float (probable) ou 32-bit PCM int. On suppose float :
+            # c'est ce que produit soundfile.write(..., subtype="FLOAT") et la
+            # plupart des outils. Si c'est du PCM int32 mal etiquete, le rendu
+            # sera muet/distordu, on log un warning.
+            arr = np.frombuffer(raw, dtype=np.float32).copy()
+            if np.abs(arr).max() > 10.0:
+                _ns_log(f"[SOUNDS] {path} sw=4 mais amplitudes hors [-1,1] "
+                        f"(peak={np.abs(arr).max():.1f}), probablement PCM int32, ignore")
+                return None
+        else:
+            _ns_log(f"[SOUNDS] {path} sampwidth={sw} non supporte (attendu 2 ou 4), ignore")
+            return None
+        return arr
+    except Exception as e:
+        _ns_log(f"[SOUNDS] Echec chargement {path} : {e}")
+        return None
+
+
+def _load_wav_calibrated_or_synth(
+    filename: str,
+    synth_fallback,
+    log_label: str,
+) -> "np.ndarray":
+    """Tente de charger sounds/<filename>. En cas de succes, calibre son
+    RMS pour matcher celui du pattern synthetique de reference, puis
+    retourne le buffer. En cas d'echec, retourne le resultat de synth_fallback().
+
+    L'idee : "meme volume percu" entre l'ancien son synth et le nouveau .wav.
+    Le RMS sur les portions actives (= au-dessus d'un seuil de silence) est
+    une mesure correcte du volume percu pour des signaux periodiques type
+    sonnerie.
+
+    Args:
+        filename: nom du fichier dans sounds/ (ex. "dial.wav")
+        synth_fallback: callable() -> np.ndarray, le generateur synthetique
+        log_label: label court pour les logs (ex. "dial")
+    """
+    synth = synth_fallback()
+    path = _os_for_sounds.path.join(_SOUNDS_DIR, filename)
+    wav = _load_wav_as_float32(path)
+    if wav is None:
+        # Fallback silencieux : pas de .wav, on garde le synth.
+        # On ne log que si le fichier existe (= echec de decodage), sinon
+        # c'est juste qu'aucun .wav n'a ete fourni et c'est normal.
+        if _os_for_sounds.path.exists(path):
+            _ns_log(f"[SOUNDS] {log_label}: fallback synth (echec chargement {path})")
+        return synth
+
+    # Calcul RMS sur les portions actives (hors silence) pour calibrer
+    def _rms_active(buf: "np.ndarray", thresh: float = 0.005) -> float:
+        active = buf[np.abs(buf) > thresh]
+        if len(active) == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(active.astype(np.float64) ** 2)))
+
+    rms_wav   = _rms_active(wav)
+    rms_synth = _rms_active(synth)
+    if rms_wav <= 0.0 or rms_synth <= 0.0:
+        # Cas degeneré : wav muet ou synth muet. On garde le wav tel quel
+        # avec un gain de securite faible pour eviter saturation.
+        gain = 0.20
+    else:
+        gain = rms_synth / rms_wav
+        # Limiter le gain pour eviter qu'un fichier extremement faible
+        # ne sature en sortie. Plafond a 1.0 (pas d'amplification au-dela
+        # du fichier d'origine) car les .wav usuels sont deja normalises.
+        gain = min(gain, 1.0)
+
+    wav_calibrated = (wav * gain).astype(np.float32)
+
+    # Verifier le peak final, log informatif
+    peak = float(np.abs(wav_calibrated).max()) if len(wav_calibrated) > 0 else 0.0
+    _ns_log(f"[SOUNDS] {log_label}: charge {path} ({len(wav)} samples, "
+            f"{len(wav)/SAMPLE_RATE:.2f}s, gain={gain:.3f}, peak={peak:.3f})")
+
+    return wav_calibrated
 
 
 # ---------------------------------------------
@@ -752,6 +979,71 @@ class AudioIO:
         self._beep_release = self._generate_beep(freq_hz=440.0, duration_ms=60,
                                                   fade_ms=8, amplitude=0.125)
 
+        # Soundboard (v0.2 alpha 029). Joue un fichier WAV local mixe dans
+        # le flux de sortie (comme le bip), avec son propre buffer et son
+        # facteur de volume (slider "Son A" dans l'UI). Le pipeline :
+        #   - play_soundboard(samples) charge un np.array float32 mono 48kHz.
+        #   - _on_output_block mixe les samples au flux principal en
+        #     multipliant par _soundboard_volume_factor.
+        #   - Un seul son a la fois : nouvelle lecture remplace l'ancienne.
+        # IMPORTANT : c'est entendu UNIQUEMENT par l'utilisateur local.
+        # Pour que les AUTRES joueurs entendent le son, le client envoie
+        # un message WebSocket soundboard_play au serveur, qui le broadcast
+        # au canal vocal, et chaque recepteur appelle play_soundboard()
+        # sur sa copie locale du fichier.
+        self._soundboard_buffer: "np.ndarray | None" = None
+        self._soundboard_idx = 0
+
+        # Sonnerie telephone CircusPhone (Feature 4, D2). Contrairement au
+        # bip PTT et au soundboard qui sont one-shot, la sonnerie BOUCLE :
+        # quand _phone_ring_idx atteint la fin du buffer, il repart a 0.
+        # La lecture ne s'arrete que sur appel explicite a stop_phone_ring().
+        # Un seul buffer : un joueur est soit appelant (motif "dial"), soit
+        # destinataire (motif "ring"), jamais les deux a la fois.
+        #   _phone_ring_buffer : buffer du motif en cours (ou None si silence)
+        #   _phone_ring_idx    : position de lecture dans le buffer (boucle)
+        # Les motifs sont charges depuis sounds/ring.wav et sounds/dial.wav
+        # si presents, sinon on tombe sur le pattern synthetique de secours
+        # (cf docstrings de _synth_phone_*_pattern). Le chargement est fait
+        # UNE FOIS ici, le buffer numpy reste en RAM pour relance instantanee.
+        self._phone_ring_buffer: "np.ndarray | None" = None
+        self._phone_ring_idx = 0
+        # Motif "ring" (destinataire) : sounds/ring.wav ou double tonalite synth.
+        self._phone_ring_pattern_ring = _load_wav_calibrated_or_synth(
+            "ring.wav", self._synth_phone_ring_pattern, "ring",
+        )
+        # Motif "dial" (appelant) : sounds/dial.wav ou bip synth.
+        self._phone_ring_pattern_dial = _load_wav_calibrated_or_synth(
+            "dial.wav", self._synth_phone_dial_pattern, "dial",
+        )
+
+        # CircusPhone (D4 etape 3) : son de notification de message texte.
+        # Contrairement a la sonnerie, c'est un ONE-SHOT (~1s) qui se joue
+        # une fois et s'arrete (comme le bip PTT et le soundboard). Volume
+        # pilote par le meme slider que la sonnerie (_phone_ring_volume_factor :
+        # la spec dit "slider sonnerie tel = sonnerie + bip d'appel + notif MP").
+        self._phone_notif_buffer: "np.ndarray | None" = None
+        self._phone_notif_idx = 0
+        # Motif notif : sounds/notif.wav ou ding-dong synth.
+        self._phone_notif_pattern = _load_wav_calibrated_or_synth(
+            "notif.wav", self._synth_phone_notif_pattern, "notif",
+        )
+
+        # CircusPhone (D4 etape 2) : flag "mute micro" depuis l'overlay
+        # phone (ecran 'En appel'). Coupe la capture cote envoi sans
+        # toucher au gate ni au PTT. False par defaut.
+        self._capture_muted = False
+
+        # Facteurs de volume controles par les sliders de l'UI
+        # (v0.2 alpha 002 / consolides en alpha 029). 1.0 = 100%, 2.0 = 200%.
+        # Bornes appliquees a 0.0..2.0 dans les setters.
+        #   _beep_volume_factor       : slider "Bip radio" (actif sur bip PTT)
+        #   _soundboard_volume_factor : slider "Son A" (actif sur soundboard)
+        #   _phone_ring_volume_factor : slider "Son B" (futur, pour CircusPhone)
+        self._beep_volume_factor       = 1.0
+        self._soundboard_volume_factor = 1.0
+        self._phone_ring_volume_factor = 1.0
+
         # Lecture
         self._output_stream = None
         self._remote_buffers: dict[str, queue.Queue] = {}
@@ -764,6 +1056,12 @@ class AudioIO:
         # voix de proximite (pas celles recues en radio PTT, qui ont deja
         # leur propre effet talkie-walkie).
         self._remote_is_radio: dict[str, bool]       = {}
+        # CircusPhone (D3) : flag "voix telephone" de la derniere trame
+        # recue par sender. Quand True, la voix est routee vers mix_phone
+        # dans _on_output_block : pas de filtre radio, pas d'echo grotte,
+        # pas d'attenuation de distance (au telephone la distance physique
+        # entre les 2 interlocuteurs n'existe pas).
+        self._remote_is_phone: dict[str, bool]       = {}
         # Flag Mode RP : si True pour un sender, sa voix de proximite sera
         # traitee comme une radio (filtre applique localement en plus de son
         # routage normal). Ce flag est calcule par le CLIENT selon la regle :
@@ -804,6 +1102,123 @@ class AudioIO:
         # Stats
         self._frames_sent     = 0
         self._frames_received = 0
+
+        # === Stats debug crackling (ajout 25/05/2026) ===
+        # Compteurs pour tracker les pertes silencieuses de frames audio.
+        # Toutes valeurs cumulatives depuis le demarrage du process. Les
+        # logs [AUDIO STATS] periodiques (cf core) consultent ces compteurs
+        # et calculent les deltas sur 30s.
+        #
+        # Cote reception (feed_remote_frame) :
+        #   _frames_dropped_by_sender : dict {sender: count} - frames jetees
+        #     car la queue _remote_buffers[sender] etait pleine (anti-drift).
+        #   _first_drop_logged_by_sender : dict {sender: ts} - timestamp du
+        #     dernier log "premier drop" pour throttle (re-logger toutes les 30s).
+        #
+        # Cote playback (_on_output_block) :
+        #   _output_underruns_by_sender : dict {sender: count} - queue vide
+        #     quand sounddevice a besoin de samples (queue.Empty).
+        #   _output_truncations_by_sender : dict {sender: count} - frame plus
+        #     grande que block_size (rare mais possible si block_size sounddevice
+        #     est inferieur a BLOCK_SIZE source = 960).
+        #   _output_silence_implicite_by_sender : dict {sender: count} - frame
+        #     plus petite que block_size (= silence ajoute implicitement, click possible).
+        self._frames_dropped_by_sender: dict[str, int] = {}
+        self._first_drop_logged_by_sender: dict[str, float] = {}
+        self._output_underruns_by_sender: dict[str, int] = {}
+        self._output_truncations_by_sender: dict[str, int] = {}
+        self._output_silence_implicite_by_sender: dict[str, int] = {}
+        # Jitter buffer warmup (ajout 02/06/2026, cf JITTER_BUFFER_WARMUP_FRAMES).
+        #   _jb_state            : "waiting" (warmup en cours) | "playing"
+        #   _jb_warmup_count     : nb fois ou on est passe en waiting (cumul)
+        #   _jb_silent_blocks    : nb de blocks audio ecrits silence pendant
+        #                          warmup (cumul). Stat utile car ces silences
+        #                          NE SONT PAS comptes comme underruns (c'est
+        #                          un comportement volontaire, pas un bug).
+        #   _jb_zero_streak      : nb de callbacks consecutifs ou la queue
+        #                          etait a 0 alors qu'on etait en playing
+        #                          (cf hysteresis JITTER_BUFFER_ZERO_STREAK).
+        #                          Reset quand une trame est pop avec succes.
+        self._jb_state: dict[str, str] = {}
+        self._jb_warmup_count: dict[str, int] = {}
+        self._jb_silent_blocks: dict[str, int] = {}
+        self._jb_zero_streak: dict[str, int] = {}
+
+        # PLC (ajout 02/06/2026 v3) :
+        #   _plc_last_frame  : derniere trame brute recue par sender (np.ndarray)
+        #                      utilisee pour rejouer sur underrun. Mise a jour
+        #                      a chaque pop dans _on_output_block.
+        #   _plc_used        : True si la derniere trame a deja servi pour
+        #                      un PLC -> on n'en fait pas un 2eme (sinon
+        #                      bouclage audible). Reset a chaque nouveau pop.
+        #   _plc_applied_total : compteur cumulatif pour stats CSV.
+        self._plc_last_frame: dict[str, "np.ndarray | None"] = {}
+        self._plc_used: dict[str, bool] = {}
+        self._plc_applied_total: dict[str, int] = {}
+        # Fix underrun 25/05/2026 Kainan : sans ce timestamp, le compteur
+        # underrun comptait aussi les periodes ou le sender ne parlait pas
+        # (queue vide naturellement car noise gate ferme cote emetteur ->
+        # aucune trame envoyee). Resultat : 1500 underruns/30s pour Skywat
+        # silencieux pendant 30s = faux positif. Maintenant on ne compte
+        # un underrun QUE si on a recu au moins une trame de ce sender
+        # depuis moins de _UNDERRUN_GAP_MS (100ms par defaut). Au-dela
+        # = sender silencieux = comportement normal, pas un bug reseau.
+        self._last_remote_frame_ts: dict[str, float] = {}
+
+        # Log audio RX detaille (ajout 02/06/2026, optionnel via UI).
+        # _last_callback_ts : timestamp du dernier appel _on_output_block,
+        #   utilise pour mesurer callback_period_ms (jitter sounddevice).
+        #   Initialise a 0.0, mis a jour a chaque callback.
+        self._last_callback_ts: float = 0.0
+
+    def set_audio_rx_log_enabled(self, enabled: bool, pseudo: str = "",
+                                 debug_dir=None) -> bool:
+        """Active ou desactive le log audio RX detaille (CSV separe pour
+        diagnostic crackling). Appele depuis l'UI quand l'utilisateur
+        coche/decoche "Activer le log audio detaille" dans les Parametres.
+
+        enabled   : True pour activer, False pour desactiver.
+        pseudo    : nom du joueur (utilise dans le nom du fichier CSV).
+                    Ignore si enabled=False.
+        debug_dir : pathlib.Path vers le dossier 'circusvoip_debug' du
+                    client. Le sous-dossier 'audio_rx/' sera cree dedans.
+                    Ignore si enabled=False.
+
+        Retourne True si l'operation a abouti, False sinon (module logger
+        non importable, deja dans l'etat demande, ou echec ouverture
+        fichier).
+        """
+        if _audio_rx_logger is None:
+            return False
+        try:
+            if enabled:
+                if _audio_rx_logger.is_enabled():
+                    return False  # deja actif
+                return _audio_rx_logger.enable(pseudo, debug_dir)
+            else:
+                if not _audio_rx_logger.is_enabled():
+                    return False  # deja inactif
+                _audio_rx_logger.disable()
+                return True
+        except Exception as e:
+            print(f"[AUDIO RX LOG] Echec toggle : {e}")
+            return False
+
+    def get_audio_stats_snapshot(self) -> dict:
+        """Renvoie une copie atomique des compteurs internes pour les
+        logs [AUDIO STATS] periodiques. Toutes les valeurs sont cumulatives
+        depuis le demarrage : l'appelant doit calculer les deltas lui-meme."""
+        with self._lock:
+            return {
+                "frames_sent":     int(self._frames_sent),
+                "frames_received": int(self._frames_received),
+                "frames_dropped_by_sender": dict(self._frames_dropped_by_sender),
+                "output_underruns_by_sender": dict(self._output_underruns_by_sender),
+                "output_truncations_by_sender": dict(self._output_truncations_by_sender),
+                "output_silence_implicite_by_sender": dict(
+                    self._output_silence_implicite_by_sender
+                ),
+            }
 
     def is_available(self) -> bool:
         return _SD_AVAILABLE
@@ -995,16 +1410,22 @@ class AudioIO:
         Callback sounddevice : appelee quand la sortie audio a besoin de nouveaux samples.
         On mixe tous les buffers remote, chacun a son volume propre.
 
-        Deux mixages paralleles :
+        Trois mixages paralleles :
           - mix_prox  : voix de proximite (sans effet radio). Recoit l'echo
                         grotte si _cave_echo_active.
           - mix_radio : voix deja passees par apply_radio_effect. Pas d'echo
                         grotte (les 2 effets ensemble sonneraient mal).
-        Les 2 mix sont additionnes a la fin.
+          - mix_phone : voix telephone CircusPhone (D3). Ni effet radio, ni
+                        echo grotte : la conversation telephone est "claire
+                        des deux cotes" (spec). Volume non attenue par la
+                        distance (gere en amont cote core : set_user_volume
+                        a 1.0 pour le correspondant).
+        Les 3 mix sont additionnes a la fin.
         """
         try:
             mix_prox  = np.zeros(frames, dtype=np.float32)
             mix_radio = np.zeros(frames, dtype=np.float32)
+            mix_phone = np.zeros(frames, dtype=np.float32)
             with self._lock:
                 for name, buf in self._remote_buffers.items():
                     vol = self._remote_volumes.get(name, 1.0)
@@ -1017,8 +1438,77 @@ class AudioIO:
                         except queue.Empty:
                             pass
                         continue
+
+                    # ─── Jitter buffer warmup (ajout 02/06/2026) ───
+                    # Si on est en mode "waiting", on attend d'avoir au moins
+                    # JITTER_BUFFER_WARMUP_FRAMES dans la queue avant de pop.
+                    # Pendant ce temps, ce sender contribue silence au mix
+                    # (PAS d'underrun compte : c'est un silence volontaire).
+                    # Une fois le seuil atteint, on passe en "playing".
+                    # Effet : la queue oscille en regime entre WARMUP et
+                    # WARMUP+1 trames, ce qui donne ~60ms de marge de jitter
+                    # au lieu de 0 (cf. diagnostic CSV Skywat 02/06).
+                    _jb_st = self._jb_state.get(name, "waiting")
+                    if _jb_st == "waiting":
+                        if buf.qsize() < JITTER_BUFFER_WARMUP_FRAMES:
+                            # Pas encore assez : silence contribue, on attend.
+                            self._jb_silent_blocks[name] = (
+                                self._jb_silent_blocks.get(name, 0) + 1
+                            )
+                            continue
+                        # Seuil atteint : on passe en playing pour ce callback.
+                        self._jb_state[name] = "playing"
+
                     try:
                         frame = buf.get_nowait()
+                        # PLC (02/06/2026 v3) : memoriser la trame pour la
+                        # rejouer en cas de prochain underrun. Reset du flag
+                        # _plc_used : on a une "nouvelle" derniere trame, on
+                        # peut donc faire un PLC dessus a la prochaine
+                        # occasion sans risque de bouclage audible.
+                        self._plc_last_frame[name] = frame
+                        self._plc_used[name] = False
+                        is_phone = self._remote_is_phone.get(name, False)
+                        # Detecter taille frame vs block_size sounddevice
+                        # pour stats debug crackling (25/05/2026). Pas de
+                        # modification du comportement existant.
+                        len_frame = len(frame)
+                        if len_frame > frames:
+                            # Frame plus grande que ce que sounddevice demande
+                            # -> tronquee (perte de la fin). Tres rare en
+                            # regime normal (les emetteurs envoient BLOCK_SIZE=960
+                            # = ce que sounddevice consomme), mais peut arriver
+                            # si le block_size sounddevice cote receveur est
+                            # different (ex : driver custom, peripherique exotique).
+                            self._output_truncations_by_sender[name] = (
+                                self._output_truncations_by_sender.get(name, 0) + 1
+                            )
+                        elif len_frame < frames:
+                            # Frame plus petite -> on complete avec du silence
+                            # implicite (target reste a 0 sur la fin). Click
+                            # audible possible (discontinuite signal -> silence).
+                            self._output_silence_implicite_by_sender[name] = (
+                                self._output_silence_implicite_by_sender.get(name, 0) + 1
+                            )
+                        # Jitter buffer (hysteresis) : un pop reussi reinit
+                        # le streak de queue vide. Le retour en "waiting"
+                        # n'est plus declenche ici (qsize=0 apres pop est
+                        # un cas normal et frequent), mais dans le handler
+                        # queue.Empty ci-dessous, apres
+                        # JITTER_BUFFER_ZERO_STREAK callbacks consecutifs
+                        # avec queue vide. Cela tolere les mini-trous
+                        # de 50-100ms dans le flux du sender sans imposer
+                        # un re-warmup penalisant (60ms de silence supp).
+                        self._jb_zero_streak[name] = 0
+                        # CircusPhone (D3) : voix telephone -> mix_phone
+                        # direct. Court-circuite tout traitement radio /
+                        # Mode RP / echo : la voix telephone est claire.
+                        if is_phone:
+                            if len_frame >= frames:
+                                mix_phone += frame[:frames] * final_vol
+                            else:
+                                mix_phone[:len_frame] += frame * final_vol
+                            continue
                         is_radio = self._remote_is_radio.get(name, False)
                         # Mode RP : si le client a decide que ce sender doit
                         # etre filtre radio (un des 2 porte casque + Mode RP
@@ -1036,12 +1526,102 @@ class AudioIO:
                             is_radio = True
                         target = mix_radio if is_radio else mix_prox
                         # Ajuster taille si necessaire
-                        if len(frame) >= frames:
+                        if len_frame >= frames:
                             target += frame[:frames] * final_vol
                         else:
-                            target[:len(frame)] += frame * final_vol
+                            target[:len_frame] += frame * final_vol
                     except queue.Empty:
-                        pass
+                        # Underrun POTENTIEL : la queue de ce sender etait vide
+                        # alors que sounddevice demandait des samples. Mais
+                        # attention au faux positif : si le sender ne parle pas
+                        # (noise gate ferme cote emetteur), sa queue est vide
+                        # naturellement et ce n'est PAS un bug.
+                        #
+                        # Fix 25/05/2026 : on ne compte un underrun QUE si on
+                        # a recu une trame de ce sender depuis moins de
+                        # _UNDERRUN_GAP_S secondes (100 ms par defaut). Au-dela
+                        # = sender silencieux = normal, on ne compte rien.
+                        # En-deca = on attendait une trame, elle n'est pas
+                        # arrivee = VRAI underrun (jitter reseau, drift, etc.)
+                        # qui peut causer du crackling cote ecoute.
+                        #
+                        # Note : on garde aussi le filtre final_vol > 0.001
+                        # pour exclure les senders mute (volume 0).
+                        _is_real_underrun = False
+                        if final_vol > 0.001:
+                            last_ts = self._last_remote_frame_ts.get(name, 0.0)
+                            if last_ts > 0 and (
+                                time.monotonic() - last_ts
+                            ) <= _UNDERRUN_GAP_S:
+                                self._output_underruns_by_sender[name] = (
+                                    self._output_underruns_by_sender.get(name, 0) + 1
+                                )
+                                _is_real_underrun = True
+
+                        # PLC (02/06/2026 v3) : si on est en VRAI underrun
+                        # (sender actif, trame manquante) ET qu'on a une
+                        # derniere trame memorisee ET qu'elle n'a pas deja
+                        # servi pour un PLC, on la rejoue attenuee a la
+                        # place du silence. Effet attendu : le pop audible
+                        # devient un micro-prolongement de la derniere
+                        # trame entendue, beaucoup plus discret a l'oreille.
+                        # Conditions strictes (anti-bouclage) :
+                        #   - _is_real_underrun : sender actif, pas mute
+                        #   - last_frame existe (au moins 1 pop deja fait)
+                        #   - _plc_used = False : on n'a pas deja PLC sur cette trame
+                        # Apres usage, _plc_used = True : si nouveau underrun
+                        # consecutif, on ecrira silence (pas de boucle).
+                        if (_is_real_underrun
+                                and self._plc_last_frame.get(name) is not None
+                                and not self._plc_used.get(name, False)):
+                            _plc_frame = self._plc_last_frame[name]
+                            _plc_len = len(_plc_frame)
+                            _plc_vol = final_vol * PLC_GAIN
+                            # Routage identique au cas pop normal : telephone
+                            # -> mix_phone, sinon mix_radio ou mix_prox selon
+                            # is_radio. Le filtre radio (apply_radio_effect)
+                            # n'est PAS reapplique sur la trame PLC : son
+                            # etat biquad serait incoherent, et l'attenuation
+                            # -6dB masque suffisamment l'artefact.
+                            _plc_is_phone = self._remote_is_phone.get(name, False)
+                            _plc_is_radio = self._remote_is_radio.get(name, False)
+                            if _plc_is_phone:
+                                if _plc_len >= frames:
+                                    mix_phone += _plc_frame[:frames] * _plc_vol
+                                else:
+                                    mix_phone[:_plc_len] += _plc_frame * _plc_vol
+                            else:
+                                _plc_target = mix_radio if _plc_is_radio else mix_prox
+                                if _plc_len >= frames:
+                                    _plc_target += _plc_frame[:frames] * _plc_vol
+                                else:
+                                    _plc_target[:_plc_len] += _plc_frame * _plc_vol
+                            # Marquer la trame comme "deja PLC-utilisee"
+                            self._plc_used[name] = True
+                            self._plc_applied_total[name] = (
+                                self._plc_applied_total.get(name, 0) + 1
+                            )
+
+                        # Hysteresis jitter buffer (02/06/2026 v2) : on
+                        # arrive ici parce que la queue etait vide alors
+                        # qu'on etait en "playing". Au lieu de basculer
+                        # immediatement en "waiting" (qui imposerait 60ms
+                        # de silence pour rewarmup), on incremente un
+                        # streak. Tant que streak < JITTER_BUFFER_ZERO_STREAK,
+                        # on reste en "playing" : le silence d'une trame
+                        # (20ms) est moins gravant qu'un re-warmup (60ms).
+                        # Au-dela du seuil, on considere que le sender
+                        # s'est vraiment tu et on bascule en "waiting".
+                        _streak = self._jb_zero_streak.get(name, 0) + 1
+                        self._jb_zero_streak[name] = _streak
+                        if _streak >= JITTER_BUFFER_ZERO_STREAK:
+                            self._jb_state[name] = "waiting"
+                            self._jb_warmup_count[name] = (
+                                self._jb_warmup_count.get(name, 0) + 1
+                            )
+                            # Reset du streak : le prochain "warmup atteint"
+                            # repartira proprement.
+                            self._jb_zero_streak[name] = 0
 
                 # Reverb grotte Schroeder (4 combs parallele + 2 all-pass serie).
                 # Applique sur le mix prox uniquement, tout le mix passe dans la
@@ -1085,7 +1665,7 @@ class AudioIO:
                         # Mix dry + wet
                         mix_prox[i] = inp + wet * sig
 
-            mixed = mix_prox + mix_radio
+            mixed = mix_prox + mix_radio + mix_phone
             # Mixer le bip local (PTT feedback) si en cours.
             # Le bip est entendu par l'utilisateur lui-meme dans son casque,
             # ce n'est PAS envoye aux autres (juste pour le feedback PTT).
@@ -1093,12 +1673,78 @@ class AudioIO:
                 if self._beep_buffer is not None and self._beep_idx < len(self._beep_buffer):
                     remaining = len(self._beep_buffer) - self._beep_idx
                     n_take = min(frames, remaining)
-                    mixed[:n_take] += self._beep_buffer[self._beep_idx:self._beep_idx + n_take]
+                    # Le bip utilise le facteur de volume "radio_beep" pour
+                    # que l'utilisateur puisse l'attenuer s'il le trouve fort.
+                    factor = float(self._beep_volume_factor)
+                    mixed[:n_take] += self._beep_buffer[self._beep_idx:self._beep_idx + n_take] * factor
                     self._beep_idx += n_take
                     if self._beep_idx >= len(self._beep_buffer):
                         # Bip termine
                         self._beep_buffer = None
                         self._beep_idx = 0
+                # Mixer le soundboard (v0.2 alpha 029) si en cours. Volume
+                # applique par _soundboard_volume_factor (slider "Son A").
+                if self._soundboard_buffer is not None and self._soundboard_idx < len(self._soundboard_buffer):
+                    remaining = len(self._soundboard_buffer) - self._soundboard_idx
+                    n_take = min(frames, remaining)
+                    factor = float(self._soundboard_volume_factor)
+                    mixed[:n_take] += self._soundboard_buffer[self._soundboard_idx:self._soundboard_idx + n_take] * factor
+                    self._soundboard_idx += n_take
+                    if self._soundboard_idx >= len(self._soundboard_buffer):
+                        # Son termine
+                        self._soundboard_buffer = None
+                        self._soundboard_idx = 0
+                # Mixer la sonnerie telephone CircusPhone (D2) si en cours.
+                # Contrairement aux 2 sons ci-dessus, ce buffer BOUCLE :
+                # quand on atteint la fin, on repart au debut. Une frame de
+                # sortie peut donc chevaucher la fin et le debut du motif,
+                # d'ou la boucle de remplissage ci-dessous. La lecture ne
+                # s'arrete jamais d'elle-meme : seul stop_phone_ring() met
+                # _phone_ring_buffer a None. Volume : _phone_ring_volume_factor
+                # (slider "Sonnerie telephone").
+                if self._phone_ring_buffer is not None:
+                    ring_buf = self._phone_ring_buffer
+                    ring_len = len(ring_buf)
+                    if ring_len > 0:
+                        factor = float(self._phone_ring_volume_factor)
+                        filled = 0
+                        idx = self._phone_ring_idx
+                        while filled < frames:
+                            n_take = min(frames - filled, ring_len - idx)
+                            mixed[filled:filled + n_take] += (
+                                ring_buf[idx:idx + n_take] * factor
+                            )
+                            filled += n_take
+                            idx += n_take
+                            if idx >= ring_len:
+                                idx = 0  # boucle : retour au debut du motif
+                        self._phone_ring_idx = idx
+                # CircusPhone (D4 etape 3) : son de notification message.
+                # One-shot (~1s) : se joue une fois et s'arrete. Meme volume
+                # que la sonnerie (slider "Sonnerie tel.") comme prevu dans
+                # la spec ("sonnerie + bip d'appel + notif MP").
+                if self._phone_notif_buffer is not None and \
+                   self._phone_notif_idx < len(self._phone_notif_buffer):
+                    remaining = len(self._phone_notif_buffer) - self._phone_notif_idx
+                    n_take = min(frames, remaining)
+                    factor = float(self._phone_ring_volume_factor)
+                    mixed[:n_take] += self._phone_notif_buffer[
+                        self._phone_notif_idx:self._phone_notif_idx + n_take
+                    ] * factor
+                    self._phone_notif_idx += n_take
+                    if self._phone_notif_idx >= len(self._phone_notif_buffer):
+                        self._phone_notif_buffer = None
+                        self._phone_notif_idx = 0
+            # Log audio RX detaille (no-op si toggle desactive). On collecte
+            # le state APRES tous les pops et tous les ajouts (sonnerie,
+            # beep, etc.), juste avant le soft clip tanh, pour avoir le
+            # mix_peak_pre_tanh "vrai". On mesure aussi le peak APRES tanh.
+            # Branchement conditionnel : on evite tout calcul si le log
+            # n'est pas actif (callback temps-reel a 50 Hz).
+            _log_active = (_audio_rx_logger is not None
+                           and _audio_rx_logger.is_enabled())
+            if _log_active:
+                _peak_pre = float(np.max(np.abs(mixed))) if frames > 0 else 0.0
             # Soft clip sur le mix final via tanh : transparent jusqu'a ~0.9,
             # saturation douce au-dela. Evite les distorsions en dents de scie
             # du hard clip quand plusieurs joueurs parlent fort en meme temps
@@ -1107,6 +1753,74 @@ class AudioIO:
             # de clip dur ensuite.
             np.tanh(mixed, out=mixed)
             outdata[:, 0] = mixed
+            # Suite du log_out apres ecriture outdata : peak post-tanh,
+            # senders_state (snapshot des queues APRES pops), flags.
+            if _log_active:
+                _peak_post = float(np.max(np.abs(mixed))) if frames > 0 else 0.0
+                _now_cb = time.monotonic()
+                _cb_period_ms = ((_now_cb - self._last_callback_ts) * 1000.0
+                                 if self._last_callback_ts > 0 else -1.0)
+                self._last_callback_ts = _now_cb
+                # Snapshot etat des queues APRES les pops effectues dans le
+                # callback. On parcourt _remote_buffers et on lit qsize.
+                # Detection underrun : approximation via _last_remote_frame_ts
+                # (sender ayant recu une trame il y a < _UNDERRUN_GAP_S
+                # secondes ET dont la queue est vide = under=True).
+                _senders_state = {}
+                try:
+                    with self._lock:
+                        for _sname, _sbuf in self._remote_buffers.items():
+                            _svol = self._remote_volumes.get(_sname, 1.0)
+                            _smult = self._remote_multipliers.get(_sname, 1.0)
+                            _sfinal = _svol * _smult
+                            _sqsz = _sbuf.qsize()
+                            _slast = self._last_remote_frame_ts.get(_sname, 0.0)
+                            _sunder = (
+                                _sfinal > 0.001
+                                and _sqsz == 0
+                                and _slast > 0
+                                and (_now_cb - _slast) <= _UNDERRUN_GAP_S
+                            )
+                            _senders_state[_sname] = {
+                                "q": _sqsz,
+                                "vol": round(_sfinal, 3),
+                                "under": bool(_sunder),
+                                "jb": self._jb_state.get(_sname, "?"),
+                                "streak": self._jb_zero_streak.get(_sname, 0),
+                                "plc": self._plc_applied_total.get(_sname, 0),
+                            }
+                except Exception:
+                    _senders_state = {}
+                # Cumuls truncations / silence implicite (somme sur tous les
+                # senders, pas par-sender pour rester compact dans le CSV).
+                try:
+                    _trunc_total = sum(
+                        self._output_truncations_by_sender.values()
+                    )
+                    _silence_total = sum(
+                        self._output_silence_implicite_by_sender.values()
+                    )
+                except Exception:
+                    _trunc_total = 0
+                    _silence_total = 0
+                _flags = {
+                    "cave_echo": bool(self._cave_echo_active),
+                    "beep": self._beep_buffer is not None,
+                    "soundboard": self._soundboard_buffer is not None,
+                    "sonnerie": self._phone_ring_buffer is not None,
+                }
+                try:
+                    _audio_rx_logger.log_out(
+                        callback_period_ms=_cb_period_ms,
+                        senders_state=_senders_state,
+                        mix_peak_pre_tanh=_peak_pre,
+                        mix_peak_post_tanh=_peak_post,
+                        trunc_total=_trunc_total,
+                        silence_impl_total=_silence_total,
+                        flags=_flags,
+                    )
+                except Exception:
+                    pass
         except Exception as e:
             print(f"[AUDIO] Erreur lecture : {e}")
             outdata.fill(0)
@@ -1146,7 +1860,7 @@ class AudioIO:
     # -----------------------------------------
 
     def feed_remote_frame(self, sender_name: str, frame_bytes: bytes,
-                          is_radio: bool = False):
+                          is_radio: bool = False, is_phone: bool = False):
         """
         Alimente le buffer de lecture avec une trame audio recue via WebSocket.
         frame_bytes : raw PCM float32 mono, longueur = BLOCK_SIZE * 4
@@ -1155,25 +1869,70 @@ class AudioIO:
                       proximite (voir _on_output_stream), pas par-trame :
                       les trames radio sont dans un mix separe et echappent
                       a l'echo, conformement a la regle "pas d'echo radio".
+        is_phone    : True si c'est de la voix telephone CircusPhone (D3).
+                      Routee vers mix_phone : ni filtre radio, ni echo
+                      grotte, ni attenuation de distance. is_phone est
+                      prioritaire sur is_radio (les deux ne sont jamais
+                      vrais en meme temps en pratique, mais par securite
+                      le mix traite is_phone en premier).
         """
         try:
             frame = np.frombuffer(frame_bytes, dtype=np.float32)
             if len(frame) == 0:
                 return
 
+            # Variables pour log audio RX detaille (si actif). Calculees au
+            # fil du flow normal, consommees dans l'appel log_rx en fin de
+            # methode. Cout negligeable meme si log inactif (juste qsize()
+            # et un get sur dict).
+            _rx_outcome = "OK"
+
             with self._lock:
                 if sender_name not in self._remote_buffers:
                     self._remote_buffers[sender_name] = queue.Queue(maxsize=MAX_QUEUE_LEN)
                     # Volume par defaut 0 : pas audible tant qu'on ne le configure pas
                     self._remote_volumes[sender_name] = 0.0
+                    # Nouveau sender : on demarre en mode warmup pour
+                    # laisser la queue se remplir avant de jouer (anti-crackling).
+                    self._jb_state[sender_name] = "waiting"
                 q = self._remote_buffers[sender_name]
-                # Memoriser is_radio de la derniere trame (utilise au mix)
+                # Memoriser is_radio / is_phone de la derniere trame
+                # (utilises au mix dans _on_output_block).
                 self._remote_is_radio[sender_name] = is_radio
+                self._remote_is_phone[sender_name] = is_phone
+
+            # Snapshot taille queue AVANT push (utile pour log_rx). On le
+            # capture hors lock : qsize() est une operation atomique sur
+            # queue.Queue et reste indicative.
+            _rx_q_before = q.qsize()
 
             # Anti-drift : si la file est pleine, on jette le plus ancien
+            # NOTE 25/05/2026 : ce drop etait silencieux jusqu'a present, ce
+            # qui empechait de detecter une cause potentielle de crackling
+            # cote reception. Maintenant on incremente un compteur (lu par
+            # get_audio_stats_snapshot toutes les 30s) et on logge le premier
+            # drop par sender + un par 30s (anti-spam) avec [AUDIO DROP RX].
             if q.full():
                 try:
                     q.get_nowait()
+                    # Compteur cumulatif par sender.
+                    self._frames_dropped_by_sender[sender_name] = (
+                        self._frames_dropped_by_sender.get(sender_name, 0) + 1
+                    )
+                    _rx_outcome = "DROP_QUEUE_FULL"
+                    # Niveau B : log throttle 30s.
+                    now_log = time.monotonic()
+                    last_logged = self._first_drop_logged_by_sender.get(
+                        sender_name, 0.0
+                    )
+                    if (now_log - last_logged) >= 30.0:
+                        _ns_log(
+                            f"[AUDIO DROP RX] queue pleine pour {sender_name!r} "
+                            f"(total drops: "
+                            f"{self._frames_dropped_by_sender[sender_name]}, "
+                            f"maxsize={MAX_QUEUE_LEN})"
+                        )
+                        self._first_drop_logged_by_sender[sender_name] = now_log
                 except queue.Empty:
                     pass
             try:
@@ -1181,7 +1940,45 @@ class AudioIO:
             except queue.Full:
                 pass
 
+            # Snapshot taille queue APRES push.
+            _rx_q_after = q.qsize()
+
             self._frames_received += 1
+            # Fix underrun 25/05/2026 : memoriser le timestamp de la derniere
+            # trame recue pour ce sender. _on_output_block s'en sert pour
+            # distinguer un VRAI underrun (queue vide alors qu'on vient de
+            # recevoir = jitter reel) d'un faux underrun (sender silencieux
+            # depuis > 100ms = comportement normal du noise gate emetteur).
+            # NB : on calcule delta_ms (depuis trame precedente du meme
+            # sender) AVANT d'ecraser _last_remote_frame_ts, pour log_rx.
+            _now_mono = time.monotonic()
+            _prev_ts = self._last_remote_frame_ts.get(sender_name, 0.0)
+            _rx_delta_ms = ((_now_mono - _prev_ts) * 1000.0
+                            if _prev_ts > 0 else -1.0)
+            self._last_remote_frame_ts[sender_name] = _now_mono
+
+            # Log audio RX detaille (no-op si toggle desactive).
+            if _audio_rx_logger is not None:
+                # Reconstruction du flag depuis is_radio/is_phone. Note :
+                # is_radio melange 0x01 (radio canal) et 0x02 (radio profil),
+                # on ne peut pas les distinguer ici. On utilise 0x01 par
+                # convention pour les 2 cas radio. Si tu veux la distinction,
+                # il faut faire remonter le flag exact depuis core.
+                if is_phone:
+                    _rx_type = 0x03
+                elif is_radio:
+                    _rx_type = 0x01
+                else:
+                    _rx_type = 0x00
+                _audio_rx_logger.log_rx(
+                    sender=sender_name,
+                    msg_type=_rx_type,
+                    size=len(frame_bytes),
+                    delta_ms=_rx_delta_ms,
+                    q_before=_rx_q_before,
+                    q_after=_rx_q_after,
+                    outcome=_rx_outcome,
+                )
         except Exception as e:
             print(f"[AUDIO] Erreur feed : {e}")
 
@@ -1295,6 +2092,220 @@ class AudioIO:
                 self._beep_buffer = self._beep_press
             self._beep_idx = 0
 
+    # -----------------------------------------
+    # Volumes des effets locaux (v0.2 alpha 002/029)
+    # -----------------------------------------
+    # Sliders dans l'UI : "Bip radio", "Son A" (= soundboard), "Son B"
+    # (= sonnerie telephone, futur). Ces facteurs s'appliquent uniquement
+    # cote LECTURE (sortie casque), pas sur ce qu'on envoie aux autres.
+    # Plage acceptee : 0.0 (muet) a 2.0 (200%, double volume).
+
+    def set_radio_beep_volume(self, factor: float):
+        """Multiplicateur applique au bip PTT (slider 'Bip radio')."""
+        with self._lock:
+            self._beep_volume_factor = max(0.0, min(2.0, float(factor)))
+
+    def set_soundboard_volume(self, factor: float):
+        """Multiplicateur applique aux sons du soundboard ('Son A')."""
+        with self._lock:
+            self._soundboard_volume_factor = max(0.0, min(2.0, float(factor)))
+
+    def set_phone_ring_volume(self, factor: float):
+        """Multiplicateur applique a la sonnerie telephone ('Son B'). Pas
+        encore branche cote UI : prevu pour CircusPhone (feature 4 du
+        cycle 0.2)."""
+        with self._lock:
+            self._phone_ring_volume_factor = max(0.0, min(2.0, float(factor)))
+
+    def play_soundboard(self, samples) -> bool:
+        """Joue un buffer audio mono float32 a 48kHz dans le mix local.
+        Entendu UNIQUEMENT par l'utilisateur lui-meme. Pour que les
+        autres joueurs entendent, le client doit aussi emettre un
+        message WebSocket soundboard_play qui declenchera la lecture
+        sur leur cote (chacun joue son propre fichier local).
+
+        v0.2 alpha 034 : la regle "un seul son a la fois" est appliquee
+        ici cote audio_io. Si un son est deja en cours, retourne False
+        sans rien faire (le nouveau son est ignore, l'ancien continue).
+        Retourne True si la lecture a commence.
+
+        Le slider 'Son A' applique son facteur via _on_output_block.
+
+        samples doit etre un np.ndarray float32 mono a 48kHz (= SAMPLE_RATE).
+        Si different, le caller (cote client.py) convertit avant d'appeler."""
+        try:
+            if samples is None:
+                return False
+            buf = np.asarray(samples, dtype=np.float32)
+            # Si c'est un array stereo (n, 2), on prend la moyenne pour
+            # rester mono.
+            if buf.ndim == 2:
+                buf = buf.mean(axis=1).astype(np.float32)
+            elif buf.ndim != 1:
+                return False  # forme inattendue
+            with self._lock:
+                # Verifier si un son est deja en cours. Si oui, on REFUSE
+                # le nouveau (regle "un seul son a la fois" du cycle 0.2).
+                if (self._soundboard_buffer is not None
+                        and self._soundboard_idx < len(self._soundboard_buffer)):
+                    return False
+                self._soundboard_buffer = buf
+                self._soundboard_idx    = 0
+            return True
+        except Exception:
+            return False
+
+    def is_soundboard_playing(self) -> bool:
+        """Retourne True si un son du soundboard est en cours de lecture.
+        Lue par le client (UI) pour griser le bouton du son pendant la
+        lecture, et le re-activer quand la lecture est terminee."""
+        with self._lock:
+            if self._soundboard_buffer is None:
+                return False
+            return self._soundboard_idx < len(self._soundboard_buffer)
+
+    # -----------------------------------------
+    # Sonnerie telephone CircusPhone (Feature 4, D2)
+    # -----------------------------------------
+    # Deux motifs placeholder synthetises (pas de fichier son pour l'instant).
+    # Le motif entier est concu pour boucler proprement : il commence et
+    # finit sur du silence, donc la repetition ne produit pas de clic, et
+    # une coupure nette (stop_phone_ring) tombe le plus souvent sur une
+    # zone de faible amplitude.
+
+    @staticmethod
+    def _synth_phone_ring_pattern() -> "np.ndarray":
+        """Motif sonnerie destinataire SYNTHETIQUE (fallback si sounds/ring.wav
+        absent). Structure type sonnerie classique : deux bouffees de
+        tonalite rapprochees puis une pause, le tout boucle par
+        _on_output_block. Tonalite a deux frequences melangees pour un rendu
+        un peu plus 'telephone' qu'un sinus pur. Amplitude moderee (0.22)."""
+        sr = SAMPLE_RATE
+        amp = 0.22
+        # Une bouffee : 2 frequences melangees, fade in/out anti-clic.
+        burst_ms = 400
+        n_burst = int(sr * burst_ms / 1000.0)
+        t = np.arange(n_burst, dtype=np.float32) / sr
+        burst = (np.sin(2.0 * np.pi * 440.0 * t)
+                 + 0.6 * np.sin(2.0 * np.pi * 480.0 * t)).astype(np.float32)
+        burst *= amp / 1.6
+        n_fade = int(sr * 12 / 1000.0)
+        if n_fade > 0 and 2 * n_fade < n_burst:
+            burst[:n_fade]  *= np.linspace(0.0, 1.0, n_fade, dtype=np.float32)
+            burst[-n_fade:] *= np.linspace(1.0, 0.0, n_fade, dtype=np.float32)
+        # Silences : court entre les 2 bouffees, long apres.
+        gap_short = np.zeros(int(sr * 0.20), dtype=np.float32)
+        gap_long  = np.zeros(int(sr * 1.80), dtype=np.float32)
+        # Motif complet : burst - gap_short - burst - gap_long
+        return np.concatenate([burst, gap_short, burst, gap_long])
+
+    @staticmethod
+    def _synth_phone_dial_pattern() -> "np.ndarray":
+        """Motif bip d'appel cote appelant SYNTHETIQUE (fallback si
+        sounds/dial.wav absent). Une bouffee de tonalite unique repetee
+        avec une pause longue : le 'tuut ... tuut' classique entendu
+        pendant qu'on attend que le correspondant decroche.
+
+        Amplitude 0.159 : alignee sur le RMS actif du ring synth
+        (-19 dBFS) pour que les 3 sons telephone (ring/dial/notif) aient
+        le meme niveau percu sous un slider unique. Avant : 0.20."""
+        sr = SAMPLE_RATE
+        amp = 0.159
+        burst_ms = 500
+        n_burst = int(sr * burst_ms / 1000.0)
+        t = np.arange(n_burst, dtype=np.float32) / sr
+        burst = np.sin(2.0 * np.pi * 420.0 * t).astype(np.float32) * amp
+        n_fade = int(sr * 12 / 1000.0)
+        if n_fade > 0 and 2 * n_fade < n_burst:
+            burst[:n_fade]  *= np.linspace(0.0, 1.0, n_fade, dtype=np.float32)
+            burst[-n_fade:] *= np.linspace(1.0, 0.0, n_fade, dtype=np.float32)
+        gap = np.zeros(int(sr * 2.50), dtype=np.float32)
+        return np.concatenate([burst, gap])
+
+    def play_phone_ring(self, kind: str = "ring"):
+        """Demarre la sonnerie telephone EN BOUCLE.
+          kind = "ring" -> motif sonnerie (destinataire d'un appel entrant)
+          kind = "dial" -> motif bip d'appel (appelant, en attente de reponse)
+        La lecture boucle jusqu'a stop_phone_ring(). Si une sonnerie est
+        deja en cours, elle est remplacee par le nouveau motif (reset a 0).
+        Entendu UNIQUEMENT par l'utilisateur local (jamais transmis)."""
+        with self._lock:
+            if kind == "dial":
+                self._phone_ring_buffer = self._phone_ring_pattern_dial
+            else:
+                self._phone_ring_buffer = self._phone_ring_pattern_ring
+            self._phone_ring_idx = 0
+
+    def stop_phone_ring(self):
+        """Coupe la sonnerie telephone immediatement (coupure nette, pas
+        de fade-out). Idempotent : appeler quand rien ne sonne ne fait
+        rien. Appele sur chaque transition d'appel (decroche, refus,
+        timeout, raccrochage, deconnexion)."""
+        with self._lock:
+            self._phone_ring_buffer = None
+            self._phone_ring_idx = 0
+
+    def is_phone_ringing(self) -> bool:
+        """Retourne True si la sonnerie telephone est en cours de lecture."""
+        with self._lock:
+            return self._phone_ring_buffer is not None
+
+    @staticmethod
+    def _synth_phone_notif_pattern() -> "np.ndarray":
+        """Motif notification de message texte SYNTHETIQUE (fallback si
+        sounds/notif.wav absent). Deux bips courts ascendants type
+        'ding-dong', conçus pour etre clairement audibles sans etre
+        agressifs. Comme tous les motifs phone, commence et finit a 0.0
+        (anti-clic).
+
+        Amplitude 0.162 : alignee sur le RMS actif du ring synth
+        (-19 dBFS) pour que les 3 sons telephone (ring/dial/notif) aient
+        le meme niveau percu sous un slider unique. Avant : 0.22."""
+        sr = SAMPLE_RATE
+        amp = 0.162
+
+        def burst(freq_hz: float, ms: int) -> "np.ndarray":
+            n = int(sr * ms / 1000.0)
+            t = np.arange(n, dtype=np.float32) / sr
+            b = np.sin(2.0 * np.pi * freq_hz * t).astype(np.float32) * amp
+            n_fade = int(sr * 10 / 1000.0)
+            if n_fade > 0 and 2 * n_fade < n:
+                b[:n_fade]  *= np.linspace(0.0, 1.0, n_fade, dtype=np.float32)
+                b[-n_fade:] *= np.linspace(1.0, 0.0, n_fade, dtype=np.float32)
+            return b
+
+        # Deux bips : un grave (440Hz) puis un aigu (660Hz). Pause courte
+        # entre les 2 + silence final pour donner le motif "ding-dong".
+        b1 = burst(440.0, 180)
+        b2 = burst(660.0, 220)
+        gap_short = np.zeros(int(sr * 0.06), dtype=np.float32)
+        gap_end   = np.zeros(int(sr * 0.50), dtype=np.float32)
+        return np.concatenate([b1, gap_short, b2, gap_end])
+
+    def play_phone_notif(self):
+        """Joue le son de notification d'un message recu (one-shot ~1s).
+        Si une notif est deja en train de jouer, elle est remplacee (reset
+        a 0). Le volume est pilote par _phone_ring_volume_factor (meme
+        slider que la sonnerie - cf spec)."""
+        with self._lock:
+            self._phone_notif_buffer = self._phone_notif_pattern
+            self._phone_notif_idx = 0
+
+    # ─────────────────────────────────────────────
+    # Mute micro depuis l'overlay phone (D4 etape 2)
+    # ─────────────────────────────────────────────
+    def set_capture_muted(self, muted: bool):
+        """Active/desactive le mute micro depuis l'overlay phone (bouton
+        mute de l'ecran 'En appel'). Quand muted=True, la capture continue
+        de tourner (pour pouvoir reprendre instantanement) mais aucune
+        trame n'est emise sur le reseau : le micro est silencieux pour
+        les autres joueurs. La spec impose la coupure NETTE (pas de fade)."""
+        self._capture_muted = bool(muted)
+
+    def is_capture_muted(self) -> bool:
+        """Retourne True si le micro est actuellement coupe par l'overlay."""
+        return self._capture_muted
+
     def set_gate_hold_ms(self, hold_ms: int):
         """Duree en ms pendant laquelle le gate reste ouvert apres silence."""
         self._gate_hold_ms = max(0, int(hold_ms))
@@ -1314,6 +2325,7 @@ class AudioIO:
             self._remote_volumes.pop(name, None)
             self._remote_multipliers.pop(name, None)
             self._remote_is_radio.pop(name, None)
+            self._remote_is_phone.pop(name, None)
             self._remote_force_radio.pop(name, None)
         # Nettoyer l'etat filtre radio (garde le module leger)
         reset_radio_filter(name)
@@ -1364,3 +2376,4 @@ class AudioIO:
             self._remote_volumes.clear()
             self._remote_multipliers.clear()
             self._remote_is_radio.clear()
+            self._remote_is_phone.clear()

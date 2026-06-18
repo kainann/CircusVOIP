@@ -61,6 +61,53 @@ Fonctions :
         toute initialisation. Defaut : ./cache/easyocr.
 
 
+API publique etendue (pour forks / packages externes)
+=====================================================
+
+Ces fonctions/aliases sont exposees pour les consommateurs qui ont besoin
+d'aller plus loin que le pipeline encapsule par SCOCRReader/read_coords
+(typiquement : un package qui wrappe ce module pour offrir un service OCR
+multi-clients, comme circus_ocr de firesstones).
+
+Pipeline OCR direct (capture + EasyOCR sans parsing metier) :
+    ocr_texts_from_region(region) -> dict
+        Capture + preprocessing image (gamma/denoise/resize x4) + OCR
+        EasyOCR (avec fallback Tesseract). Retourne le texte brut, pas
+        de parsing metier de coordonnees. Le consommateur applique
+        ensuite ses propres normalisations.
+
+Initialisation et acces moteur OCR :
+    ensure_imaging()         Charge mss/cv2/numpy en imports lazy.
+    get_easy_ocr()           Recupere/initialise l'instance EasyOCR.
+    easy_ocr_image(img_bgr)  Lance EasyOCR sur une image deja capturee.
+    capture_region(region)   Capture mss d'une region (deja publique).
+    capture_with_backoff(region)  Capture avec retry sur erreur mss.
+    set_force_cpu(flag)      Force EasyOCR en mode CPU avant init.
+    get_minus_was_restored() Indique si la derniere lecture OCR a beneficie
+                             de la restauration visuelle des tirets.
+
+Helpers de filtrage / validation / parsing (consommes par circusvoip_core
+et par les forks externes pour reutiliser la logique metier sans
+reimplementer le parsing) :
+    parse_coords(text)           Parse interne complet (regex multi-passes,
+                                 correction tirets, restauration noms). Plus
+                                 puissant que parse_ocr_text pour les forks.
+    normalize_numbers(text)      Normalise un texte OCR : corrige les
+                                 confusions de chiffres (0/O, 1/l, etc.)
+                                 avant parsing.
+    apply_sign_memory(pos)       Corrige le signe (memoire signe par axe).
+    is_sign_flip(pos_a, pos_b)   Detecte un flip de signe suspect entre
+                                 deux lectures consecutives.
+    are_containers_similar(a, b) Compare deux ids/noms de zones SC en
+                                 tolerant les fautes OCR (3 vs 8, etc.).
+    is_cave_container(cid, name) True si la zone est un container "cave".
+
+Note : ces noms sont des alias des fonctions internes prefixees par _ qui
+existent depuis l'origine. Le code historique du module continue d'utiliser
+les noms prives ; les noms publics sont disponibles pour les forks et le
+nouveau code, et garantissent un contrat stable.
+
+
 Format de la position retournee
 ================================
 
@@ -445,7 +492,6 @@ _KNOWN_ZONES_SHIPS = [
     "aegis_redeemer",
     "aegis_retaliator",
     "aegis_vanguard",
-    "anvil_carrack",
     "anvil_hornet",
     "anvil_terrapin",
     "anvil_valkyrie",
@@ -604,13 +650,13 @@ _KNOWN_ZONES_INTERIORS = [
     "levski_v2_middeck",
     "levski_v2_topdeck",
     "levski_v2_lowerdeck",
+    "levski_v2_refindeck",        # refinery deck
     "levski_v2_bottomdeck",       # deck du bas - ajoute 14/05/2026 : sans
                                   # cette entree le fuzzy matcher ne pouvait
                                   # canonicaliser aucune variante OCR
                                   # ("bottondeck", "vz", "tevski"...), d'ou des
                                   # container_id incoherents entre clients et
                                   # des joueurs "hors de portee" a tort.
-    "levski_v2_refindeck",        # refinery deck
     # Hangars Levski Nyx (tailles : small/medium/large/xl - top/front)
     "hangar_xltop_levski_nyx",
     "hangar_xlfront_levski_nyx",
@@ -649,6 +695,40 @@ _KNOWN_ZONES_INTERIORS = [
     "hangar_mediumfront_rest_nyx",
     "hangar_smalltop_rest_nyx",
     "hangar_smallfront_rest_nyx",
+    # GrimHex (Green Imperial Housing Exchange, asteroide Yela).
+    # SC affiche "Hangar_MediumFront_GrimHEX_<cid>" (avec "HEX" en majuscules)
+    # mais la canonicalisation passe tout en lowercase donc le suffixe stocke
+    # est "_grimhex". Ajoute 23/05/2026 suite a observation Kainan :
+    # sans ces entrees, l'OCR mappait "hangar_mediumfront_grimhex" sur
+    # "hangar_mediumfront_rest_nyx" (Levski) par fuzzy match, ce qui creait
+    # une fausse proximite inter-stations entre Yela et Nyx.
+    "hangar_xltop_grimhex",
+    "hangar_xlfront_grimhex",
+    "hangar_largetop_grimhex",
+    "hangar_largefront_grimhex",
+    "hangar_mediumtop_grimhex",
+    "hangar_mediumfront_grimhex",
+    "hangar_smalltop_grimhex",
+    "hangar_smallfront_grimhex",
+    # DistributionCenter (Stanton) - nouvelle famille observee 04/06/2026.
+    # SC affiche "Hangar_<Taille><Position>_DistributionCenter_<cid>" dans
+    # le HUD (ex : "Hangar_LargeTop_DistributionCenter_420059395203").
+    # Sans ces entrees, l'OCR de chaque joueur peut donner une variante
+    # legerement differente (espaces vs underscores selon le rendu visuel)
+    # -> container_id divergent entre clients -> joueurs "hors de portee"
+    # a tort dans le meme hangar physique. Observe sur Skywat vs Kainan/Hugo :
+    # Skywat lisait "HangarLargeTop" (HUD brut) et Kainan/Hugo lisaient
+    # "Hangar LargeTop" -> 2 zones differentes cote serveur.
+    # 8 tailles ajoutees par anticipation (cf. convention reststop/grimhex).
+    # Si la famille existe aussi a Pyro, on ajoutera "_pyro" plus tard.
+    "hangar_xltop_distributioncenter",
+    "hangar_xlfront_distributioncenter",
+    "hangar_largetop_distributioncenter",
+    "hangar_largefront_distributioncenter",
+    "hangar_mediumtop_distributioncenter",
+    "hangar_mediumfront_distributioncenter",
+    "hangar_smalltop_distributioncenter",
+    "hangar_smallfront_distributioncenter",
     "reststop_cargo_occu_0001",    # cargo habitat reststop (plusieurs instances)
     "reststop_cargo_occu_0002",
     "reststop_cargo_occu_0003",
@@ -667,11 +747,32 @@ _KNOWN_ZONES_INTERIORS = [
     "transitcarriage_lorville_tram",   # tram Lorville (gare centrale)
     "transitcarriage_ugfacilitylta",  # ascenseur UGF (underground facility)
     "transitcarriage_reststop_small",  # tram intra-reststop (Pyro R&R notamment)
+    "transitcarriage_newbabbage_hospital",  # ascenseur hopital New Babbage (microTech)
     # Shuttle A18 (Area18, ArcCorp)
     "transitcarriage_a18_shuttle_a",
     "transitcarriage_a18_shuttle_b",
     "transitcarriage_a18_shuttle_c",
     "transitcarriage_a18_shuttle_d",
+    # Ascenseurs intra-vaisseaux (assets propres au vaisseau, distincts du
+    # container_id du vaisseau lui-meme). Observe 04/06/2026 sur le Carrack
+    # Anvil : un joueur dans l'ascenseur intra-Carrack a un cid different
+    # du Carrack lui-meme (-> "TransitCarriage ANVL Carrack Elevator <cid>"
+    # dans le HUD SC). Sans cette entree, le fuzzy match pouvait le mapper
+    # par erreur sur un autre transitcarriage_*.
+    # Si d'autres vaisseaux ont un ascenseur intra (Reclaimer, 890 Jump,
+    # Hammerhead...), ajouter sous la meme convention en les observant.
+    "transitcarriage_anvl_carrack_elevator",
+    # TransportCarriage GrimHex - ascenseurs principaux observes 23/05/2026
+    # ATTENTION : SC utilise DEUX nomenclatures distinctes :
+    #   - "TransitCarriage_*"   : trams/ascenseurs Levski, A18, Lorville, UGF, reststops
+    #   - "TransportCarriage_*" : ascenseurs GrimHex (au moins) - autre type d'asset
+    # Les deux coexistent dans le jeu (info confirmee par Kainan). Ne PAS
+    # mapper l'un sur l'autre. Forme observee : "TransportCarriage_Stanton_GrimHex_Elevator_<nom>_<cid>".
+    # Sans ces entrees, le fuzzy matcher canonicalisait correctement le nom complet
+    # (vu que c'est exact, juste lowercase) mais aucun rattrapage des variantes
+    # OCR pourries n'etait possible.
+    "transportcarriage_stanton_grimhex_elevator_default",
+    "transportcarriage_stanton_grimhex_elevator_mainconcourse",
     # Seraphim Station - entrees Crusader LEO (Low Earth Orbit)
     # Le "1" final est un CHIFFRE (leo1, leo2...), pas une lettre L
     "rs_entry_cru-leo1",
@@ -690,15 +791,6 @@ _KNOWN_ZONES_INTERIORS = [
     "tsg_gascloud_002",
     "tsg_gascloud_003",
     "tsg_gascloud_004",
-    # Encounters Pyro - harvestable object containers (rencontres aleatoires
-    # dans l'espace Pyro, type epaves/conteneurs). Le suffixe "_001" est un
-    # numero d'instance ; SC peut spawner _002, _003 etc. Ajoute 15/05/2026
-    # apres observation logs Kainan : 11 variantes OCR de ce nom long sur
-    # 32 lectures, "cid_similar" ne rattrapait qu'1 fois sur 32 faute
-    # d'ancre canonique dans _KNOWN_ZONES. Memes consequences potentielles
-    # que pour levski_v2_bottomdeck (joueurs "hors de portee" a tort si
-    # leurs OCR convergent vers des variantes differentes).
-    "locationharvestableobjectcontainer_ab_pyro_int_enctr_001",
     # Stations/outposts sur planetes/lunes
     "keeger_segment_social_001",   # outpost type Keeger
     "keeger_segment_social_002",
@@ -800,7 +892,27 @@ _KNOWN_ZONES_INTERIORS = [
     # le fuzzy fusionne les deux variantes.
     "lorville_l19_int",
     "objectcontainer-lorville_cbd_int",   # Central Business District
-    "objectcontainer-lorville_5p_int",    # Five Points (commerce)
+    # Fix 26/05/2026 Kainan : c'etait "5p_int" (Five Points, hypothese
+    # erronee initiale). Le screenshot du HUD SC affiche bien "sp_int"
+    # (Spaceport interieur). "5p" etait juste une lecture OCR pourrie
+    # de "sp" - on canonicalise sur la VRAIE valeur affichee par SC.
+    "objectcontainer-lorville_sp_int",    # Spaceport interieur
+    # Gates Lorville - 6 portes d'entree/sortie (gate_01 a gate_06).
+    # Observe 26/05/2026 Kainan via screenshots HUD SC. Le HUD utilise
+    # 2 formes orthographiques :
+    #   - "ObjectContainer-gate1_int"   (forme courte, sans zero-pad et
+    #     sans separateur entre "gate" et le numero)
+    #   - "ObjectContainer-gate_01_int" (forme longue avec underscore)
+    # On ajoute uniquement la forme courte "gate1" pour gate 1 (la seule
+    # observee en variante courte) et la forme longue pour 01-06. Le
+    # fuzzy matcher convergera les 2 quand l'OCR bave (distance 1-2).
+    "objectcontainer-gate1_int",
+    "objectcontainer-gate_01_int",
+    "objectcontainer-gate_02_int",
+    "objectcontainer-gate_03_int",
+    "objectcontainer-gate_04_int",
+    "objectcontainer-gate_05_int",
+    "objectcontainer-gate_06_int",
     "hangar_smalltop_lorville",
     "hangar_mediumtop_lorville",
     "hangar_largetop_lorville",
@@ -809,11 +921,52 @@ _KNOWN_ZONES_INTERIORS = [
     "newbabbage_shuttle",
     "newbabbage_metro",
     "objectcontainer-newbab_domes_int_001",  # Dome Newbab (interieur)
+    # Orison (Crusader / Stanton 2) - ville flottante.
+    # Zones observees 23/05/2026 Kainan (screen + log debug). Le HUD SC
+    # affiche les noms avec underscores et numerotation des elements
+    # (Util_A, Shuttle_A, etc.). Ne PAS extrapoler vers _B, _C... sans
+    # observation directe : la convention SC n'est pas systematique
+    # (ex: Lorville n'a qu'un tram, Levski a Large/Medium/Small).
+    "hangar_mediumfront_orison",   # screen + log, cid 304252274855
+    "oc_arcade_int_001",            # ObjectContainer arcade (commerce/loisirs)
+    "oc_orison_hospital_int_001",   # ObjectContainer hopital interieur
+    "spaceport_interior",           # interieur du spaceport
+    "spaceport_transit",            # zone de transit spaceport
+    # TransitCarriage Orison - ascenseurs et navettes intra-Orison.
+    # Convention "transitcarriage_orison_<usage>[_<index>]"
+    "transitcarriage_orison_hospital",            # ascenseur vers hopital
+    "transitcarriage_orison_elev_ht_circular",    # ascenseur hightech circular
+    "transitcarriage_orison_util_a",              # ascenseur utilitaire A
+    "transitcarriage_orison_shuttle_a",           # navette shuttle A
+    # "ObjectContainerModifier-NNN" : nouveau type d'asset observe a Orison
+    # (23/05/2026 Kainan). Le screen montre "ObjectContainerModifier-003"
+    # qui est un magasin. Comme pour ObjectContainer-NNN, le numero NNN
+    # identifie un emplacement specifique, pas un index generique.
+    # Ne JAMAIS ajouter d'autres numeros sans observation directe.
+    "objectcontainermodifier-003",
     # Containers generiques de zones de stations
     # SC affiche "ObjectContainer Entry" / "ObjectContainer Commercial"
     # comme zones generiques pour les entrees / zones commerce des stations.
     "objectcontainer_entry",       # zone d'entree de station
     "objectcontainer_commercial",  # zone commerce de station
+    # "ObjectContainer-NNN" : forme numerique observee. ATTENTION : le numero
+    # NNN identifie un LIEU specifique, pas un index generique. Ne JAMAIS
+    # ajouter des numeros non observes :
+    #   - "ObjectContainer-000" = GrimHex (observe 23/05/2026 Kainan)
+    #   - "ObjectContainer-028" = Orison (observe 23/05/2026 Kainan)
+    # Si on ajoute par exemple "001-006" sans preuve, le fuzzy matcher
+    # (distance Levenshtein 1-2 entre les 3 derniers chiffres) va mapper
+    # "ObjectContainer-028" sur "ObjectContainer-000" puisque les deux
+    # canoniques sont dans la liste -> fausse proximite inter-stations
+    # entre GrimHex et Orison.
+    # NOTE : le code expose ces zones avec cid="name:objectcontainer-NNN"
+    # (pas d'ID numerique dans le HUD), donc le canonical EST l'identifiant.
+    # L'OCR produit des variantes pourries pour le mot "ObjectContainer"
+    # qui sont rattrapees par _OCR_NAME_FIXES (cf "ObjedtContainer",
+    # "ObjectCortairer", "bjectContainer", etc.). Le suffixe -NNN reste
+    # exact (les chiffres OCR sont fiables sur 3 caracteres).
+    "objectcontainer-000",
+    "objectcontainer-028",
     # Pyro - containers generiques de batiments
     # ATTENTION : SC expose le MEME nom+ID pour plusieurs batiments distincts
     # (cf point 6 de la roadmap). On stabilise juste le nom canonique ici,
@@ -831,11 +984,26 @@ _KNOWN_ZONES_INTERIORS = [
     # SC affiche "dealership_rundown_001" (Rundown station, Pyro). Le suffixe
     # numerique distingue les multiples instances du meme dealership.
     "dealership_rundown_001",
-    # Contested zones Pyro - zones PvP a points d'interet (Pyro V Lagrange 2,
-    # etc.). Format observe : "p<num>l<num>_contestedzone".
-    # IMPORTANT : "p5l2" contient bien la lettre "l" (Lagrange), pas le
-    # chiffre "1". L'OCR peut confondre l/1, mais le canonique est avec "l".
+    # Contested zones Pyro - zones PvP a points d'interet.
+    # Format observe : "p<num>l<num>_contestedzone".
+    # IMPORTANT : "p5l2" / "p2l4" contiennent la lettre "l" (Lagrange),
+    # pas le chiffre "1". L'OCR peut confondre l/1, mais le canonique est
+    # avec "l".
+    # ATTENTION CRITIQUE : NE JAMAIS extrapoler vers des combinaisons non
+    # observees. Si "p3l1_contestedzone" n'est pas dans la liste mais que
+    # "p2l4" et "p5l2" y sont, le fuzzy match (distance Levenshtein 2 sur
+    # les chiffres) va mapper "p3l1" sur le plus proche -> fausse proximite
+    # PvP entre deux contested zones distinctes. Bug initial : "p2l4" lu
+    # correctement etait map sur "p5l2" car seul "p5l2" etait dans la liste
+    # (observe 23/05/2026 Kainan, session Checkmate). Ajouter UNIQUEMENT
+    # au fil des observations directes.
     "p5l2_contestedzone",
+    "p2l4_contestedzone",   # Pyro 2 Lagrange 4 (Checkmate Station), observe 23/05/2026 Kainan
+    # Contested zone rewards (loot terminal des contested zones Pyro).
+    # Observe a Checkmate (cid:name expose donc canonical = identifiant).
+    # Comme pour p<N>l<N>, le chiffre final identifie un lieu specifique.
+    # Ne pas extrapoler.
+    "rs_cz_rewards_001",
     # Interieurs de stations Pyro Lagrange (format "rs_int_p<num>l<num>").
     # Comme pour p5l2_contestedzone, le "l" est un L (Lagrange), pas un 1.
     # L'OCR le lit souvent en "p214" (l->1), mais l'equivalence OCR
@@ -846,6 +1014,15 @@ _KNOWN_ZONES_INTERIORS = [
     # Refinery deck Pyro (process raffinage minerai). Variante non-pyro
     # (rs_refinery tout court) non observee a date.
     "rs_refinery_pyro",
+    # Encounters Pyro - harvestable object containers (rencontres aleatoires
+    # dans l'espace Pyro, type epaves/conteneurs). Le suffixe "_001" est un
+    # numero d'instance ; SC peut spawner _002, _003 etc. Ajoute 15/05/2026
+    # apres observation logs Kainan : 11 variantes OCR de ce nom long sur
+    # 32 lectures, "cid_similar" ne rattrapait qu'1 fois sur 32 faute
+    # d'ancre canonique dans _KNOWN_ZONES. Memes consequences potentielles
+    # que pour levski_v2_bottomdeck (joueurs "hors de portee" a tort si
+    # leurs OCR convergent vers des variantes differentes).
+    "locationharvestableobjectcontainer_ab_pyro_int_enctr_001",
 ]
 
 # Liste unifiee (conservee pour compat + utilisee par le fuzzy match)
@@ -1225,6 +1402,121 @@ _OCR_NAME_FIXES = [
     ("HangarSmallTop",  "Hangar SmallTop"),
     ("HangarMediumTop", "Hangar MediumTop"),
     ("HangarBigTop",    "Hangar BigTop"),
+    # ===== Fixes ajoutes 23/05/2026 (session GrimHex Kainan) =====
+    # "De fault" : OCR EasyOCR split visuellement "Default" en "De" + "fault"
+    # sur les TransportCarriage GrimHex. Sans fix, le canonical produit est
+    # "transportcarriage_..._de_fault" au lieu de "..._default", ce qui ne
+    # matche aucune entree connue et casse le rattrapage fuzzy.
+    ("De fault",        "Default"),
+    ("De faut",         "Default"),       # variante observee avec coupure
+    ("DE fault",        "Default"),
+    ("de fault",        "default"),
+    # "Starton" : OCR confond n -> r dans "Stanton" sur certains angles.
+    # Sans fix, "TransportCarriage_Starton_GrimHex_..." est canonicalise
+    # differemment de "TransportCarriage_Stanton_GrimHex_..." -> 2 joueurs
+    # cote a cote dans le meme ascenseur peuvent etre vus comme separes.
+    ("Starton",         "Stanton"),
+    ("starton",         "stanton"),
+    ("STARTON",         "Stanton"),
+    # "bjectContainer" / "bjectcontainer" : OCR perd le O initial sur certains
+    # cadrages (le O est mange par le bord de la zone OCR). Observe sur le
+    # hangar GrimHex (cid 304252101071).
+    # ATTENTION : ces fixes DOIVENT etre prefixes d'un espace pour eviter
+    # de matcher au milieu d'un mot comme "ObjectContainerModifier". Sans
+    # le prefixe espace, "ObjectContainerModifier" matche "bjectContainer"
+    # a l'interieur -> remplacement crash -> "OObjectContainerModifier".
+    (" bjectContainer", " ObjectContainer"),
+    (" bjectcontainer", " objectcontainer"),
+    (" BjectContainer", " ObjectContainer"),
+    # "ObjectContaine" (sans le r final) : OCR coupe le r final dans certains
+    # cadrages. Observe sur le hangar GrimHex.
+    ("ObjectContaine ",  "ObjectContainer "),   # espace evite de matcher "Container" au milieu
+    ("ObjectContaine-",  "ObjectContainer-"),
+    ("Objectcontaine ",  "Objectcontainer "),
+    ("Objectcontaine-",  "Objectcontainer-"),
+    # "ObjedtContainer" : c -> d apres O (OCR confond la cedille du c).
+    ("ObjedtContainer", "ObjectContainer"),
+    ("Objedtcontainer", "Objectcontainer"),
+    # "ObjectCortairer" : confusion lourde n->r et n->r sur "Container".
+    # Tres ponctuel (1 occurrence dans la session, parmi 31 lectures propres).
+    ("ObjectCortairer", "ObjectContainer"),
+    ("Objectcortairer", "Objectcontainer"),
+    # "Grimhe }" / "Grimhe *" / "Grimhe )" : OCR confond x -> caractere
+    # parasite sur GrimHex en bord de zone. Observe a 2 reprises.
+    ("Grimhe }",        "GrimHex"),
+    ("Grimhe *",        "GrimHex"),
+    ("Grimhe )",        "GrimHex"),
+    ("grimhe }",        "grimhex"),
+    ("grimhe *",        "grimhex"),
+    # "Flevator" : F au lieu de E sur Elevator (1 occurrence tres degradee).
+    ("Flevator",        "Elevator"),
+    ("flevator",        "elevator"),
+    # "Mainconcour se" : split visuel "MainConcourse" -> "Mainconcour se"
+    # sur les TransportCarriage GrimHex.
+    ("Mainconcour se",  "MainConcourse"),
+    ("mainconcour se",  "mainconcourse"),
+    ("MainConcour se",  "MainConcourse"),
+    # "TransportCal r Tage" : degradation tres lourde de "TransportCarriage"
+    # (1 occurrence parmi 6 lectures). Pattern specifique pour ne pas casser
+    # d'autres mots commencant par "Transport".
+    ("TransportCal r Tage", "TransportCarriage"),
+    ("Transportcal r tage", "Transportcarriage"),
+    # ===== Fixes ajoutes 23/05/2026 (session Orison Kainan) =====
+    # "Orisom" / "Orisori" / "Orisor" : variantes OCR de "Orison" (n -> m/ri/r).
+    # Observees sur les TransitCarriage Orison et zones internes.
+    # Fixes specifiques car m<->n et i parasites ne sont pas dans _OCR_CHAR_EQUIV
+    # (ajout global trop risque : casserait medium/main/etc.).
+    ("Orisom",          "Orison"),
+    ("orisom",          "orison"),
+    ("Orisori",         "Orison"),
+    ("orisori",         "orison"),
+    ("Orisor ",         "Orison "),     # espace evite de matcher "Orisor" au milieu d'un mot
+    ("Orisor_",         "Orison_"),
+    ("orisor ",         "orison "),
+    ("orisor_",         "orison_"),
+    # "risom" / "risori" : perte du "O" initial sur "Orison".
+    # Le contexte (precede par un mot, suivi de "Elev"/"Hospital"/etc.) limite
+    # le risque de faux positifs.
+    ("e risom",         "e Orison"),    # "TransitCarriage risom Elev" -> "TransitCarriage Orison Elev"
+    ("e risori",        "e Orison"),
+    # "Hlospital" / "nospital" : variantes OCR de "Hospital".
+    ("Hlospital",       "Hospital"),
+    ("hlospital",       "hospital"),
+    (" nospital",       " hospital"),   # espace avant pour eviter matcher au milieu
+    (" Nospital",       " Hospital"),
+    # "Trarisit" : "ri" parasite au lieu de "n" sur "Transit".
+    ("TrarisitCarriage", "TransitCarriage"),
+    ("trarisitcarriage", "transitcarriage"),
+    ("Trarisitcarriage", "Transitcarriage"),
+    # "Stantori" / "Stantor" : variantes OCR de "Stanton" (n -> ri/r).
+    # Vues sur les zones "OOC Stanton 2 Crusader".
+    ("Stantori",        "Stanton"),
+    ("stantori",        "stanton"),
+    ("Stantor ",        "Stanton "),
+    ("stantor ",        "stanton "),
+    # "Spacedort" / "Spacepori" / "Sparepoci" : variantes OCR de "Spaceport"
+    # (Orison spaceport). Le mot apparait dans "Spaceport_interior" et
+    # "Spaceport_transit".
+    ("Spacedort",       "Spaceport"),
+    ("spacedort",       "spaceport"),
+    ("Spacepori",       "Spaceport"),
+    ("spacepori",       "spaceport"),
+    ("Sparepoci",       "Spaceport"),
+    ("sparepoci",       "spaceport"),
+    # "Crhs sader" / "Crusader 3l GrOCo" : degradations lourdes ponctuelles
+    # de "Crusader" sur "OOC_Stanton_2_Crusader". Le contexte (precede par
+    # "2") limite le risque.
+    ("2 Crhs sader",    "2 Crusader"),
+    ("2 crhs sader",    "2 crusader"),
+    # "arcadle" / "arcarle" / "argade" : variantes OCR de "arcade"
+    # (OC_arcade_int_001 a Orison). Le mot "arcade" est specifique a Orison
+    # dans le HUD SC, donc fix global est safe.
+    ("arcadle",         "arcade"),
+    ("Arcadle",         "Arcade"),
+    ("arcarle",         "arcade"),
+    ("Arcarle",         "Arcade"),
+    ("argade",          "arcade"),
+    ("Argade",          "Arcade"),
 ]
 
 def _pretty_container_name(raw_name: str) -> str:
@@ -3081,6 +3373,27 @@ def _ensure_imaging():
         import mss as _m
         _mss = _m
 
+
+# v0.2 (optim perf) : cache MSS thread-local.
+# Avant : `with _mss.mss() as sct:` etait dans capture_region(), recree a
+# chaque appel (-> 10-20 fois/s en jeu). Recreer le contexte GDI Windows
+# coute ~5-10ms a chaque fois.
+# Maintenant : un instance MSS par thread (mss n'est pas thread-safe :
+# .grab() partage un buffer interne, donc instance par thread). On utilise
+# threading.local() qui isole automatiquement les attributs par thread.
+import threading as _threading_mss
+_mss_tls = _threading_mss.local()
+
+def _get_mss_instance():
+    """Retourne un instance mss.mss() unique pour le thread appelant.
+    Cree au 1er appel par thread, reutilise ensuite. Reste vivant jusqu'a
+    la fin du thread (mss.mss() libere ses ressources GDI au gc)."""
+    sct = getattr(_mss_tls, "sct", None)
+    if sct is None:
+        sct = _mss.mss()
+        _mss_tls.sct = sct
+    return sct
+
 # _dbg_save : sauvegarde des images du pipeline OCR pour diagnostic.
 # Reste en no-op tant que enable_debug_screens() n'est pas appele
 # (typiquement par le client via --debug-ocr en ligne de commande).
@@ -3239,10 +3552,12 @@ def capture_region(region):
             except Exception:
                 pass
     try:
-        with _mss.mss() as sct:
-            raw = sct.grab(region)
-            img = _np.frombuffer(raw.bgra, dtype=_np.uint8).reshape(raw.height, raw.width, 4)
-            return _cv2.cvtColor(img, _cv2.COLOR_BGRA2BGR)
+        # v0.2 (optim perf) : MSS reutilise via thread-local cache au lieu
+        # d'etre recree a chaque appel. Voir _get_mss_instance() plus haut.
+        sct = _get_mss_instance()
+        raw = sct.grab(region)
+        img = _np.frombuffer(raw.bgra, dtype=_np.uint8).reshape(raw.height, raw.width, 4)
+        return _cv2.cvtColor(img, _cv2.COLOR_BGRA2BGR)
     finally:
         # Hook post-capture : reactiver le masque, MEME si grab a leve.
         # Le finally garantit qu'on ne laisse jamais le masque cache si
@@ -4136,6 +4451,113 @@ _ZONE_MAP = {
 # On exclut les noms contenant uniquement des chiffres (ship IDs)
 # et le mot "Root"
 
+
+def ocr_texts_from_region(region):
+    """Capture une region et retourne le texte OCR brut.
+
+    Ce chemin garde le preprocessing image historique de Circus VOIP
+    (gamma, denoise, resize x4, restauration visuelle des tirets), mais ne
+    lance aucun parsing metier de coordonnees. Les clients VOIP/Racing font
+    ensuite leurs propres normalisations et filtres.
+    """
+    _ensure_imaging()
+    img = capture_region(region)
+    h, w = img.shape[:2]
+    gamma_val = float((region or {}).get("gamma", 0.5))
+
+    def _apply_gamma(arr, g):
+        inv = 1.0 / g
+        lut = _np.array([((i / 255.0) ** inv) * 255
+                        for i in range(256)], dtype=_np.uint8)
+        return _cv2.LUT(arr, lut)
+
+    if gamma_val <= 0.35:
+        img_gamma = _apply_gamma(img, gamma_val)
+        easy_img = _cv2.resize(
+            img_gamma, (w * 4, h * 4),
+            interpolation=_cv2.INTER_CUBIC
+        )
+        gray = _cv2.cvtColor(img_gamma, _cv2.COLOR_BGR2GRAY)
+        _, otsu = _cv2.threshold(
+            gray, 0, 255, _cv2.THRESH_BINARY + _cv2.THRESH_OTSU
+        )
+        tess_img = _cv2.resize(
+            otsu, (w * 4, h * 4),
+            interpolation=_cv2.INTER_CUBIC
+        )
+    else:
+        denoised = _cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 21)
+        gray = _cv2.cvtColor(denoised, _cv2.COLOR_BGR2GRAY)
+        big = _cv2.resize(
+            gray, (w * 4, h * 4),
+            interpolation=_cv2.INTER_CUBIC
+        )
+        easy_img = _apply_gamma(big, gamma_val)
+        _, tess_img = _cv2.threshold(
+            easy_img, 0, 255, _cv2.THRESH_BINARY + _cv2.THRESH_OTSU
+        )
+
+    _dbg_save(img, "coords_raw", "image brute capturee")
+    _dbg_save(easy_img, "coords_easy_in", f"EasyOCR input (gamma={gamma_val} x4)")
+    _dbg_save(tess_img, "coords_tess_in", f"Tesseract input (gamma={gamma_val}+Otsu x4)")
+
+    texts = []
+    easy_texts = []
+    easy = _get_easy_ocr()
+    if easy:
+        t0 = _easy_ocr_image(easy_img)
+        _dbg_save(easy_img, "coords_easyocr", t0)
+        if t0.strip():
+            easy_texts.append(t0)
+            texts.append(t0)
+        else:
+            eh, ew = easy_img.shape[:2]
+            n_lines = 2
+            line_h = max(1, eh // n_lines)
+            for i in range(n_lines):
+                y1 = i * line_h
+                y2 = min(eh, y1 + line_h)
+                crop = easy_img[y1:y2, :]
+                if crop.shape[0] >= 5:
+                    t = _easy_ocr_image(crop)
+                    if t.strip():
+                        easy_texts.append(t)
+                        texts.append(t)
+
+    if easy_texts:
+        combined_preview = " | ".join(t.replace("\n", " ") for t in easy_texts)[:300]
+        _logger_dedup(
+            "easyocr_text_raw",
+            f"[EASYOCR RAW] {combined_preview}",
+            value=combined_preview,
+            min_interval=30.0,
+        )
+    else:
+        try:
+            import pytesseract as _pytesseract
+            t = _pytesseract.image_to_string(tess_img, config="--psm 6 --oem 1")
+            if t.strip():
+                texts.append(t)
+        except Exception:
+            pass
+
+    seen = set()
+    unique_texts = []
+    for text in texts:
+        clean = str(text).strip()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        unique_texts.append(clean)
+
+    return {
+        "text": "\n".join(unique_texts),
+        "texts": unique_texts,
+        "pipeline": "ocr_text",
+        "minus_was_restored": bool(globals().get("_minus_was_restored", False)),
+    }
+
+
 def read_coords(region):
     """Capture la zone de l'ecran et lance le pipeline OCR."""
     """Retourne le dict avec zone/x/y/z/etc., ou None."""
@@ -4311,3 +4733,83 @@ class SCOCRReader:
 #
 # Cote application, il faut etre PER_MONITOR_AWARE_V2 pour que mss
 # voie correctement les pixels physiques sur tous les ecrans.
+
+
+# =============================================================================
+# API publique etendue (ajout pour faciliter la consommation par des forks
+# / packages externes type circus_ocr de firesstones).
+#
+# Historique : ce module exposait deja une API publique propre (SCOCRReader,
+# read_coords, parse_ocr_text, distance, list_monitors, auto_ocr_zone,
+# set_logger, set_cache_dir, capture_region, compute_proximity_volume,
+# ocr_texts_from_region). Mais certaines fonctions internes etaient en
+# realite consommees par circusvoip_core.py et par des forks externes -
+# typiquement les correcteurs de signe et les comparateurs de zones. On
+# les exposait via leur nom prive (prefixe _), ce qui rend les forks plus
+# fragiles aux refactos internes.
+#
+# Cette section ajoute des ALIAS publics vers les fonctions privees
+# existantes (zero changement de logique : meme objet, juste un autre nom).
+# Les noms prives restent disponibles pour ne rien casser des appelants
+# existants. Les forks et nouveau code peuvent utiliser les noms publics.
+#
+# Symboles concernes (consommes par engine.py de circus_ocr, par
+# circusvoip_circus_ocr_client.py du fork firesstones, ou par
+# circusvoip_core.py) :
+#   - ensure_imaging         (= _ensure_imaging)
+#   - get_easy_ocr           (= _get_easy_ocr)
+#   - easy_ocr_image         (= _easy_ocr_image)
+#   - apply_sign_memory      (= _apply_sign_memory)
+#   - is_sign_flip           (= _is_sign_flip)
+#   - are_containers_similar (= _are_containers_similar)
+#   - is_cave_container      (= _is_cave_container)
+#   - capture_with_backoff   (= _capture_with_backoff)
+#   - parse_coords           (= _parse_coords)        [parseur prefere]
+#   - normalize_numbers      (= _normalize_numbers)   [normaliseur OCR]
+#   - pretty_container_name  (= _pretty_container_name) [affichage zone]
+#   - set_force_cpu(flag)    (setter pour _ocr_force_cpu_flag)
+#   - get_minus_was_restored()  (getter pour _minus_was_restored)
+# =============================================================================
+
+# Alias publics : memes objets, juste exposes sous des noms sans le prefixe _.
+ensure_imaging         = _ensure_imaging
+get_easy_ocr           = _get_easy_ocr
+easy_ocr_image         = _easy_ocr_image
+apply_sign_memory      = _apply_sign_memory
+is_sign_flip           = _is_sign_flip
+are_containers_similar = _are_containers_similar
+is_cave_container      = _is_cave_container
+capture_with_backoff   = _capture_with_backoff
+parse_coords           = _parse_coords
+normalize_numbers      = _normalize_numbers
+pretty_container_name  = _pretty_container_name
+
+
+def set_force_cpu(flag: bool) -> None:
+    """Force EasyOCR en mode CPU (ou laisse l'auto-detection GPU).
+
+    A appeler AVANT le premier _get_easy_ocr() / ensure_imaging(), car le
+    flag est lu une seule fois lors de l'initialisation paresseuse du
+    reader EasyOCR. Apres init, ce setter n'a plus d'effet.
+
+    Exposition publique propre du flag global _ocr_force_cpu_flag utilise
+    en interne et par SCOCRReader.set_force_cpu().
+    """
+    global _ocr_force_cpu_flag
+    _ocr_force_cpu_flag = bool(flag)
+
+
+def get_minus_was_restored() -> bool:
+    """Indique si la derniere lecture OCR a beneficie de la restauration
+    visuelle des tirets (detection des signes moins par traitement image,
+    appliques quand EasyOCR a "mange" un - en tete de coordonnee).
+
+    Lorsque ce flag est True, le filtre de detection de flip de signe
+    (is_sign_flip) ne doit pas court-circuiter la lecture : le signe a
+    deja ete corrige visuellement avant le parsing. Le flag est reset
+    a chaque nouvelle lecture par read_coords().
+
+    Exposition publique propre de la variable module _minus_was_restored,
+    consommee par engine.py de circus_ocr et par circusvoip_core.
+    """
+    return bool(_minus_was_restored)

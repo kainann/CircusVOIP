@@ -41,6 +41,7 @@ import re
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -238,10 +239,11 @@ _boot_log("apres _bootstrap_dependencies()")
 
 from PySide6.QtCore import (
     Qt, QTimer, QObject, Signal, Slot, QThread, QPoint, QRect,
+    QMetaObject, QPropertyAnimation, QEasingCurve,
 )
 from PySide6.QtGui import (
-    QGuiApplication, QScreen, QCursor, QPainter, QColor, QPen,
-    QFont, QKeyEvent, QMouseEvent, QIcon, QPixmap,
+    QGuiApplication, QScreen, QCursor, QPainter, QPainterPath, QColor, QPen,
+    QFont, QKeyEvent, QMouseEvent, QIcon, QPixmap, QImage, QTextCursor,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -263,9 +265,12 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QDoubleSpinBox,
+    QSpinBox,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -360,6 +365,7 @@ THEME_GREEN     = "#3fb950"
 THEME_ORANGE    = "#d29922"
 THEME_BLUE      = "#58a6ff"
 THEME_RED       = "#f85149"
+THEME_PURPLE    = "#bc8cff"
 
 # Stylesheet global applique a la QMainWindow. Cible les widgets Qt
 # standards (QWidget, QLabel, QLineEdit, QPushButton, QGroupBox,
@@ -576,6 +582,663 @@ _BASE_DIR = Path(__file__).resolve().parent
 CLIENT_CONFIG_FILE = _BASE_DIR / "circusvoip_client_config.json"
 _LEGACY_CLIENT2_CONFIG = _BASE_DIR / "circusvoip_client2_config.json"
 VERSION_FILE = _BASE_DIR / "circusvoip_version.json"
+# CircusPhone (Feature 4, D4) : annuaire local des contacts. Fichier JSON
+# auto-enrichi a chaque session avec les joueurs vus connectes en meme
+# temps que l'utilisateur. Ne purge jamais tout seul (l'utilisateur peut
+# retirer un contact via le bouton "oublier").
+PHONE_ANNUAIRE_FILE = _BASE_DIR / "circusphone_annuaire.json"
+# CircusPhone (D4 etape 3) : conversations privees + brouillons. Stockage
+# local par contact : 10 envoyes + 10 recus (max 20 messages par contact),
+# tronques aux plus recents quand la limite est atteinte. Les brouillons
+# (texte en cours de redaction quand on quitte l'ecran conversation) sont
+# stockes dans le meme fichier pour pouvoir etre repris a l'ouverture
+# suivante de la conversation.
+PHONE_MESSAGES_FILE = _BASE_DIR / "circusphone_messages.json"
+# Limites de la messagerie (cf spec D4).
+PHONE_MAX_BODY_LEN  = 500   # taille max d'un message texte
+# Cap GLOBAL : envoyes + recus fusionnes, trie par ts, on garde les N plus
+# recents toutes categories confondues. Remplace les anciens PHONE_MAX_SENT
+# et PHONE_MAX_RECEIVED (cap a 10 chacun) qui creaient un bug d'historique
+# incoherent : quand un user envoyait beaucoup de messages, ses anciens
+# envoyes etaient tronques mais les recus correspondants restaient, donnant
+# des messages du contact "qui repondent a rien" dans le fil. Fix 23/05/2026
+# Kainan. La structure JSON est conservee (sent[] + received[] separes) pour
+# retrocompat, le cap est applique apres fusion logique via _phone_trim_convo.
+PHONE_MAX_MESSAGES  = 20    # nb total de messages conserves par contact
+# Constantes obsoletes conservees temporairement comme alias (au cas ou du
+# code legacy / scripts de migration les utilise). A retirer apres v0.2.
+PHONE_MAX_SENT      = PHONE_MAX_MESSAGES  # deprecated
+PHONE_MAX_RECEIVED  = PHONE_MAX_MESSAGES  # deprecated
+
+# [D5] Photo de profil locale + cache des pairs. La photo locale est
+# stockee en JPEG compresse (200x200 q80, generalement 15-30 Ko). Un
+# fichier .meta.json suit local_hash, uploaded_hash et updated_at pour
+# detecter une desynchro avec le serveur (changement hors-ligne) et
+# repousser automatiquement a la prochaine reco. Le cache des pairs vit
+# dans un dossier dedie : 1 JPEG par pseudo + un index JSON {pseudo:hash}.
+PHONE_PROFILE_PHOTO_FILE       = _BASE_DIR / "circusvoip_profile_photo.jpg"
+PHONE_PROFILE_PHOTO_META_FILE  = _BASE_DIR / "circusvoip_profile_photo.meta.json"
+# [D5+] Photo source non compressee (PNG pour preserver la qualite). Sert
+# de base aux re-compressions quand l'utilisateur ajuste le zoom +/-
+# sans dégradation cumulative. Le format PNG est volontaire : meme si la
+# source originale est un JPEG, on convertit en PNG sans perte pour
+# pouvoir re-cropper a volonte.
+PHONE_PROFILE_PHOTO_SOURCE_FILE = _BASE_DIR / "circusvoip_profile_photo_source.png"
+PHONE_PROFILE_CACHE_DIR        = _BASE_DIR / "circusvoip_profile_photo_cache"
+PHONE_PROFILE_CACHE_INDEX_FILE = PHONE_PROFILE_CACHE_DIR / "_index.json"
+# Limite stricte cote client (doit etre coherente avec _PROFILE_PHOTO_MAX_BYTES
+# cote serveur). On compresse jusqu'a tenir sous cette limite.
+PHONE_PROFILE_PHOTO_MAX_BYTES  = 200_000
+PHONE_PROFILE_PHOTO_DIM        = 200    # cote max en pixels
+# [D5+] Zoom factor pour le crop carre.
+#   1.0 = prendre tout le carre central possible (cadrage le plus large
+#         qui rentre dans l'image, limite par min(w, h)).
+#   0.40 = ne prendre que les 40% centraux (zoom marque, portrait visage).
+#   >1.0 = "dezoomer" au-dela de l'image : on prend un carre virtuel plus
+#          grand que l'image, et les zones manquantes sont remplies avec
+#          des bandes noires (padding). Utile pour les photos paysage ou
+#          portrait pour montrer toute la largeur ou la hauteur dans le
+#          carre, au prix de bandes esthétiquement moyennes.
+# Pas : 0.05 par clic +/-.
+PHONE_PROFILE_ZOOM_MIN         = 0.40
+PHONE_PROFILE_ZOOM_MAX         = 2.00
+PHONE_PROFILE_ZOOM_STEP        = 0.05
+PHONE_PROFILE_ZOOM_DEFAULT     = 1.00    # comme avant par defaut
+
+
+# ─────────────────────────────────────────────
+#  [D5] ProfilePhotoManager : photo locale + cache des pairs
+# ─────────────────────────────────────────────
+#
+# Singleton instancie au demarrage du MainWindow. Centralise :
+#   - La photo de profil locale (compression Pillow, ecriture disque,
+#     hash SHA-256, meta pour suivre la synchro avec le serveur).
+#   - Le cache disque des photos des pairs (1 JPEG par pseudo +
+#     index JSON {pseudo: hash}).
+#   - L'envoi de profile_photo_upload (avec retry a chaque reconnexion).
+#   - L'envoi de profile_photo_request et le traitement de
+#     profile_photo_response (mise a jour du cache + notification UI).
+#
+# Pas thread-safe au sens strict : toutes les operations critiques sont
+# faites dans le thread principal Qt (l'envoi WS est deja relai par
+# _core._ws_send_safe qui est thread-safe). Les operations disque sont
+# courtes (quelques Ko) donc le blocage est negligeable.
+
+class _ProfilePhotoManager:
+    """Gere la photo locale et le cache des pairs (D5)."""
+
+    def __init__(self, owner):
+        # owner : MainWindow, sert pour les signaux Qt et l'acces _core.
+        self._owner = owner
+        # Hash SHA-256 hex de la photo locale actuelle (None si pas de photo).
+        self._local_hash: str | None = None
+        # Hash deja confirme uploade au serveur (None si jamais uploade
+        # ou si on a change la photo en mode offline).
+        self._uploaded_hash: str | None = None
+        # [D5+] Zoom factor courant (1.0 = cadrage large, 0.40 = zoom max).
+        # Persiste dans la meta pour survivre aux redemarrages.
+        self._zoom: float = PHONE_PROFILE_ZOOM_DEFAULT
+        # [D5+] Offset du centre du crop par rapport au centre de l'image
+        # source, en pixels. (0, 0) = centre = comportement par defaut.
+        # Persiste dans la meta. Borne par _recompress_from_source pour
+        # que le crop reste dans l'image (le crop ne peut pas sortir).
+        self._offset_x: int = 0
+        self._offset_y: int = 0
+        # Cache memoire des photos des pairs : {pseudo: (bytes_jpeg, hash)}.
+        # Les bytes restent en RAM pour eviter de relire le disque a chaque
+        # affichage. Quelques Mo max pour des dizaines de pairs.
+        self._peer_cache: dict[str, tuple[bytes, str]] = {}
+        # Hash des photos pairs en cache disque : {pseudo: hash}. Sert au
+        # if-none-match (on demande au serveur "j'ai deja ce hash, change-le
+        # si tu en as un autre").
+        self._peer_hashes: dict[str, str] = {}
+        # Pseudos pour lesquels une request est en cours (anti-double-shot).
+        self._pending_requests: set[str] = set()
+        # Charge les meta locales et l'index pairs.
+        self._load_meta()
+        self._load_peer_index()
+
+    # ─── persistance locale (photo de l'utilisateur) ───────────────
+
+    def _load_meta(self):
+        """Lit circusvoip_profile_photo.meta.json. Si absent ou corrompu,
+        on repart d'un etat 'pas de photo'. Si le fichier JPEG existe mais
+        pas la meta, on recalcule le hash et on considere la photo non
+        encore uploadee (sera repoussee a la prochaine reco)."""
+        meta_path = PHONE_PROFILE_PHOTO_META_FILE
+        photo_path = PHONE_PROFILE_PHOTO_FILE
+        loaded = None
+        if meta_path.exists():
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+            except Exception:
+                loaded = None
+        if isinstance(loaded, dict):
+            lh = loaded.get("local_hash")
+            uh = loaded.get("uploaded_hash")
+            if isinstance(lh, str) and lh:
+                self._local_hash = lh
+            if isinstance(uh, str) and uh:
+                self._uploaded_hash = uh
+            # [D5+] Zoom factor persiste (par defaut si absent ou hors bornes).
+            z = loaded.get("zoom")
+            try:
+                z = float(z)
+                if PHONE_PROFILE_ZOOM_MIN <= z <= PHONE_PROFILE_ZOOM_MAX:
+                    self._zoom = z
+            except (TypeError, ValueError):
+                pass
+            # [D5+] Offsets de crop persistes (int en pixels).
+            ox = loaded.get("offset_x")
+            oy = loaded.get("offset_y")
+            try:
+                if ox is not None:
+                    self._offset_x = int(ox)
+            except (TypeError, ValueError):
+                pass
+            try:
+                if oy is not None:
+                    self._offset_y = int(oy)
+            except (TypeError, ValueError):
+                pass
+        # Si on a une meta mais pas le fichier photo, on reset (incoherent).
+        if self._local_hash and not photo_path.exists():
+            self._local_hash = None
+            self._uploaded_hash = None
+            self._save_meta()
+            return
+        # Si on a un fichier photo mais pas de meta, on recalcule le hash.
+        if photo_path.exists() and not self._local_hash:
+            try:
+                import hashlib
+                with open(photo_path, "rb") as f:
+                    self._local_hash = hashlib.sha256(f.read()).hexdigest()
+                self._uploaded_hash = None
+                self._save_meta()
+            except Exception:
+                pass
+
+    def _save_meta(self):
+        """Ecrit le fichier meta. Best-effort."""
+        try:
+            data = {
+                "local_hash":    self._local_hash,
+                "uploaded_hash": self._uploaded_hash,
+                "zoom":          round(self._zoom, 4),
+                "offset_x":      int(self._offset_x),
+                "offset_y":      int(self._offset_y),
+                "updated_at":    time.time(),
+            }
+            with open(PHONE_PROFILE_PHOTO_META_FILE, "w",
+                      encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+    def has_local_photo(self) -> bool:
+        return self._local_hash is not None and PHONE_PROFILE_PHOTO_FILE.exists()
+
+    def local_photo_path(self):
+        return PHONE_PROFILE_PHOTO_FILE if self.has_local_photo() else None
+
+    def needs_upload(self) -> bool:
+        """True si on a une photo locale qui n'a pas (encore) ete
+        confirmee uploadee au serveur (changement hors-ligne, ou jamais
+        envoyee)."""
+        if not self.has_local_photo():
+            return False
+        return self._local_hash != self._uploaded_hash
+
+    def get_zoom(self) -> float:
+        """Retourne le zoom factor courant (1.0 = large, 0.40 = max)."""
+        return self._zoom
+
+    def has_source(self) -> bool:
+        """True si on a une copie de la source non compressee permettant
+        de re-cropper a volonte sans degradation."""
+        return PHONE_PROFILE_PHOTO_SOURCE_FILE.exists()
+
+    def set_local_photo_from_file(self, src_path: str) -> tuple[bool, str]:
+        """Selection utilisateur : copie la source en PNG (conserve sans
+        perte) puis applique le zoom courant pour produire le JPEG final
+        a 200x200. Retourne (ok, message). Si le zoom courant est invalide
+        (premiere selection), on part du zoom par defaut (1.0)."""
+        try:
+            from PIL import Image
+        except Exception:
+            return False, "Pillow indisponible (pip install Pillow)."
+        try:
+            img = Image.open(src_path)
+            # Conversion RGB pour homogeneiser (l'alpha n'a pas de sens
+            # pour un avatar opaque).
+            img = img.convert("RGB")
+            # Sauvegarde de la source non compressee (PNG, sans perte).
+            # On redimensionne raisonnablement si l'image est trop grosse
+            # (eviter 30-50 Mo de PNG sur le disque pour une photo 4K).
+            # Borne : 2048 px sur le plus grand cote, ce qui laisse une
+            # grosse marge pour zoomer/cadrer fin sans degradation visible
+            # (rendu final = 200x200, donc 2048 -> 200 est largement suffisant).
+            max_src_dim = 2048
+            if max(img.size) > max_src_dim:
+                img.thumbnail((max_src_dim, max_src_dim), Image.LANCZOS)
+            img.save(PHONE_PROFILE_PHOTO_SOURCE_FILE, "PNG", optimize=True)
+        except Exception as e:
+            return False, f"Echec import : {e}"
+        # Applique le zoom courant (ou defaut si pas encore defini).
+        if not (PHONE_PROFILE_ZOOM_MIN <= self._zoom <= PHONE_PROFILE_ZOOM_MAX):
+            self._zoom = PHONE_PROFILE_ZOOM_DEFAULT
+        # Nouvelle photo = on recentre (offset (0, 0)). Sinon un vieux
+        # offset d'une autre image risquerait de mal cadrer.
+        self._offset_x = 0
+        self._offset_y = 0
+        ok, msg = self._recompress_from_source(self._zoom)
+        if not ok:
+            return False, msg
+        # Tentative d'upload immediate (best-effort).
+        self.try_upload_local()
+        return True, "Photo enregistree."
+
+    def adjust_zoom(self, delta: float) -> tuple[bool, str]:
+        """Ajuste le zoom factor de `delta` (positif = zoom +, negatif =
+        zoom -). Borne au range [MIN, MAX]. Recompresse a partir de la
+        source et re-uploade. Retourne (ok, message). No-op si pas de
+        source disponible (besoin de Choisir une photo d'abord)."""
+        if not self.has_source():
+            return False, "Pas de photo source. Choisissez une photo d'abord."
+        new_zoom = max(PHONE_PROFILE_ZOOM_MIN,
+                       min(PHONE_PROFILE_ZOOM_MAX, self._zoom + delta))
+        # Si on est deja a la borne dans la direction demandee, no-op
+        # (pas d'erreur, c'est juste sans effet).
+        if abs(new_zoom - self._zoom) < 1e-6:
+            return True, "Zoom inchange (borne atteinte)."
+        self._zoom = new_zoom
+        ok, msg = self._recompress_from_source(new_zoom)
+        if not ok:
+            return False, msg
+        self.try_upload_local()
+        return True, f"Zoom : {int(new_zoom * 100)}%"
+
+    def get_offset(self) -> tuple[int, int]:
+        """Retourne l'offset courant (dx, dy) en pixels par rapport au
+        centre de l'image source."""
+        return (self._offset_x, self._offset_y)
+
+    def get_offset_step(self) -> int:
+        """Retourne le pas de deplacement conseille pour une fleche
+        directionnelle, en pixels source. Proportionnel a la taille du
+        carre courant (10%) pour que le mouvement reste cohérent visuelle-
+        ment quel que soit le zoom. Minimum 4 pour garantir un mouvement
+        visible meme sur petite source."""
+        if not self.has_source():
+            return 8
+        try:
+            from PIL import Image
+            img = Image.open(PHONE_PROFILE_PHOTO_SOURCE_FILE)
+            w, h = img.size
+        except Exception:
+            return 8
+        base_side = min(w, h)
+        side = int(base_side * self._zoom)
+        step = max(4, int(side * 0.10))
+        return step
+
+    def adjust_offset(self, dx: int, dy: int) -> tuple[bool, str]:
+        """Deplace le centre du crop de (dx, dy) pixels. Bornes
+        appliquees selon le zoom :
+          - zoom <= 1.0 : le crop ne peut pas sortir de l'image
+          - zoom >  1.0 : l'image ne peut pas sortir du carre (sinon
+                          on n'aurait que du noir)
+        Recompresse depuis la source et re-uploade."""
+        if not self.has_source():
+            return False, "Pas de photo source. Choisissez une photo d'abord."
+        new_ox = self._offset_x + int(dx)
+        new_oy = self._offset_y + int(dy)
+        try:
+            from PIL import Image
+            img = Image.open(PHONE_PROFILE_PHOTO_SOURCE_FILE)
+            w, h = img.size
+        except Exception:
+            return False, "Impossible de lire la source."
+        base_side = min(w, h)
+        side = int(base_side * self._zoom)
+        if self._zoom <= 1.0:
+            # Crop dans l'image : limite par les bords de l'image.
+            max_dx = max(0, (w - side) // 2)
+            max_dy = max(0, (h - side) // 2)
+        else:
+            # Carre virtuel plus grand que l'image : limite par le canevas.
+            # On garde toujours au moins 1 pixel d'image visible.
+            max_dx = max(0, side // 2 - 1)
+            max_dy = max(0, side // 2 - 1)
+        new_ox = max(-max_dx, min(max_dx, new_ox))
+        new_oy = max(-max_dy, min(max_dy, new_oy))
+        if new_ox == self._offset_x and new_oy == self._offset_y:
+            return True, "Position inchangee (borne atteinte)."
+        self._offset_x = new_ox
+        self._offset_y = new_oy
+        ok, msg = self._recompress_from_source(self._zoom)
+        if not ok:
+            return False, msg
+        self.try_upload_local()
+        return True, f"Decalage : ({new_ox}, {new_oy})"
+
+    def reset_offset(self) -> tuple[bool, str]:
+        """Recentre l'image (offset 0, 0). Recompresse + ré-uploade.
+        No-op si deja a (0, 0)."""
+        if not self.has_source():
+            return False, "Pas de photo source. Choisissez une photo d'abord."
+        if self._offset_x == 0 and self._offset_y == 0:
+            return True, "Deja centre."
+        self._offset_x = 0
+        self._offset_y = 0
+        ok, msg = self._recompress_from_source(self._zoom)
+        if not ok:
+            return False, msg
+        self.try_upload_local()
+        return True, "Recentre."
+
+    def _recompress_from_source(self, zoom: float) -> tuple[bool, str]:
+        """Relit la source PNG, applique un crop carre de cote
+        max(w,h)*zoom_normalise au centre (+ offset), redimensionne en
+        200x200, compresse en JPEG q80, ecrit le fichier final + meta +
+        reset uploaded_hash. Source-of-truth pour la generation du JPEG
+        final.
+
+        Comportement selon zoom :
+          zoom <= 1.0 : crop carre dans l'image (cote = min(w,h)*zoom).
+          zoom > 1.0  : carre virtuel plus grand que l'image. La zone
+                        qui depasse de l'image est remplie de noir
+                        (padding). Permet de voir toute la largeur d'une
+                        photo paysage par exemple.
+
+        L'offset (self._offset_x, self._offset_y) deplace le centre du
+        carre. Pour zoom <= 1.0, l'offset est clamp pour que le carre
+        reste dans l'image. Pour zoom > 1.0, l'offset est libre (mais
+        plafonne pour eviter de pousser l'image hors du carre)."""
+        if not PHONE_PROFILE_PHOTO_SOURCE_FILE.exists():
+            return False, "Source manquante."
+        try:
+            from PIL import Image
+        except Exception:
+            return False, "Pillow indisponible."
+        try:
+            img = Image.open(PHONE_PROFILE_PHOTO_SOURCE_FILE)
+            img = img.convert("RGB")
+            w, h = img.size
+            # Cote du carre : base = min(w,h) (le plus grand carre qui
+            # rentre), puis multiplie par le zoom.
+            #   zoom = 1.0 -> cote = min(w, h)             [crop normal]
+            #   zoom = 0.5 -> cote = min(w, h) * 0.5       [zoom IN]
+            #   zoom = 1.5 -> cote = min(w, h) * 1.5       [zoom OUT + padding]
+            base_side = min(w, h)
+            side = int(base_side * zoom)
+            if side < 8:
+                side = 8
+
+            if zoom <= 1.0:
+                # ─── Cas normal : crop dans l'image ─────────────────────
+                # Clamp l'offset pour que le rectangle reste dans l'image.
+                max_dx = max(0, (w - side) // 2)
+                max_dy = max(0, (h - side) // 2)
+                ox = max(-max_dx, min(max_dx, self._offset_x))
+                oy = max(-max_dy, min(max_dy, self._offset_y))
+                self._offset_x = ox
+                self._offset_y = oy
+                cx = w // 2 + ox
+                cy = h // 2 + oy
+                left = cx - side // 2
+                top  = cy - side // 2
+                right  = left + side
+                bottom = top + side
+                # Garde-fou defensif.
+                left = max(0, left)
+                top = max(0, top)
+                right = min(w, right)
+                bottom = min(h, bottom)
+                cropped = img.crop((left, top, right, bottom))
+            else:
+                # ─── Cas zoom > 1.0 : carre virtuel + padding noir ─────
+                # On cree un canevas noir de taille side x side et on y
+                # colle l'image source centree (+ offset). Les zones non
+                # couvertes par l'image restent noires.
+                # Clamp l'offset pour empecher l'image de sortir
+                # totalement du carre (sinon on aurait juste du noir) :
+                # on autorise un offset max = (side - w) // 2 + w // 2
+                # pour x, mais la limite pratique est de ne pas pousser
+                # l'image au-dela du bord du canevas.
+                # Plus simple : on clamp pour que l'image soit toujours
+                # au moins partiellement visible. On limite l'offset a
+                # +-(side // 2) - 1 pour ne pas tout noircir.
+                max_dx = max(0, side // 2 - 1)
+                max_dy = max(0, side // 2 - 1)
+                ox = max(-max_dx, min(max_dx, self._offset_x))
+                oy = max(-max_dy, min(max_dy, self._offset_y))
+                self._offset_x = ox
+                self._offset_y = oy
+                # Canevas noir de cote `side`.
+                cropped = Image.new("RGB", (side, side), (0, 0, 0))
+                # Position du coin haut-gauche de l'image dans le canevas :
+                # centre du canevas = (side//2, side//2)
+                # centre voulu de l'image = centre canevas - offset
+                # coin haut-gauche = centre voulu - (w//2, h//2)
+                cx_target = side // 2 - ox
+                cy_target = side // 2 - oy
+                paste_x = cx_target - w // 2
+                paste_y = cy_target - h // 2
+                cropped.paste(img, (paste_x, paste_y))
+
+            cropped.thumbnail(
+                (PHONE_PROFILE_PHOTO_DIM, PHONE_PROFILE_PHOTO_DIM),
+                Image.LANCZOS,
+            )
+            import io
+            quality = 80
+            jpeg_bytes = None
+            for _ in range(5):
+                buf = io.BytesIO()
+                cropped.save(buf, "JPEG", quality=quality, optimize=True)
+                candidate = buf.getvalue()
+                if len(candidate) <= PHONE_PROFILE_PHOTO_MAX_BYTES:
+                    jpeg_bytes = candidate
+                    break
+                quality -= 10
+                if quality < 40:
+                    jpeg_bytes = candidate
+                    break
+            if jpeg_bytes is None or len(jpeg_bytes) > PHONE_PROFILE_PHOTO_MAX_BYTES:
+                return False, (f"Photo trop volumineuse apres compression "
+                               f"({len(jpeg_bytes or b'')} bytes).")
+            with open(PHONE_PROFILE_PHOTO_FILE, "wb") as f:
+                f.write(jpeg_bytes)
+            import hashlib
+            self._local_hash = hashlib.sha256(jpeg_bytes).hexdigest()
+            self._uploaded_hash = None
+            self._save_meta()
+            return True, "OK"
+        except Exception as e:
+            return False, f"Echec recompression : {e}"
+
+    def clear_local_photo(self):
+        """Supprime la photo locale (JPEG + meta + source PNG). Pas de
+        notification serveur : la photo reste sur le serveur tant que
+        l'utilisateur n'en met pas une autre. Comportement volontaire :
+        on n'a pas de message 'profile_photo_delete' cote serveur pour
+        rester simple."""
+        for p in (PHONE_PROFILE_PHOTO_FILE,
+                  PHONE_PROFILE_PHOTO_META_FILE,
+                  PHONE_PROFILE_PHOTO_SOURCE_FILE):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+        self._local_hash = None
+        self._uploaded_hash = None
+        self._zoom = PHONE_PROFILE_ZOOM_DEFAULT
+        self._offset_x = 0
+        self._offset_y = 0
+
+    def try_upload_local(self) -> bool:
+        """Tente d'uploader la photo locale au serveur si necessaire.
+        Retourne True si une tentative a ete faite (succes WS), False
+        si pas de photo ou pas connecte."""
+        if not self.needs_upload():
+            return False
+        if not (_CORE_AVAILABLE and state.connected):
+            return False
+        try:
+            with open(PHONE_PROFILE_PHOTO_FILE, "rb") as f:
+                jpeg_bytes = f.read()
+        except Exception:
+            return False
+        try:
+            import base64
+            data_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+            ok = _core._ws_send_safe({
+                "type": "profile_photo_upload",
+                "data_b64": data_b64,
+                "hash": self._local_hash,
+            })
+            if ok:
+                # On marque comme uploade en optimiste : si le serveur
+                # rejette silencieusement, la prochaine reco re-tentera
+                # (uploaded_hash != local_hash via le meta a la reload).
+                # Mais pour la session courante on evite de spammer.
+                # NB : si on veut etre strict, il faudrait un ack du
+                # serveur, mais on a decide de garder le protocole sobre.
+                self._uploaded_hash = self._local_hash
+                self._save_meta()
+                return True
+        except Exception:
+            pass
+        return False
+
+    # ─── cache des photos des pairs ─────────────────────────────────
+
+    def _load_peer_index(self):
+        """Charge l'index disque des photos pairs. Cree le dossier si
+        absent. Format : {pseudo: hash}."""
+        try:
+            PHONE_PROFILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return
+        if not PHONE_PROFILE_CACHE_INDEX_FILE.exists():
+            return
+        try:
+            with open(PHONE_PROFILE_CACHE_INDEX_FILE, "r",
+                      encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                cleaned = {}
+                for k, v in data.items():
+                    if isinstance(k, str) and isinstance(v, str) and v:
+                        cleaned[k] = v
+                self._peer_hashes = cleaned
+        except Exception:
+            self._peer_hashes = {}
+
+    def _save_peer_index(self):
+        try:
+            with open(PHONE_PROFILE_CACHE_INDEX_FILE, "w",
+                      encoding="utf-8") as f:
+                json.dump(self._peer_hashes, f, indent=2)
+        except Exception:
+            pass
+
+    def _peer_cache_path(self, pseudo: str):
+        # Sanitisation defensive (le pseudo vient du serveur, deja filtre,
+        # mais on couvre les cas exotiques).
+        if (not isinstance(pseudo, str) or not pseudo
+                or "/" in pseudo or "\\" in pseudo or pseudo in (".", "..")):
+            return None
+        return PHONE_PROFILE_CACHE_DIR / f"{pseudo}.jpg"
+
+    def get_peer_photo_bytes(self, pseudo: str) -> bytes | None:
+        """Retourne les bytes JPEG d'un pair s'ils sont en cache. None
+        sinon. Charge depuis le disque si pas encore en cache memoire."""
+        if not pseudo:
+            return None
+        cached = self._peer_cache.get(pseudo)
+        if cached is not None:
+            return cached[0]
+        # Pas en RAM : on tente le disque.
+        path = self._peer_cache_path(pseudo)
+        if path is None or not path.exists():
+            return None
+        try:
+            with open(path, "rb") as f:
+                b = f.read()
+        except Exception:
+            return None
+        h = self._peer_hashes.get(pseudo, "")
+        self._peer_cache[pseudo] = (b, h)
+        return b
+
+    def request_peer_photo(self, pseudo: str):
+        """Demande la photo d'un pair au serveur (avec if-none-match si
+        on a deja un hash en cache). Idempotent : un seul request en vol
+        par pseudo. La reponse arrivera via handle_response()."""
+        if not pseudo:
+            return
+        if pseudo in self._pending_requests:
+            return
+        if not (_CORE_AVAILABLE and state.connected):
+            return
+        my_name = getattr(state, "my_name", "") or ""
+        if pseudo == my_name:
+            # Inutile de demander sa propre photo au serveur, on l'a en
+            # local. Cas a gerer ailleurs (affichage de soi-meme).
+            return
+        try:
+            ok = _core._ws_send_safe({
+                "type": "profile_photo_request",
+                "target": pseudo,
+                "if_none_match": self._peer_hashes.get(pseudo) or "",
+            })
+            if ok:
+                self._pending_requests.add(pseudo)
+        except Exception:
+            pass
+
+    def handle_response(self, target: str, status: str,
+                        new_hash: str | None, data_b64: str | None) -> bool:
+        """Traite un profile_photo_response. Retourne True si le cache a
+        ete mis a jour (la UI doit se rafraichir pour ce pseudo)."""
+        self._pending_requests.discard(target)
+        if not target:
+            return False
+        if status == "unchanged":
+            return False
+        if status == "none":
+            # Le serveur n'a pas de photo pour ce pseudo. Si on en avait
+            # une en cache (cas rare : photo supprimee cote owner), on la
+            # garde quand meme : pas de mecanisme de delete. Comportement
+            # volontaire selon la spec (pas de cleanup tant que pas de
+            # nouvelle photo).
+            return False
+        if status != "ok" or not data_b64 or not new_hash:
+            return False
+        try:
+            import base64
+            jpeg_bytes = base64.b64decode(data_b64, validate=True)
+        except Exception:
+            return False
+        if len(jpeg_bytes) > PHONE_PROFILE_PHOTO_MAX_BYTES:
+            return False
+        # Ecriture disque + cache memoire + index.
+        path = self._peer_cache_path(target)
+        if path is None:
+            return False
+        try:
+            with open(path, "wb") as f:
+                f.write(jpeg_bytes)
+        except Exception:
+            return False
+        self._peer_cache[target] = (jpeg_bytes, new_hash)
+        self._peer_hashes[target] = new_hash
+        self._save_peer_index()
+        return True
 
 
 def _load_version_info() -> dict:
@@ -718,6 +1381,22 @@ def _download_update_file(server_ip: str, file_meta: dict, dest_dir: Path) -> bo
     expected_sha = file_meta.get("sha256")
     if not name or not expected_sha:
         return False
+    # Validation anti-path-traversal : un manifest malveillant pourrait
+    # contenir "name": "../../Windows/System32/foo.dll" ce qui ecrirait
+    # en dehors de dest_dir. On normalise puis verifie que le chemin reste
+    # dans dest_dir. On refuse aussi les chemins absolus.
+    if (
+        ".." in name.replace("\\", "/").split("/")
+        or name.startswith("/")
+        or name.startswith("\\")
+        or (len(name) > 1 and name[1] == ":")  # chemin Windows absolu type "C:..."
+    ):
+        try:
+            if _CORE_AVAILABLE:
+                _core._dbg_log(f"[UPDATE] Nom de fichier suspect refuse : {name}")
+        except Exception:
+            pass
+        return False
     try:
         import urllib.request
         url = f"http://{server_ip}:{UPDATE_PORT}/files/{name}"
@@ -738,6 +1417,10 @@ def _download_update_file(server_ip: str, file_meta: dict, dest_dir: Path) -> bo
                     f"recu={actual_sha[:12]}..."
                 )
             return False
+        # Creer les dossiers parents si le nom contient un sous-chemin
+        # (ex: "sounds/dial.wav" -> creer dest_dir/sounds/ avant l'open).
+        # Sans ca, l'open echoue avec FileNotFoundError sur le parent.
+        dest.parent.mkdir(parents=True, exist_ok=True)
         with open(dest, "wb") as f:
             f.write(data)
         if _CORE_AVAILABLE:
@@ -879,6 +1562,9 @@ def _apply_update(server_ip: str, manifest: dict) -> tuple[bool, str]:
             src = tmp_dir / name
             dst = _BASE_DIR / name
             try:
+                # Creer les dossiers parents au cas ou name contient
+                # un sous-chemin (ex: "sounds/dial.wav").
+                dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
             except Exception as e:
                 return False, f"Echec ecriture {name} : {e}"
@@ -1062,10 +1748,12 @@ _CORE_MANAGED_CFG_KEYS = frozenset({
     "gamelog_path",
     # Mode RP
     "rp_mode",
-    # Hotkeys (8 raccourcis)
+    # Hotkeys (8 raccourcis + 5 CircusPhone D4)
     "radio_key", "profile_radio_key",
     "mute_mic_key", "mute_prox_key", "mute_radio_key", "mute_all_key",
     "proximity_short_key", "cycle_channel_key",
+    "phone_open_key", "phone_accept_key", "phone_decline_key",
+    "phone_mute_key", "phone_speaker_key",
 })
 
 
@@ -1123,6 +1811,268 @@ def _save_cfg(cfg: dict) -> None:
 
 # Note : _VERSION_STRING est deja defini ligne 572 a partir de
 # _VERSION_INFO charge au boot. Pas besoin de le recharger ici.
+
+
+# ======================================================================
+# CircusPhone (Feature 4, D4) : annuaire local des contacts
+# ======================================================================
+# L'annuaire est un simple fichier JSON a cote du script. Structure :
+#   {
+#     "contacts": {
+#       "<pseudo>": {
+#         "first_seen": "<iso8601>",   # 1re fois vu connecte avec moi
+#         "last_seen":  "<iso8601>",   # derniere fois vu connecte avec moi
+#       },
+#       ...
+#     }
+#   }
+# Enrichissement : a chaque fois que le client recoit la liste des joueurs
+# connectes (welcome / join), tout pseudo absent est ajoute, tout pseudo
+# deja present voit son last_seen mis a jour. On ne purge jamais
+# automatiquement : seul l'utilisateur retire un contact ("oublier").
+# Le statut connecte/deconnecte n'est PAS stocke dans le fichier : il est
+# calcule a l'affichage en croisant avec state.players (joueurs en ligne).
+
+def _phone_load_annuaire() -> dict:
+    """Charge l'annuaire depuis PHONE_ANNUAIRE_FILE. Retourne toujours un
+    dict de forme {"contacts": {...}} (vide si fichier absent ou illisible)."""
+    try:
+        if PHONE_ANNUAIRE_FILE.exists():
+            data = json.loads(PHONE_ANNUAIRE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("contacts"), dict):
+                return data
+    except Exception as e:
+        print(f"[PHONE] Echec lecture annuaire : {e}", file=sys.stderr)
+    return {"contacts": {}}
+
+
+def _phone_save_annuaire(annuaire: dict) -> bool:
+    """Sauvegarde l'annuaire dans PHONE_ANNUAIRE_FILE. Best-effort :
+    retourne True si l'ecriture a reussi, False sinon (jamais d'exception
+    remontee a l'appelant)."""
+    try:
+        PHONE_ANNUAIRE_FILE.write_text(
+            json.dumps(annuaire, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return True
+    except Exception as e:
+        print(f"[PHONE] Echec sauvegarde annuaire : {e}", file=sys.stderr)
+        return False
+
+
+def _phone_enrich_annuaire(annuaire: dict, pseudos, my_name: str = "") -> bool:
+    """Enrichit l'annuaire avec une liste de pseudos vus connectes.
+      - pseudo absent  -> ajoute (first_seen = last_seen = maintenant)
+      - pseudo present -> last_seen mis a jour (en memoire seulement)
+      - mon propre pseudo (my_name) est ignore (on ne s'ajoute pas soi-meme)
+    Modifie `annuaire` en place. Retourne True UNIQUEMENT si au moins un
+    nouveau contact a ete ajoute (donc qu'il faut sauvegarder le fichier).
+    Les simples mises a jour de last_seen ne declenchent PAS de save :
+    sinon on ecrirait le fichier a chaque pos recue (toutes les secondes
+    par joueur connecte), ce qui userait le disque sans valeur ajoutee."""
+    contacts = annuaire.setdefault("contacts", {})
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    added = False
+    for pseudo in pseudos:
+        if not isinstance(pseudo, str) or not pseudo:
+            continue
+        if my_name and pseudo == my_name:
+            continue
+        entry = contacts.get(pseudo)
+        if entry is None:
+            contacts[pseudo] = {"first_seen": now_iso, "last_seen": now_iso}
+            added = True
+        else:
+            # Update memoire uniquement. Pas de signal de save : on
+            # economise les I/O disque.
+            entry["last_seen"] = now_iso
+    return added
+
+
+def _phone_forget_contact(annuaire: dict, pseudo: str) -> bool:
+    """Retire un contact de l'annuaire ("oublier ce contact"). Modifie
+    `annuaire` en place. Retourne True si le contact existait et a ete
+    retire, False s'il n'etait pas la."""
+    contacts = annuaire.get("contacts", {})
+    if pseudo in contacts:
+        del contacts[pseudo]
+        return True
+    return False
+
+
+# ======================================================================
+# CircusPhone (Feature 4, D4 etape 3) : messagerie privee
+# ======================================================================
+# Stockage d'une conversation par contact. Structure du fichier :
+#   {
+#     "conversations": {
+#       "<pseudo>": {
+#         "sent":     [{"ts": <float>, "body": "<str>"}, ...max 10],
+#         "received": [{"ts": <float>, "body": "<str>"}, ...max 10],
+#         "draft":    "<str>",    # brouillon en cours (vide si aucun)
+#         "unread":   <int>,      # nb de messages non lus
+#       },
+#       ...
+#     }
+#   }
+# 10 envoyes + 10 recus par contact (cf spec). Le 'sent' est tronque
+# par l'avant (on retire les plus anciens). 'received' idem. 'draft' est
+# vide par defaut, rempli quand on quitte l'ecran conversation avec du
+# texte non envoye, vide quand on envoie. 'unread' incremente a chaque
+# reception, remis a 0 quand on ouvre la conversation.
+
+def _phone_load_messages() -> dict:
+    """Charge le fichier de conversations. Retourne toujours un dict de
+    forme {"conversations": {...}} (vide si fichier absent / illisible).
+    Applique _phone_trim_convo sur chaque conversation chargee pour
+    normaliser les fichiers anciens (cap 10+10) au nouveau cap global
+    (20 messages total). Pas d'ecriture disque ici : la normalisation
+    sera persistee au prochain save naturel (envoi/reception/draft)."""
+    try:
+        if PHONE_MESSAGES_FILE.exists():
+            data = json.loads(PHONE_MESSAGES_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(
+                data.get("conversations"), dict
+            ):
+                # Normalisation : applique le cap global a chaque convo.
+                # Idempotent si deja au format propre.
+                for convo in data["conversations"].values():
+                    if isinstance(convo, dict):
+                        # _phone_get_convo-like garde-fous pour les vieux
+                        # fichiers qui manqueraient une cle.
+                        convo.setdefault("sent", [])
+                        convo.setdefault("received", [])
+                        convo.setdefault("draft", "")
+                        convo.setdefault("unread", 0)
+                        _phone_trim_convo(convo)
+                return data
+    except Exception as e:
+        print(f"[PHONE] Echec lecture messages : {e}", file=sys.stderr)
+    return {"conversations": {}}
+
+
+def _phone_save_messages(messages: dict) -> bool:
+    """Sauvegarde les conversations dans PHONE_MESSAGES_FILE. Best-effort :
+    retourne True si l'ecriture a reussi, False sinon."""
+    try:
+        PHONE_MESSAGES_FILE.write_text(
+            json.dumps(messages, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return True
+    except Exception as e:
+        print(f"[PHONE] Echec sauvegarde messages : {e}", file=sys.stderr)
+        return False
+
+
+def _phone_get_convo(messages: dict, pseudo: str) -> dict:
+    """Retourne (ou cree) le dict de conversation pour ce contact. Modifie
+    `messages` en place si la conversation n'existait pas encore."""
+    convos = messages.setdefault("conversations", {})
+    convo = convos.get(pseudo)
+    if convo is None:
+        convo = {"sent": [], "received": [], "draft": "", "unread": 0}
+        convos[pseudo] = convo
+    else:
+        # Garde-fous : si un fichier ancien manque des cles, on complete.
+        convo.setdefault("sent", [])
+        convo.setdefault("received", [])
+        convo.setdefault("draft", "")
+        convo.setdefault("unread", 0)
+    return convo
+
+
+def _phone_trim_convo(convo: dict) -> None:
+    """Tronque une conversation a PHONE_MAX_MESSAGES messages au TOTAL
+    (envoyes + recus). Fusionne sent[] et received[] par timestamp, garde
+    les N plus recents, puis re-separe en sent[]/received[] pour preserver
+    la structure JSON (retrocompat).
+
+    Sans cette fusion, le cap separe sur sent et received creait un fil
+    incoherent : si on envoyait beaucoup, nos vieux envoyes etaient
+    tronques mais les recus de l'epoque restaient -> messages du contact
+    "qui repondent a rien". Bug observe 23/05/2026 Kainan.
+
+    Modifie convo en place. Idempotent.
+    """
+    sent = convo.get("sent", []) or []
+    received = convo.get("received", []) or []
+    total = len(sent) + len(received)
+    if total <= PHONE_MAX_MESSAGES:
+        return
+    # Fusionner avec marqueur de provenance (True = sent, False = received).
+    merged = []
+    for m in sent:
+        merged.append((float(m.get("ts", 0.0)), True, m))
+    for m in received:
+        merged.append((float(m.get("ts", 0.0)), False, m))
+    # Trier par ts croissant (les plus anciens en tete).
+    merged.sort(key=lambda x: x[0])
+    # Garder les N plus recents (queue de la liste).
+    kept = merged[-PHONE_MAX_MESSAGES:]
+    # Re-separer en sent / received en conservant l'ordre par ts.
+    new_sent = [item[2] for item in kept if item[1]]
+    new_received = [item[2] for item in kept if not item[1]]
+    convo["sent"] = new_sent
+    convo["received"] = new_received
+
+
+def _phone_append_sent(messages: dict, pseudo: str, body: str,
+                       ts: float) -> None:
+    """Ajoute un message envoye a la conversation avec `pseudo`. Le cap
+    a PHONE_MAX_MESSAGES (envoyes + recus combines) est applique via
+    _phone_trim_convo apres l'ajout. Modifie en place."""
+    convo = _phone_get_convo(messages, pseudo)
+    convo["sent"].append({"ts": ts, "body": body})
+    _phone_trim_convo(convo)
+
+
+def _phone_append_received(messages: dict, pseudo: str, body: str,
+                           ts: float) -> None:
+    """Ajoute un message recu a la conversation avec `pseudo`. Cap global
+    via _phone_trim_convo (envoyes + recus combines). Incremente le
+    compteur unread. Modifie en place."""
+    convo = _phone_get_convo(messages, pseudo)
+    convo["received"].append({"ts": ts, "body": body})
+    _phone_trim_convo(convo)
+    convo["unread"] = int(convo.get("unread", 0)) + 1
+
+
+def _phone_mark_read(messages: dict, pseudo: str) -> bool:
+    """Marque la conversation avec `pseudo` comme lue (unread = 0).
+    Retourne True si quelque chose a change (donc qu'il faut sauvegarder)."""
+    convo = messages.get("conversations", {}).get(pseudo)
+    if convo is None:
+        return False
+    if int(convo.get("unread", 0)) == 0:
+        return False
+    convo["unread"] = 0
+    return True
+
+
+def _phone_set_draft(messages: dict, pseudo: str, draft: str) -> None:
+    """Met a jour le brouillon de la conversation avec `pseudo`. Modifie
+    en place. La conversation est creee si elle n'existait pas (pour ne
+    pas perdre un brouillon vers un contact a qui on n'a jamais parle)."""
+    convo = _phone_get_convo(messages, pseudo)
+    convo["draft"] = draft or ""
+
+
+def _phone_merge_messages(messages: dict, pseudo: str):
+    """Construit la liste chronologique (envoyes + recus melanges, tries
+    par ts croissant) pour affichage. Chaque element : (ts, body, is_me)
+    ou is_me=True si c'est un message que j'ai envoye."""
+    convo = messages.get("conversations", {}).get(pseudo)
+    if convo is None:
+        return []
+    items = []
+    for m in convo.get("sent", []):
+        items.append((float(m.get("ts", 0.0)), m.get("body", ""), True))
+    for m in convo.get("received", []):
+        items.append((float(m.get("ts", 0.0)), m.get("body", ""), False))
+    items.sort(key=lambda x: x[0])
+    return items
 
 
 # ======================================================================
@@ -1216,6 +2166,18 @@ if _CORE_AVAILABLE:
     # ne pas avoir ete initialises a class-level :
     if not hasattr(state, "my_pos"):
         state.my_pos = None
+    # v0.2 : timestamp monotonic de la derniere position locale OCR.
+    # Utilise par le masque DisplayInfo pour determiner si l'OCR a lu
+    # une position recente. 0.0 = jamais lu encore -> mask cache.
+    if not hasattr(state, "my_pos_ts"):
+        state.my_pos_ts = 0.0
+    # v0.2 alpha 055 : flag controle par la machine d'etat clavier qui
+    # detecte la mobiglass (F1/F2/F11) et le menu options (Echap). Quand
+    # True, le masque DisplayInfo est cache en plus des autres conditions
+    # (case cochee, OCR frais, etc.). Resync auto sur changement de
+    # position OCR (le joueur a la main sur le perso = mobiglass fermee).
+    if not hasattr(state, "mask_force_hidden"):
+        state.mask_force_hidden = False
     if not hasattr(state, "audio_server_ip"):
         state.audio_server_ip = None  # client2 le set au moment de connecter
     # Flag de shutdown : permet aux threads daemon (OCR, watchdog, audio,
@@ -1232,6 +2194,8 @@ else:
         # serveur fait crash AttributeError. Defaults conservateurs :
         # tout False/None/{}/[] pour rester en mode degrade.
         my_pos: Optional[dict] = None
+        my_pos_ts: float = 0.0  # v0.2 : timestamp OCR pour mask DisplayInfo
+        mask_force_hidden: bool = False  # v0.2 alpha 055 : machine etat clavier
         my_name: str = DEFAULT_NAME
         players: dict = {}
         connected: bool = False
@@ -1338,6 +2302,34 @@ class NetWorker(QObject):
     sig_invalid_token = Signal()                 # mauvais MDP serveur
     sig_anonymous_mode = Signal(bool)            # mode anonyme on/off (serveur)
     sig_channels_changed = Signal()              # liste/canal courant a rafraichir
+    # v0.2 alpha 029 : un joueur du canal vocal courant a declenche un son
+    # du soundboard. Args : (sound_id, sender_name). Sera relie a
+    # MainWindow._play_soundboard_local via QueuedConnection (thread-safe
+    # cross-thread : on est dans NetWorker, le slot tourne dans le thread Qt
+    # main qui possede audio_io et le cache des sons).
+    sig_soundboard_play = Signal(str, str)        # sound_id, sender_name
+    # v0.2 alpha 035 : signal emis quand le serveur push de nouvelles
+    # permissions sur mon profil (welcome ou my_profile). Args :
+    # (perm_key, value). MainWindow ecoute et adapte l'UI (montre/cache
+    # la section soundboard, le bouton Soundboard, etc.).
+    sig_my_perm_changed = Signal(str, bool)       # perm_key, value
+    # CircusPhone (Feature 4, D1) : signaux du cycle de vie d'appel.
+    # Tous emis depuis le thread worker WS, relies a des slots
+    # MainWindow._on_phone_* via QueuedConnection (thread-safe).
+    sig_phone_ringing  = Signal(str, str)         # call_id, target
+    sig_phone_incoming = Signal(str, str)         # call_id, caller
+    sig_phone_accepted = Signal(str, str, str)    # call_id, caller, callee
+    sig_phone_declined = Signal(str)              # call_id
+    sig_phone_busy     = Signal(str, str)         # target, cause
+    sig_phone_missed   = Signal(str, str, str)    # call_id, caller, callee
+    sig_phone_ended    = Signal(str, str)         # call_id, reason
+    # CircusPhone (D4 etape 3) : reception d'un MP texte. Relaye au thread
+    # Qt via slot _on_phone_message_received dans MainWindow.
+    sig_phone_message_received = Signal(str, str, float)  # sender, body, ts
+    # [D5] Reponse a un profile_photo_request. Champs : target, status,
+    # hash, data_b64. status est l'un de : "ok", "unchanged", "none".
+    sig_profile_photo_response = Signal(str, str, str, str)
+    #                                  target, status, hash, data_b64
 
     def __init__(self):
         super().__init__()
@@ -1542,6 +2534,13 @@ class NetWorker(QObject):
                 # reconnecte, on obtient un nouveau ticket et l'ancien est
                 # ecrase (l'ancien ne vaut plus rien cote serveur).
                 state.audio_ticket = data.get("audio_ticket", "") or ""
+                # v0.2 alpha 035 : permissions du profil. Au welcome,
+                # le serveur envoie False par defaut (pas encore de profil
+                # assigne). Stocke pour usage UI + emet le signal pour
+                # mise a jour immediate (cacher la section soundboard).
+                sb_allowed = bool(data.get("soundboard_allowed", False))
+                state.my_profile_soundboard_allowed = sb_allowed
+                self.sig_my_perm_changed.emit("soundboard_allowed", sb_allowed)
             except Exception as e:
                 if _CORE_AVAILABLE:
                     try:
@@ -1759,10 +2758,17 @@ class NetWorker(QObject):
                 new_prof = data.get("profile")
                 state.my_profile = new_prof
                 state.player_profiles[my_name] = new_prof
+                # v0.2 alpha 035 : permissions associees au nouveau profil
+                # (envoyees par le serveur dans le meme message). Si pas
+                # de profil, toutes les permissions sont False.
+                sb_allowed = bool(data.get("soundboard_allowed", False))
+                state.my_profile_soundboard_allowed = sb_allowed
                 self.sig_log.emit(
-                    f"[NET] mon profil -> {new_prof or '(aucun)'}"
+                    f"[NET] mon profil -> {new_prof or '(aucun)'} "
+                    f"(soundboard={'OUI' if sb_allowed else 'NON'})"
                 )
                 self.sig_channels_changed.emit()
+                self.sig_my_perm_changed.emit("soundboard_allowed", sb_allowed)
             except Exception as e:
                 if _CORE_AVAILABLE:
                     try:
@@ -1782,6 +2788,26 @@ class NetWorker(QObject):
                 if _CORE_AVAILABLE:
                     try:
                         _core._dbg_log(f"[NET] player_prox_short KO : {e}")
+                    except Exception:
+                        pass
+            return
+
+        if msg_type == "soundboard_play":
+            # v0.2 alpha 029/031 : un joueur du canal vocal a declenche un
+            # son du soundboard. NetWorker tourne dans son propre thread,
+            # _play_soundboard_local est sur MainWindow (thread Qt main).
+            # On emet un signal Qt -> traverse les threads via
+            # QueuedConnection -> _play_soundboard_local est invoque dans
+            # le thread Qt main, qui possede state.audio_io et le cache.
+            try:
+                sound_id = data.get("sound_id")
+                sender   = data.get("name") or ""
+                if isinstance(sound_id, str) and sound_id:
+                    self.sig_soundboard_play.emit(sound_id, sender)
+            except Exception as e:
+                if _CORE_AVAILABLE:
+                    try:
+                        _core._dbg_log(f"[SOUNDBOARD] play recv KO : {e}")
                     except Exception:
                         pass
             return
@@ -1816,6 +2842,110 @@ class NetWorker(QObject):
         # pong indique que la connexion est vivante. Le timestamp pourrait
         # servir a calculer une latence mais pas necessaire pour l'instant.
         if msg_type == "pong":
+            return
+
+        # ─────────────────────────────────────────────
+        #  CircusPhone (Feature 4, D1) : cycle de vie d'appel
+        # ─────────────────────────────────────────────
+        # On relaie chaque message au thread Qt via un signal dedie.
+        # MainWindow porte l'etat d'appel et l'UI de la page Phone Debug.
+        if msg_type == "phone_call_ringing":
+            self.sig_phone_ringing.emit(
+                data.get("call_id") or "", data.get("target") or "")
+            return
+        if msg_type == "phone_call_incoming":
+            self.sig_phone_incoming.emit(
+                data.get("call_id") or "", data.get("caller") or "")
+            return
+        if msg_type == "phone_call_accepted":
+            self.sig_phone_accepted.emit(
+                data.get("call_id") or "", data.get("caller") or "",
+                data.get("callee") or "")
+            return
+        if msg_type == "phone_call_declined":
+            self.sig_phone_declined.emit(data.get("call_id") or "")
+            return
+        if msg_type == "phone_call_busy":
+            self.sig_phone_busy.emit(
+                data.get("target") or "", data.get("cause") or "")
+            return
+        if msg_type == "phone_call_missed":
+            self.sig_phone_missed.emit(
+                data.get("call_id") or "", data.get("caller") or "",
+                data.get("callee") or "")
+            return
+        if msg_type == "phone_call_ended":
+            self.sig_phone_ended.emit(
+                data.get("call_id") or "", data.get("reason") or "")
+            return
+        # CircusPhone D4b : on est un voisin du proprietaire d'un HP.
+        # On est maintenant autorise a entendre les trames 0x03 venant
+        # du peer 'peer' (la voix de l'autre partie de l'appel).
+        if msg_type == "phone_hp_active":
+            peer = data.get("peer") or ""
+            owner = data.get("owner") or ""
+            if peer and owner:
+                state.hp_speakers_allowed[peer] = owner
+                self.sig_log.emit(
+                    f"[HP] J'entends maintenant {peer} en HP (owner={owner})"
+                )
+            return
+        # CircusPhone D4b : autorisation revoquee (le proprietaire a
+        # eteint son HP, ou j'ai quitte le rayon 5m, ou l'appel a fini).
+        if msg_type == "phone_hp_inactive":
+            peer = data.get("peer") or ""
+            owner = data.get("owner") or ""
+            # On retire l'entree uniquement si elle correspond a l'owner
+            # qui notifie : si plusieurs HP m'autorisaient sur le meme
+            # peer (cas tordu), on ne casse pas les autres.
+            cur_owner = state.hp_speakers_allowed.get(peer)
+            if cur_owner == owner:
+                state.hp_speakers_allowed.pop(peer, None)
+                self.sig_log.emit(
+                    f"[HP] Je n'entends plus {peer} en HP (owner={owner})"
+                )
+            return
+        # CircusPhone D4b : je suis le peer d'un proprietaire HP. La liste
+        # des voisins du proprietaire (dont je peux entendre la prox 0x00)
+        # vient d'etre mise a jour par le serveur. On la remplace en bloc.
+        if msg_type == "phone_hp_neighbors_update":
+            owner = data.get("owner") or ""
+            new_neighbors = data.get("neighbors") or []
+            if not owner:
+                return
+            # Retirer toutes les entrees liees a cet owner (peut-etre des
+            # voisins qui ne sont plus voisins), puis ajouter les nouveaux.
+            for nb in list(state.hp_proxies_allowed.keys()):
+                if state.hp_proxies_allowed.get(nb) == owner:
+                    state.hp_proxies_allowed.pop(nb, None)
+            for nb in new_neighbors:
+                if isinstance(nb, str) and nb:
+                    state.hp_proxies_allowed[nb] = owner
+            self.sig_log.emit(
+                f"[HP] Voisins de {owner} mis a jour : "
+                f"{len(state.hp_proxies_allowed)} pseudos autorises"
+            )
+            return
+        # CircusPhone (D4 etape 3) : un MP texte est arrive.
+        if msg_type == "phone_message_received":
+            sender = data.get("sender") or ""
+            body   = data.get("body") or ""
+            try:
+                ts = float(data.get("ts") or 0.0)
+            except Exception:
+                ts = 0.0
+            self.sig_phone_message_received.emit(sender, body, ts)
+            return
+
+        # [D5] Reponse a une demande de photo de profil.
+        if msg_type == "profile_photo_response":
+            target = data.get("target") or ""
+            status = data.get("status") or ""
+            new_hash = data.get("hash") or ""
+            data_b64 = data.get("data_b64") or ""
+            self.sig_profile_photo_response.emit(
+                target, status, new_hash, data_b64
+            )
             return
 
         self.sig_log.emit(f"[NET] type inconnu : {msg_type}")
@@ -3114,6 +4244,2168 @@ class OverlayManager(QObject):
 
 
 # ======================================================================
+# Masque DisplayInfo (v0.2, feature 3)
+# ======================================================================
+# Overlay topmost qui dessine un rectangle opaque noir par-dessus la
+# zone DisplayInfo de Star Citizen (le HUD qui affiche le nom de la
+# zone / planete / station). Certains joueurs (notamment streamers)
+# le trouvent imposant ou veulent eviter de leak la localisation.
+#
+# Le mask est :
+#   - Click-through (Qt.WindowTransparentForInput) : les clics passent
+#     au jeu en-dessous.
+#   - Topmost (Qt.WindowStaysOnTopHint) : reste visible meme en
+#     plein-ecran fenetre du jeu.
+#   - Frameless (Qt.FramelessWindowHint) : pas de barre de titre.
+#   - Place sur l'ecran qui contient la zone OCR (pas forcement
+#     l'ecran principal Windows).
+#
+# Position et taille : derivees de la resolution de l'ecran cible a
+# partir de la reference 4K ci-dessous. Le rectangle est colle au
+# bord droit de l'ecran (cf. comportement du DisplayInfo SC sur
+# ultrawide), et scale proportionnellement a la largeur/hauteur ecran.
+#
+# Affichage conditionnel : visible uniquement si
+#   - la case dans Parametres > OCR (avance) est cochee, ET
+#   - state.my_pos_ts a moins de DISPLAYINFO_MASK_STALE_S secondes
+#     (= l'OCR a lu une position recente, donc le joueur est en jeu
+#     plutot que sur le bureau Windows / dans le menu).
+# Un QTimer 500ms cote MainWindow check ces conditions.
+
+# Reference 4K (3840x2160). Mesuree sur ecran 4K standard, position de
+# la zone DisplayInfo Star Citizen.
+#   x_4k       : px depuis le bord gauche de l'ecran (= 2496 -> reste
+#                1344 px jusqu'au bord droit, donc colle a droite)
+#   y_4k       : px depuis le bord haut (= 0 -> colle en haut)
+#   width_4k   : largeur en px (= 1344)
+#   height_4k  : hauteur en px (= 500)
+# Pour les autres resolutions, on scale :
+#   - largeur : width_4k * (screen_w / 3840)
+#   - hauteur : height_4k * (screen_h / 2160)
+#   - x       : screen_w - largeur calculee (colle au bord droit, donc
+#               independant de la position x_4k -> c'est volontaire,
+#               cf. comportement HUD SC en ultrawide)
+#   - y       : y_4k * (screen_h / 2160) (proportionnel a la hauteur)
+DISPLAYINFO_MASK_REF_4K = {
+    "x":      2496,
+    "y":      0,
+    "width":  1344,
+    "height": 500,
+}
+DISPLAYINFO_MASK_REF_SCREEN_W = 3840
+DISPLAYINFO_MASK_REF_SCREEN_H = 2160
+
+# Apparence du rectangle (v0.2 alpha 005, retour utilisateur "le bloc noir
+# opaque etait trop visible et flagrant"). On garde un rectangle simple
+# (pas de flou ni de detection de pixels du texte) mais on le rend
+# semi-transparent avec coins arrondis pour qu'il se fonde mieux dans
+# l'image du jeu.
+#   DISPLAYINFO_MASK_OPACITY : 0.0 (totalement transparent, invisible)
+#                              a 1.0 (totalement opaque, comme avant).
+#                              0.5 = compromis : le texte est nettement
+#                              attenue mais le decor du jeu en dessous
+#                              reste devine, evite l'effet "gros pate noir".
+#   DISPLAYINFO_MASK_RADIUS  : rayon des coins arrondis en pixels.
+#                              Calcule en pixels logiques de l'ecran cible.
+#                              0 = coins droits comme avant.
+#                              10 = leger arrondi, juste pour adoucir.
+DISPLAYINFO_MASK_OPACITY = 0.5
+DISPLAYINFO_MASK_RADIUS  = 10
+
+# Mode "smart" du masque (v0.2 alpha 006). Au lieu de dessiner un
+# rectangle uniforme, on capture la zone DisplayInfo et on detecte les
+# pixels appartenant au texte du HUD. On ne masque QUE ces pixels-la,
+# en les remplacant par la couleur moyenne du decor environnant.
+# Resultat : le texte disparait, mais le decor du jeu reste totalement
+# visible entre les lignes et les caracteres.
+#
+# Detection adaptative (v0.2 alpha 012) : remplace les seuils RGB fixes
+# qui souffraient de 2 problemes :
+#   1. Certains textes (gris terne, contours antialiases, couleurs hors
+#      criteres) passaient sous les seuils -> bouts de texte visibles.
+#   2. Sur une frame avec une luminosite globale differente (fondu,
+#      changement de scene), aucun pixel ne passait les seuils ->
+#      frame entiere ou le masque ne cachait rien.
+#
+# Methode : pour chaque pixel, on calcule la moyenne de luminosite dans
+# un grand voisinage (fenetre WINDOW_PX x WINDOW_PX). Un pixel est
+# considere "texte" si sa luminosite est BRIGHT_DIFF plus elevee que
+# cette moyenne locale. C'est exactement la maniere dont un humain
+# detecte le texte : ce qui ressort du fond, peu importe la couleur.
+#
+#   DISPLAYINFO_TEXT_BRIGHT_DIFF : seuil de difference de luminosite
+#                                  par rapport a la moyenne locale.
+#                                  20 = tres agressif (attrape tout, y
+#                                       compris faux positifs sur
+#                                       reflets / lumieres).
+#                                  30 = compromis recommande.
+#                                  50 = selectif, ne loupe pas les
+#                                       textes brillants mais peut
+#                                       louper le gris fonce.
+#   DISPLAYINFO_TEXT_WINDOW_PX   : taille du voisinage pour calcul de
+#                                  la moyenne locale. Doit etre plus
+#                                  grand que l'epaisseur d'un caractere
+#                                  (sinon le caractere lui-meme tire
+#                                  la moyenne et echappe la detection).
+#                                  21 px = bon defaut pour le texte du
+#                                  HUD SC (lignes hautes de ~15-20 px).
+DISPLAYINFO_TEXT_BRIGHT_DIFF = 15
+DISPLAYINFO_TEXT_WINDOW_PX   = 51
+
+# Dilate du masque texte : on etend le masque de N pixels autour de chaque
+# pixel detecte pour bien couvrir les bordures antialiasees des caracteres
+# (qui sont moins brillantes que le centre du trait et ne passent pas le
+# seuil). 1 ou 2 px suffit en general.
+DISPLAYINFO_TEXT_DILATE_PX = 3
+
+# Taille maximale d'un cluster de pixels detectes avant filtrage
+# (v0.2 alpha 038). Pour rejeter les zones lumineuses du JEU (lampes,
+# voyants, reflets, etoiles, parties eclairees d'un vaisseau) qui sont
+# detectees a tort comme du texte HUD par le critere de luminosite
+# locale. Un caractere du HUD a cette resolution fait typiquement
+# entre 5 et 30 pixels une fois detecte. Un cluster nettement plus gros
+# (lampe, blob lumineux, gros voyant) est presque toujours un element
+# du jeu et NON du texte.
+#
+# Calibrage :
+#   - 60 : preserve tous les caracteres standards, rejette les blobs
+#          de taille moyenne+.
+#   - 100 : plus large, garde aussi quelques gros caracteres (chiffres
+#           gras, certains glyphes), rejette les vrais gros blobs.
+#   - 200 : seulement les enormes blobs (lampe pleine ecran) sont rejetes.
+# Defaut prudent a 80 px : si un caractere depasse cette taille, c'est
+# probablement deja un faux positif sur un blob lumineux.
+DISPLAYINFO_TEXT_MAX_BLOB_PX = 80
+
+# Voisinage utilise pour calculer la couleur moyenne du decor a la place
+# des pixels texte. On prend les pixels NON-texte dans une fenetre de
+# (2*N+1)x(2*N+1) autour de chaque pixel texte et on moyenne. Plus N est
+# grand, plus le remplacement est lisse mais flou (et plus c'est cher).
+# v0.2 alpha 047 : monte de 6 a 16 pour eviter les bandes noires sur
+# les lignes denses du HUD. Avec N=6, le voisinage 13x13 ne capturait
+# pas assez de pixels "decor" pour les zones ou une ligne du HUD est
+# entierement remplie de texte (= la moyenne tombait a quasi-noir).
+# Avec N=16, on echantillonne 33x33 px (= au-dessus et en-dessous d'une
+# ligne de texte, on trouve toujours du decor). Cout CPU negligeable
+# car le boxFilter est applique en demi-resolution.
+DISPLAYINFO_DECOR_RADIUS_PX = 16
+
+# Periode de rafraichissement du masque smart (ms). 16ms = ~60 FPS,
+# match la cadence du DWM Windows et donc la fluidite de SC.
+# A plus haute frequence, on ne gagne plus rien visuellement.
+# Cout estime ~25-30 % CPU d'un coeur a 5 FPS pour une zone 1344x500,
+# donc ~300% (= 3 coeurs equivalents) a 60 FPS. Reste OK sur PC moderne.
+DISPLAYINFO_SMART_PERIOD_MS = 16
+
+# Memoire temporelle du masque (v0.2 alpha 007). Le texte du HUD change a
+# chaque frame (FPS, coords, timers qui defilent), donc la detection des
+# pixels du texte change aussi a chaque frame -> clignotement visible.
+# Pour stabiliser : on garde en memoire les N derniers masques detectes et
+# on les combine via OR logique. Un pixel reste masque tant qu'il a ete
+# detecte "texte" dans au moins UN des N derniers frames.
+# Compromis :
+#   N=1  : comportement initial, clignotement maximal.
+#   N=5  : 1 seconde de memoire a 5 FPS, bon compromis stabilite/etalement.
+#   N=10 : 2 secondes de memoire, plus stable mais le masque s'etale plus.
+#   N=20 : tres stable mais converge vers des bandes pleines.
+DISPLAYINFO_TEXT_HISTORY_FRAMES = 5
+
+# Delai (secondes) au-dela duquel state.my_pos_ts est considere comme
+# perime -> le mask se cache (le joueur a probablement quitte le jeu,
+# alt-tab, ou est sur un ecran de chargement). Mis a 20s pour tolerer
+# les interruptions courtes d'OCR (boussoles, menus rapides) sans faire
+# clignoter le mask.
+DISPLAYINFO_MASK_STALE_S = 20.0
+
+# Periode du timer de check (ms). 500ms = check 2x/sec, suffisant pour
+# faire apparaitre/disparaitre le mask de maniere fluide sans charger
+# la boucle Qt.
+DISPLAYINFO_MASK_CHECK_MS = 500
+
+# ----------------------------------------------------------------------
+# FLAGS DEBUG MASQUE (v0.2 alpha 016)
+# ----------------------------------------------------------------------
+# Permettent d'isoler le masque de l'OCR pour reproduire/diagnostiquer
+# des problemes (clignotement, frames vides). En production : laisser
+# les valeurs par defaut.
+#
+# DEBUG_ENABLE_OCR :
+#   True  (defaut) = OCR fonctionne normalement
+#   False          = l'OCR n'est PAS demarre du tout. Le client tourne
+#                    en mode "VOIP only", sans lecture de position SC,
+#                    sans capture MSS de la zone OCR, sans callbacks
+#                    pre/post sur le masque. Permet de tester si le
+#                    clignotement vient d'une interaction OCR ↔ masque.
+#                    Effet de bord : state.my_pos reste a None ->
+#                    l'overlay des autres joueurs / proximite ne marche
+#                    plus, mais on s'en fout pour le debug du masque.
+#
+# DEBUG_MASK_BYPASS_OCR_CHECK :
+#   False (defaut) = le masque ne s'affiche que si l'OCR a lu une
+#                    position recente (state.my_pos_ts < 20s).
+#   True           = le masque s'affiche des que la case est cochee,
+#                    sans verifier l'etat de l'OCR. Necessaire si
+#                    DEBUG_ENABLE_OCR=False (sinon le masque ne s'affiche
+#                    jamais, faute de position OCR).
+#
+# Trois configs de test recommandees :
+#   1. Normal              : DEBUG_ENABLE_OCR=True,  BYPASS=False
+#   2. Sans OCR du tout    : DEBUG_ENABLE_OCR=False, BYPASS=True
+#   3. OCR sans gate       : DEBUG_ENABLE_OCR=True,  BYPASS=True
+DEBUG_ENABLE_OCR             = True
+DEBUG_MASK_BYPASS_OCR_CHECK  = False
+
+
+def _compute_displayinfo_mask_rect(screen_w: int, screen_h: int) -> tuple[int, int, int, int]:
+    """Calcule (x, y, w, h) du rectangle masque DisplayInfo pour une
+    resolution d'ecran donnee, en pixels PHYSIQUES de cet ecran.
+
+    Methode : on scale la largeur a partir de la largeur ecran et la
+    hauteur a partir de la hauteur ecran (par rapport a la reference 4K).
+    Le rectangle est ensuite colle au bord droit en calculant
+    x = screen_w - largeur_calculee. Le y est scale proportionnellement
+    a la hauteur (= 0 puisque y_4k = 0).
+
+    Retourne 4 entiers : (x_left, y_top, width, height).
+    """
+    if screen_w <= 0 or screen_h <= 0:
+        return (0, 0, 0, 0)
+    ratio_w = screen_w / float(DISPLAYINFO_MASK_REF_SCREEN_W)
+    ratio_h = screen_h / float(DISPLAYINFO_MASK_REF_SCREEN_H)
+    w = int(round(DISPLAYINFO_MASK_REF_4K["width"]  * ratio_w))
+    h = int(round(DISPLAYINFO_MASK_REF_4K["height"] * ratio_h))
+    y = int(round(DISPLAYINFO_MASK_REF_4K["y"]      * ratio_h))
+    # Colle au bord droit : x = screen_w - w. Si w > screen_w (cas
+    # theorique improbable), on clamp a 0 pour eviter un x negatif.
+    x = max(0, screen_w - w)
+    return (x, y, w, h)
+
+
+# ----------------------------------------------------------------------
+# Machine d'etat clavier qui suit les ouvertures de mobiglass / menu
+# options dans Star Citizen, pour cacher le masque DisplayInfo quand
+# le HUD n'est plus visible derriere une de ces interfaces (v0.2 alpha 055).
+# ----------------------------------------------------------------------
+# Probleme resolu : avant cette classe, le masque ne se cachait que
+# lorsque l'OCR n'avait pas lu de position depuis 20s (DISPLAYINFO_MASK_STALE_S).
+# Quand le joueur ouvre la mobiglass ou le menu options, le HUD
+# DisplayInfo disparait, mais l'OCR continue parfois a "lire" via la
+# derniere position connue cote sc_ocr -> my_pos_ts reste recent -> le
+# masque continue de couvrir une zone vide, voire cache un bout de la
+# mobiglass ou du menu.
+#
+# Solution : detecter les touches F1/F2/F11 (mobiglass) et Echap (menu)
+# au niveau global via pynput. Tenir une petite machine d'etat (IDLE /
+# MOBIGLASS / MENU_OPTIONS) qui dit si le HUD est presumablement cache.
+# Resync sur changement de position OCR : si la position bouge, c'est
+# que le joueur a la main sur le perso -> mobiglass forcement fermee
+# -> on revient en IDLE (filet de securite contre desync, par ex. si
+# l'utilisateur ferme la mobiglass au clic souris).
+#
+# Regles de transition (cf. discussion utilisateur) :
+#   IDLE :
+#     - F1/F2/F11 -> MOBIGLASS (memorise la touche)
+#     - ECHAP     -> MENU_OPTIONS
+#   MOBIGLASS (touche ouvrante memorisee = K_open) :
+#     - touche == K_open  -> IDLE
+#     - F1 (specialement) -> IDLE (F1 ferme toujours la mobiglass meme
+#                            si ouverte par F2/F11)
+#     - F2/F11 autres     -> reste MOBIGLASS, K_open est remplacee
+#     - ECHAP             -> IDLE
+#     - position change   -> IDLE
+#   MENU_OPTIONS :
+#     - ECHAP             -> IDLE
+#     - position change   -> IDLE
+#
+# Touches en dur (F1/F2/F11/escape) pour cette premiere version.
+# Si SC remap les controles, on rendra ca configurable ulterieurement.
+class _DisplayInfoMaskKeyTracker:
+    """Listener pynput dedie au masque DisplayInfo. Suit les ouvertures de
+    mobiglass (F1/F2/F11) et menu options (Echap), met a jour
+    state.mask_force_hidden, et appelle un callback quand l'etat change
+    (pour rafraichir immediatement le masque sans attendre le timer 500ms).
+
+    Tourne en thread pynput (daemon). start()/stop() controlent le cycle
+    de vie. Les transitions d'etat sont protegees par un lock car le
+    listener pynput et le timer Qt peuvent y acceder en concurrence
+    (resync sur position).
+    """
+
+    STATE_IDLE         = "IDLE"
+    STATE_MOBIGLASS    = "MOBIGLASS"
+    STATE_MENU_OPTIONS = "MENU_OPTIONS"
+
+    # Touches surveillees. Format = sortie de _normalize_pynput_key.
+    KEYS_MOBIGLASS = ("f1", "f2", "f11")
+    KEY_ESCAPE     = "esc"
+    KEY_F1         = "f1"  # la touche speciale qui ferme toujours
+
+    def __init__(self, on_state_changed=None):
+        # Callback appele quand state.mask_force_hidden change. Le caller
+        # peut s'en servir pour declencher un refresh immediat du masque.
+        # Appele depuis le thread pynput : il doit etre thread-safe (en
+        # pratique on emet un signal Qt pour rebondir sur le thread main).
+        self._on_state_changed = on_state_changed
+        self._lock = threading.Lock()
+        self._state = self.STATE_IDLE
+        self._mobiglass_open_key: str | None = None  # touche qui a ouvert
+        self._kb_listener = None
+        # Derniere position observee pour la detection de changement.
+        # Initialise a None : on prend la premiere comme reference.
+        self._last_pos: tuple[float, float, float] | None = None
+        # Seuil de detection de changement de position (metres). Choisi
+        # par l'utilisateur : 0.1m absorbe le bruit OCR sans louper un
+        # vrai mouvement.
+        self._pos_threshold_m = 0.1
+
+    def start(self) -> None:
+        """Demarre le listener pynput dans un thread daemon."""
+        if self._kb_listener is not None:
+            return
+        try:
+            from pynput import keyboard as kb
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        f"[MASK KEYS] pynput indisponible : {e}"
+                    )
+                except Exception:
+                    pass
+            return
+
+        def _on_press(key):
+            try:
+                # Reutilise le normaliseur du core pour rester coherent
+                # avec les autres listeners (case-insensitive, gestion
+                # des touches speciales et numpad).
+                if _CORE_AVAILABLE:
+                    norm = _core._normalize_pynput_key(key)
+                else:
+                    # Fallback minimal si core absent : on prend juste
+                    # key.name s'il existe (suffit pour F1/F2/F11/esc).
+                    norm = getattr(key, "name", None)
+                    if norm:
+                        norm = norm.lower()
+                if not norm:
+                    return
+                self._handle_key(norm)
+            except Exception as e:
+                if _CORE_AVAILABLE:
+                    try:
+                        _core._dbg_log(
+                            f"[MASK KEYS] on_press exception : {e}"
+                        )
+                    except Exception:
+                        pass
+
+        try:
+            self._kb_listener = kb.Listener(on_press=_on_press)
+            self._kb_listener.daemon = True
+            self._kb_listener.start()
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        "[MASK KEYS] listener pynput demarre "
+                        "(F1/F2/F11/Esc)"
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            self._kb_listener = None
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        f"[MASK KEYS] start KO : {e}"
+                    )
+                except Exception:
+                    pass
+
+    def stop(self) -> None:
+        """Arrete le listener pynput (utile au shutdown du client)."""
+        if self._kb_listener is None:
+            return
+        try:
+            self._kb_listener.stop()
+        except Exception:
+            pass
+        self._kb_listener = None
+
+    def _handle_key(self, key: str) -> None:
+        """Applique les regles de la machine d'etat. Appele depuis le
+        thread pynput. Protege par le lock car la fonction
+        check_position_change() peut tourner en parallele depuis le
+        thread Qt."""
+        with self._lock:
+            old_force_hidden = (self._state != self.STATE_IDLE)
+            if self._state == self.STATE_IDLE:
+                if key in self.KEYS_MOBIGLASS:
+                    self._state = self.STATE_MOBIGLASS
+                    self._mobiglass_open_key = key
+                elif key == self.KEY_ESCAPE:
+                    self._state = self.STATE_MENU_OPTIONS
+                    self._mobiglass_open_key = None
+                else:
+                    return  # touche non surveillee
+            elif self._state == self.STATE_MOBIGLASS:
+                if key == self._mobiglass_open_key:
+                    # Re-appui sur la touche d'ouverture -> ferme
+                    self._state = self.STATE_IDLE
+                    self._mobiglass_open_key = None
+                elif key == self.KEY_F1:
+                    # F1 ferme toujours la mobiglass, meme si ouverte
+                    # par F2 ou F11 (regle utilisateur).
+                    self._state = self.STATE_IDLE
+                    self._mobiglass_open_key = None
+                elif key in self.KEYS_MOBIGLASS:
+                    # F2 ou F11 alors que la mobiglass est ouverte par
+                    # une autre touche : on remplace la touche memorisee
+                    # (le re-appui sur cette nouvelle touche fermera).
+                    self._mobiglass_open_key = key
+                elif key == self.KEY_ESCAPE:
+                    # Echap ferme la mobiglass
+                    self._state = self.STATE_IDLE
+                    self._mobiglass_open_key = None
+                else:
+                    return
+            elif self._state == self.STATE_MENU_OPTIONS:
+                if key == self.KEY_ESCAPE:
+                    self._state = self.STATE_IDLE
+                else:
+                    return
+            new_force_hidden = (self._state != self.STATE_IDLE)
+            changed = (new_force_hidden != old_force_hidden)
+            # Reset de la reference de position quand on entre dans un
+            # etat "cache" : la prochaine position lue sera la reference
+            # pour detecter un mouvement. Sinon on risquerait de resync
+            # immediatement avec une vieille position qui differe.
+            if new_force_hidden and not old_force_hidden:
+                self._last_pos = None
+
+        # Mettre a jour le flag global hors du lock (l'ecriture d'un bool
+        # est atomique en Python, pas besoin de synchroniser).
+        try:
+            state.mask_force_hidden = new_force_hidden
+        except Exception:
+            pass
+
+        if changed and self._on_state_changed is not None:
+            try:
+                self._on_state_changed()
+            except Exception:
+                pass
+
+        if _CORE_AVAILABLE:
+            try:
+                _core._dbg_log(
+                    f"[MASK KEYS] key={key} -> state={self._state} "
+                    f"open_key={self._mobiglass_open_key} "
+                    f"hidden={new_force_hidden}"
+                )
+            except Exception:
+                pass
+
+    def check_position_change(self, pos: dict | None) -> None:
+        """Verifie si la position OCR a change depuis le dernier appel.
+        Si oui ET qu'on est en MOBIGLASS ou MENU_OPTIONS, on resync en
+        IDLE (le joueur a forcement la main sur son perso pour qu'il
+        bouge). Appele depuis le timer Qt main thread du masque.
+
+        pos peut etre None (pas encore de position OCR) : dans ce cas
+        on ne fait rien."""
+        if not isinstance(pos, dict):
+            return
+        try:
+            x = float(pos.get("x", 0.0))
+            y = float(pos.get("y", 0.0))
+            z = float(pos.get("z", 0.0))
+        except Exception:
+            return
+        resync = False
+        moved_distance = 0.0  # rempli si resync, pour le log
+        with self._lock:
+            if self._state == self.STATE_IDLE:
+                # En IDLE on ne fait rien (le masque n'est pas force cache),
+                # mais on garde la position courante comme reference pour
+                # plus tard.
+                self._last_pos = (x, y, z)
+                return
+            if self._last_pos is None:
+                # Premiere position observee depuis l'entree dans l'etat
+                # cache : on l'enregistre comme reference, sans resync.
+                self._last_pos = (x, y, z)
+                return
+            dx = x - self._last_pos[0]
+            dy = y - self._last_pos[1]
+            dz = z - self._last_pos[2]
+            # Distance euclidienne. On compare au seuil au carre pour
+            # eviter le sqrt (gain marginal mais cout 0).
+            dist_sq = dx*dx + dy*dy + dz*dz
+            thr_sq = self._pos_threshold_m * self._pos_threshold_m
+            if dist_sq < thr_sq:
+                # Pas de mouvement significatif, on garde l'etat.
+                # La reference n'est PAS mise a jour : sinon un drift
+                # lent (un pas par cycle, en dessous du seuil) finirait
+                # par cumuler sans jamais resync.
+                return
+            # Mouvement detecte -> resync forcee en IDLE.
+            self._state = self.STATE_IDLE
+            self._mobiglass_open_key = None
+            self._last_pos = (x, y, z)
+            resync = True
+            moved_distance = dist_sq ** 0.5
+
+        if resync:
+            try:
+                state.mask_force_hidden = False
+            except Exception:
+                pass
+            # NOTE : on N'APPELLE PAS self._on_state_changed() ici.
+            # check_position_change est appelee depuis le thread Qt main
+            # (depuis _update_displayinfo_mask). Le callback est connecte
+            # au signal _sig_mask_state_changed qui en AutoConnection
+            # depuis le main thread vers un slot main thread devient une
+            # DirectConnection -> appel SYNCHRONE recursif vers
+            # _update_displayinfo_mask, qui voit alors une etape
+            # intermediaire de son propre etat (race) et peut creer 2
+            # instances de la fenetre masque (-> conflit bettercam DXGI
+            # observe en alpha 055, log "bettercam grab KO" en boucle).
+            # Le caller relit state.mask_force_hidden apres notre appel,
+            # ce qui suffit pour reagir au resync sans recursion.
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        "[MASK KEYS] position change detected "
+                        f"(d={moved_distance:.2f}m > {self._pos_threshold_m}m) "
+                        "-> resync IDLE"
+                    )
+                except Exception:
+                    pass
+
+
+class _DisplayInfoMaskWorker(QObject):
+    """Worker thread qui capture la zone DisplayInfo via MSS, detecte les
+    pixels du texte HUD, calcule un remplacement par la couleur du decor
+    moyen autour, et emit le resultat sous forme d'un QImage RGBA pret a
+    afficher.
+
+    Le QImage retourne fait la taille de la zone du masque (en pixels
+    PHYSIQUES de l'ecran cible). Les pixels alpha=0 sont totalement
+    transparents (laissent passer le jeu), les pixels alpha>0 sont la
+    couleur du decor moyen (qui remplace visuellement le texte detecte).
+
+    Signal :
+        sig_image_ready(QImage) : nouveau masque pret a redessiner.
+
+    Slot :
+        request_stop() : demande l'arret propre de la boucle.
+
+    La capture mss est creee dans ce thread (thread-local, mss n'est pas
+    partageable entre threads). Le traitement numpy + cv2 est aussi fait
+    ici, donc le thread Qt n'est pas bloque.
+    """
+
+    sig_image_ready = Signal(object)  # QImage, mais object pour souplesse
+
+    def __init__(self, owner_window=None):
+        super().__init__()
+        # Cible : (left, top, width, height) en pixels physiques. Mis a
+        # jour par set_region() depuis le thread Qt principal. None tant
+        # que la geometrie n'a pas ete calculee (= avant le premier show).
+        self._region: dict | None = None
+        # Flag d'arret coopératif (lu par la boucle a chaque iteration).
+        self._stop = False
+        # Lock pour la lecture/ecriture de _region depuis le thread Qt
+        # (set_region) et le thread worker (run).
+        import threading as _th
+        self._lock = _th.Lock()
+        # owner_window : reserve pour un usage futur (hide/show de la
+        # fenetre owner pendant les captures du worker, anti-larsen).
+        # Actuellement non utilise apres simplification alpha 012 :
+        # les slots _slot_hide_for_worker / _slot_show_after_worker
+        # n'existent pas dans la fenetre, donc les appels invokeMethod
+        # echouaient et laissaient parfois la fenetre cachee (bug
+        # observe alpha 011 : frame entiere sans masque).
+        self._owner = owner_window
+
+        # DEBUG alpha 017 : compteur de cycle public, lu depuis l'UI pour
+        # correler avec les marques utilisateur "[USER MARK] texte
+        # visible". Incremente a chaque capture reussie.
+        self.cycle_n = 0
+        self.last_n_pixels = 0
+        self.last_brightness_mean = 0.0
+
+        # v0.2 alpha 027 : periode du worker modifiable a chaud (via
+        # set_period) pour permettre a l'UI de changer la frequence
+        # (5/10/20/30/60 FPS) sans recreer le worker.
+        # Initialisee a la valeur constante par defaut, sera ecrasee
+        # par set_period si l'UI l'appelle apres l'init.
+        self._period_s = max(0.005, float(DISPLAYINFO_SMART_PERIOD_MS) / 1000.0)
+
+    @Slot(float)
+    def set_period(self, period_s: float):
+        """Change la periode du worker a chaud. Thread-safe (atomique
+        Python sur l'attribut). Effet immediat sur le prochain cycle."""
+        try:
+            p = float(period_s)
+            if p < 0.005:
+                p = 0.005
+            self._period_s = p
+        except (TypeError, ValueError):
+            pass
+
+    @Slot(int, int, int, int)
+    def set_region(self, left: int, top: int, width: int, height: int):
+        """Met a jour la region a capturer. Thread-safe (lock)."""
+        with self._lock:
+            if width <= 0 or height <= 0:
+                self._region = None
+            else:
+                self._region = {
+                    "left":   int(left),
+                    "top":    int(top),
+                    "width":  int(width),
+                    "height": int(height),
+                }
+
+    @Slot()
+    def request_stop(self):
+        """Demande l'arret de la boucle. Non-bloquant."""
+        self._stop = True
+
+    @Slot()
+    def run(self):
+        """Boucle principale du worker. Tourne dans le thread du QThread.
+        Capture + traite + emit en continu jusqu'a request_stop."""
+        # Imports lazy : pas la peine de charger numpy/cv2/mss au boot du
+        # client si l'utilisateur n'active jamais le masque smart.
+        try:
+            import mss as _mss
+            import numpy as _np
+            import cv2 as _cv2
+            import time as _time
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        f"[MASK SMART] Imports KO (mss/numpy/cv2) : {e}"
+                    )
+                except Exception:
+                    pass
+            return
+
+        # v0.2 alpha 042 : tentative d'utiliser bettercam (Desktop
+        # Duplication API DirectX) pour la capture, beaucoup plus rapide
+        # que MSS (1-3ms vs 17ms sur la meme zone). Si bettercam n'est
+        # pas installe ou plante au demarrage, on fallback sur MSS.
+        # bettercam.create() peut prendre 500ms-1s au 1er appel (init
+        # COM + duplication API), on le fait au demarrage du worker.
+        _bettercam_cam = None
+        try:
+            import bettercam as _bettercam
+            # output_color="BGR" pour eviter une conversion supplementaire
+            # (notre pipeline travaille en BGR comme MSS).
+            # output_idx selon l'ecran cible : ici on prend l'output qui
+            # contient la zone de capture. Par defaut output 0 (ecran
+            # principal). Si zone est sur un 2e ecran, peut etre ajuste
+            # plus tard.
+            _bettercam_cam = _bettercam.create(output_idx=0, output_color="BGR")
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        "[MASK SMART] bettercam OK (Desktop Duplication API). "
+                        "Capture rapide active."
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            _bettercam_cam = None
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        f"[MASK SMART] bettercam indisponible ({e}), "
+                        f"fallback MSS."
+                    )
+                except Exception:
+                    pass
+
+        # Cache du dernier frame valide : bettercam.grab() peut retourner
+        # None si le contenu n'a pas change depuis le dernier appel.
+        # Dans ce cas on reutilise le dernier bgr connu pour eviter de
+        # rater un cycle complet (sinon on perd du temps).
+        _last_bgr = None
+
+        # v0.2 alpha 056 : throttle des logs "bettercam grab KO". En cas
+        # d'erreur persistante (DXGI invalide, etc.), on logue la 1ere
+        # erreur immediatement puis on agrege le compteur d'erreurs et
+        # on re-logue toutes les 30s avec le total accumule. Reset au
+        # premier grab reussi (suivant). Evite de saturer le fichier
+        # de debug avec des centaines de lignes identiques.
+        _grab_err_count   = 0      # nb d'erreurs depuis le dernier log
+        _grab_err_last_t  = 0.0    # monotonic du dernier log emis
+        _grab_err_last_e  = None   # derniere exception (pour replay)
+        _GRAB_ERR_LOG_PERIOD_S = 30.0
+
+        # Constantes lues une fois pour eviter les accesses globaux dans
+        # la boucle chaude.
+        BRIGHT_DIFF = int(DISPLAYINFO_TEXT_BRIGHT_DIFF)
+        WINDOW_PX   = max(3, int(DISPLAYINFO_TEXT_WINDOW_PX))
+        # WINDOW_PX doit etre impair pour cv2.boxFilter (kernel centre).
+        if WINDOW_PX % 2 == 0:
+            WINDOW_PX += 1
+        DILATE_PX  = max(0, int(DISPLAYINFO_TEXT_DILATE_PX))
+        DECOR_R    = max(1, int(DISPLAYINFO_DECOR_RADIUS_PX))
+        MAX_BLOB_PX = max(1, int(DISPLAYINFO_TEXT_MAX_BLOB_PX))
+        # v0.2 alpha 027 : self._period_s supprime comme constante locale.
+        # On lit maintenant self._period_s a chaque cycle (modifiable a
+        # chaud via worker.set_period() depuis l'UI).
+        HIST_FRAMES = max(1, int(DISPLAYINFO_TEXT_HISTORY_FRAMES))
+
+        # Historique temporel des masques is_text (apres dilate). Le masque
+        # affiche = OR logique des HIST_FRAMES derniers : un pixel reste
+        # masque tant qu'il a ete detecte au moins une fois dans la fenetre
+        # glissante. Anti-clignotement quand le texte change a chaque frame
+        # (FPS, coords, timers qui defilent).
+        # On stocke les masques sous forme de uint8 0/1 (pas bool) pour les
+        # additionner facilement via np.bitwise_or sans cast intermediaire.
+        # collections.deque(maxlen=N) gere automatiquement l'eviction des
+        # plus vieux masques.
+        from collections import deque as _deque
+        history = _deque(maxlen=HIST_FRAMES)
+        history_size = (0, 0)  # (h, w) des masques en historique
+
+        # Pre-construire le kernel de dilatation une fois.
+        if DILATE_PX > 0:
+            ks = 2 * DILATE_PX + 1
+            dilate_kernel = _np.ones((ks, ks), dtype=_np.uint8)
+        else:
+            dilate_kernel = None
+
+        # Kernel size de la boxFilter pour la moyenne decor
+        decor_ksize = (2 * DECOR_R + 1, 2 * DECOR_R + 1)
+
+        try:
+            with _mss.mss() as sct:
+                while not self._stop:
+                    t0 = _time.monotonic()
+                    # Snapshot region (lock court)
+                    with self._lock:
+                        region = self._region.copy() if self._region else None
+                    if region is None:
+                        _time.sleep(self._period_s)
+                        continue
+
+                    # v0.2 alpha 022 : plus besoin de hide/show le owner
+                    # avant le grab. La fenetre est maintenant opaque
+                    # (sans WA_TranslucentBackground) et compatible avec
+                    # SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE).
+                    # Donc MSS voit l'image SC pure (sans le masque).
+                    grab_ok = False
+                    # v0.2 alpha 042 : si bettercam est dispo, on l'utilise
+                    # en priorite (1-3ms vs 17ms MSS). Sinon fallback MSS.
+                    if _bettercam_cam is not None:
+                        try:
+                            # bettercam.grab() prend un tuple (left, top, right, bottom).
+                            # MSS prenait (left, top, width, height) en dict.
+                            bc_region = (
+                                int(region["left"]),
+                                int(region["top"]),
+                                int(region["left"]) + int(region["width"]),
+                                int(region["top"]) + int(region["height"]),
+                            )
+                            bc_frame = _bettercam_cam.grab(region=bc_region)
+                            if bc_frame is not None:
+                                # v0.2 alpha 051 : detecter et rejeter les
+                                # frames anormalement noires retournees par
+                                # bettercam. Symptome rapporte : clignotement
+                                # noir en immobilite. Cause probable : DXGI
+                                # peut renvoyer un frame transitoire entre
+                                # 2 etats du compositor (changement de focus,
+                                # overlay system, etc.). Le frame est noir
+                                # alors que l'image SC ne l'est pas.
+                                #
+                                # Detection : on prend l'echantillon d'un
+                                # coin (8x8 px, ultra rapide) et on regarde
+                                # la moyenne. Si < 5 (= quasi noir total)
+                                # ET qu'on a deja un _last_bgr valide, on
+                                # rejette ce frame comme suspect.
+                                #
+                                # On ne calcule pas .mean() sur tout le
+                                # frame (couteux), juste un sample 8x8.
+                                try:
+                                    sample = bc_frame[:8, :8].mean()
+                                except Exception:
+                                    sample = 255.0  # par defaut, accepter
+                                if sample < 5.0 and _last_bgr is not None:
+                                    # Frame suspect, on garde l'ancien.
+                                    bgr = _last_bgr
+                                    grab_ok = True
+                                else:
+                                    # Frame neuve OK : on l'utilise et on cache.
+                                    # .copy() (alpha 050) pour ne PAS partager
+                                    # le buffer interne de bettercam.
+                                    bgr = bc_frame.copy()
+                                    _last_bgr = bgr
+                                    grab_ok = True
+                            elif _last_bgr is not None:
+                                # bettercam dit "pas de mise a jour" :
+                                # on reutilise le dernier frame valide
+                                # (deja copie a la frame precedente).
+                                bgr = _last_bgr
+                                grab_ok = True
+                            else:
+                                # Aucun frame jamais recu : sleep et retente.
+                                _time.sleep(self._period_s)
+                                continue
+                        except Exception as e:
+                            # v0.2 alpha 056 : throttle pour eviter le spam
+                            # (cf. variables initialisees en haut de run()).
+                            # 1ere erreur : log immediat.
+                            # Erreurs suivantes : comptees silencieusement,
+                            # 1 log toutes les 30s avec le total cumule
+                            # depuis le debut de la rafale.
+                            # Reset complet : uniquement sur un grab reussi
+                            # (cf. branche else: ci-dessous).
+                            _grab_err_count += 1
+                            _grab_err_last_e = e
+                            _now = _time.monotonic()
+                            _should_log = False
+                            if _grab_err_count == 1:
+                                # 1ere erreur de la rafale.
+                                _should_log = True
+                            elif _now - _grab_err_last_t >= _GRAB_ERR_LOG_PERIOD_S:
+                                # Rafale persistante depuis >=30s : recap.
+                                _should_log = True
+                            if _should_log and _CORE_AVAILABLE:
+                                try:
+                                    if _grab_err_count > 1:
+                                        _core._dbg_log(
+                                            f"[MASK SMART] bettercam grab KO "
+                                            f"(x{_grab_err_count} depuis le debut "
+                                            f"de la rafale) : {e}, "
+                                            f"fallback MSS pour ce cycle."
+                                        )
+                                    else:
+                                        _core._dbg_log(
+                                            f"[MASK SMART] bettercam grab KO : "
+                                            f"{e}, fallback MSS pour ce cycle."
+                                        )
+                                except Exception:
+                                    pass
+                            if _should_log:
+                                # Marqueur du dernier log : la prochaine
+                                # log ne se redeclenchera qu'apres 30s.
+                                _grab_err_last_t = _now
+                            # Fallback MSS pour ce cycle (on retry bettercam
+                            # au prochain cycle, peut-etre que c'etait
+                            # transitoire).
+                        else:
+                            # v0.2 alpha 056 : pas d'exception levee = grab
+                            # bettercam reussi. Si on avait des erreurs
+                            # accumulees, on log un "recovery" puis on reset.
+                            if _grab_err_count > 0:
+                                if _CORE_AVAILABLE:
+                                    try:
+                                        _core._dbg_log(
+                                            f"[MASK SMART] bettercam grab OK "
+                                            f"apres {_grab_err_count} erreur(s) "
+                                            f"(derniere : {_grab_err_last_e})"
+                                        )
+                                    except Exception:
+                                        pass
+                                _grab_err_count  = 0
+                                _grab_err_last_t = 0.0
+                                _grab_err_last_e = None
+                    if not grab_ok:
+                        # MSS classique (soit pas de bettercam, soit fallback).
+                        try:
+                            raw = sct.grab(region)
+                            # mss BGRA -> numpy BGR
+                            img = _np.frombuffer(
+                                raw.bgra, dtype=_np.uint8
+                            ).reshape(raw.height, raw.width, 4)
+                            # On garde BGR (drop alpha).
+                            bgr = img[:, :, :3]
+                            grab_ok = True
+                        except Exception as e:
+                            if _CORE_AVAILABLE:
+                                try:
+                                    _core._dbg_log(
+                                        f"[MASK SMART] grab MSS KO : {e}"
+                                    )
+                                except Exception:
+                                    pass
+                    if not grab_ok:
+                        _time.sleep(self._period_s)
+                        continue
+                    t_grab = _time.monotonic()
+
+                    h_img, w_img = bgr.shape[:2]
+                    # Detection adaptative : un pixel est "texte" si sa
+                    # luminosite depasse la moyenne locale de BRIGHT_DIFF.
+                    # bgr indices : 0=B, 1=G, 2=R
+                    # On calcule la luminosite par pixel (moyenne R+G+B),
+                    # puis la moyenne locale via cv2.boxFilter (rapide).
+                    # Travail en float32 pour eviter l'overflow uint8.
+                    bgr_f = bgr.astype(_np.float32)
+                    brightness = (
+                        bgr_f[:, :, 0] + bgr_f[:, :, 1] + bgr_f[:, :, 2]
+                    ) / 3.0
+                    # Moyenne locale dans fenetre WINDOW_PX x WINDOW_PX.
+                    # BORDER_REPLICATE pour eviter les artefacts de bord
+                    # (sinon la moyenne sur les bords serait biaisee).
+                    local_mean = _cv2.boxFilter(
+                        brightness, -1, (WINDOW_PX, WINDOW_PX),
+                        normalize=True,
+                        borderType=_cv2.BORDER_REPLICATE,
+                    )
+                    is_text = (brightness >= (local_mean + BRIGHT_DIFF))
+                    t_detect = _time.monotonic()
+
+                    # v0.2 alpha 038 : filtrage par taille de cluster.
+                    # Un caractere du HUD a cette resolution fait
+                    # typiquement quelques dizaines de pixels une fois
+                    # detecte. Une zone lumineuse du JEU (lampe, voyant,
+                    # blob lumineux) fait souvent beaucoup plus.
+                    # cv2.connectedComponentsWithStats etiquette chaque
+                    # cluster et donne sa taille. On garde uniquement
+                    # les clusters dont la taille <= MAX_BLOB_PX.
+                    # Connexite 8 (diagonales incluses) pour bien
+                    # rassembler les caracteres et les blobs.
+                    is_text_u8_pre = is_text.astype(_np.uint8)
+                    n_labels, labels, stats, _centroids = _cv2.connectedComponentsWithStats(
+                        is_text_u8_pre, connectivity=8
+                    )
+                    # stats[i] = [x, y, w, h, area]. Label 0 = fond, on
+                    # l'ignore. On construit un masque qui ne garde que
+                    # les labels dont l'area <= seuil.
+                    if n_labels > 1:
+                        # Tableau bool indexe par label : True si on garde
+                        # le cluster, False sinon.
+                        keep = _np.zeros(n_labels, dtype=bool)
+                        # cv2.CC_STAT_AREA = 4
+                        areas = stats[:, 4]
+                        keep[1:] = areas[1:] <= MAX_BLOB_PX
+                        # On reconstruit is_text en gardant uniquement
+                        # les pixels appartenant a un label conserve.
+                        is_text = keep[labels]
+                    # Sinon (n_labels == 1, donc que du fond), is_text
+                    # est deja entierement False, rien a filtrer.
+                    t_blob = _time.monotonic()
+
+                    n_pixels = int(is_text.sum())
+                    brightness_mean = float(brightness.mean())
+                    self.cycle_n += 1
+                    self.last_n_pixels = n_pixels
+                    self.last_brightness_mean = brightness_mean
+                    # v0.2 alpha 027 : log aggrege 1x/sec au lieu de
+                    # 1x/cycle (sinon a 60 FPS ca spamme 60 lignes/sec).
+                    # On accumule min/max/avg et on flush toutes les
+                    # ~1 sec.
+                    if not hasattr(self, "_log_acc"):
+                        self._log_acc = {
+                            "t_start":  _time.monotonic(),
+                            "frames":   0,
+                            "px_min":   None,
+                            "px_max":   0,
+                            "px_sum":   0,
+                            "bm_sum":   0.0,
+                        }
+                    acc = self._log_acc
+                    acc["frames"] += 1
+                    if acc["px_min"] is None or n_pixels < acc["px_min"]:
+                        acc["px_min"] = n_pixels
+                    if n_pixels > acc["px_max"]:
+                        acc["px_max"] = n_pixels
+                    acc["px_sum"] += n_pixels
+                    acc["bm_sum"] += brightness_mean
+                    # v0.2 alpha 056 : log periodique passe de 1s a 30s
+                    # (sur demande utilisateur) pour reduire le bruit dans
+                    # le fichier de debug. Les agregats min/max/avg restent
+                    # representatifs sur 30s.
+                    if _time.monotonic() - acc["t_start"] >= 30.0:
+                        if _CORE_AVAILABLE:
+                            try:
+                                avg_px = acc["px_sum"] / max(1, acc["frames"])
+                                avg_bm = acc["bm_sum"] / max(1, acc["frames"])
+                                _core._dbg_log(
+                                    f"[MASK SMART 30s] frames={acc['frames']} "
+                                    f"px_min={acc['px_min']} max={acc['px_max']} "
+                                    f"avg={avg_px:.0f} "
+                                    f"bright_avg={avg_bm:.1f}"
+                                )
+                            except Exception:
+                                pass
+                        self._log_acc = {
+                            "t_start":  _time.monotonic(),
+                            "frames":   0,
+                            "px_min":   None,
+                            "px_max":   0,
+                            "px_sum":   0,
+                            "bm_sum":   0.0,
+                        }
+
+                    # Dilate : etend le masque d'un pixel autour pour
+                    # capturer les bords antialiasees des caracteres.
+                    if dilate_kernel is not None:
+                        is_text_u8 = is_text.astype(_np.uint8)
+                        is_text_u8 = _cv2.dilate(is_text_u8, dilate_kernel)
+                    else:
+                        is_text_u8 = is_text.astype(_np.uint8)
+
+                    # Stabilisation temporelle : on combine les HIST_FRAMES
+                    # derniers masques via OR logique. Si la taille de l'image
+                    # a change (changement de resolution ou d'ecran), on reset
+                    # l'historique pour eviter un mismatch numpy.
+                    cur_size = (h_img, w_img)
+                    if cur_size != history_size:
+                        history.clear()
+                        history_size = cur_size
+                    history.append(is_text_u8)
+                    if len(history) == 1:
+                        # Premier frame de l'historique : pas besoin de stack.
+                        is_text_combined_u8 = is_text_u8
+                    else:
+                        # OR via reduce sur la deque. np.bitwise_or.reduce
+                        # est efficace et evite un stack intermediaire.
+                        is_text_combined_u8 = _np.bitwise_or.reduce(
+                            _np.stack(history, axis=0), axis=0
+                        )
+                    is_text = is_text_combined_u8.astype(bool)
+                    t_hist = _time.monotonic()
+
+                    # Si aucun pixel detecte : ON N'EMET PAS un QImage
+                    # transparent (sinon la fenetre devient invisible et
+                    # le DisplayInfo SC se montre a nu pendant cette
+                    # frame -> "frame qui ne cache rien" rapporte par
+                    # l'utilisateur). On garde plutot le dernier masque
+                    # affiche (le paintEvent dessine self._mask_pixmap
+                    # tant qu'il existe). Quand un nouveau cycle aura
+                    # detecte du texte, le masque sera mis a jour.
+                    # Pas de pixels detectes : on emet quand meme un QImage
+                    # opaque = image SC pure (sans transformation). v0.2
+                    # alpha 022 : la fenetre est maintenant opaque, donc
+                    # il faut TOUJOURS lui donner un contenu a afficher,
+                    # sinon elle resterait noire ou montrerait l'ancien
+                    # masque (perimee). Image SC = on copie bgr -> rgba
+                    # avec alpha = 255.
+                    if not is_text.any():
+                        if _CORE_AVAILABLE:
+                            try:
+                                _core._dbg_log(
+                                    f"[MASK SMART] cycle {self.cycle_n} : "
+                                    f"aucun pixel texte detecte - on affiche "
+                                    f"l'image SC telle quelle"
+                                )
+                            except Exception:
+                                pass
+                        # Construire QImage opaque = image SC pure
+                        rgba = _np.empty((h_img, w_img, 4), dtype=_np.uint8)
+                        rgba[..., 0] = bgr[..., 2]
+                        rgba[..., 1] = bgr[..., 1]
+                        rgba[..., 2] = bgr[..., 0]
+                        rgba[..., 3] = 255
+                        qimg = _qimage_from_rgba(rgba)
+                        try:
+                            self.sig_image_ready.emit(qimg)
+                        except Exception:
+                            pass
+                        elapsed = _time.monotonic() - t0
+                        if elapsed < self._period_s:
+                            _time.sleep(self._period_s - elapsed)
+                        continue
+
+                    # Couleur du decor moyen autour de chaque pixel.
+                    # v0.2 alpha 046 : revert downscale 4x -> 2x. Le
+                    # downscale 4x faisait apparaitre des bandes noires
+                    # quand la hauteur du masque etait reduite (kernel
+                    # boxFilter de 3x3 en quart de res devenait trop
+                    # petit pour couvrir le voisinage decor reel).
+                    # v0.2 alpha 044 : multiply en basse res (gain garde).
+                    # Le decor est lisse, donc 2x suffit pour la qualite
+                    # visuelle.
+                    h_lo = (h_img + 1) // 2
+                    w_lo = (w_img + 1) // 2
+                    # Downscale bgr_f -> demi res.
+                    bgr_f_lo = _cv2.resize(
+                        bgr_f, (w_lo, h_lo),
+                        interpolation=_cv2.INTER_AREA,
+                    )
+                    # Downscale not_text -> demi res.
+                    not_text_u8 = (1 - is_text.astype(_np.uint8))
+                    not_text_lo = _cv2.resize(
+                        not_text_u8.astype(_np.float32),
+                        (w_lo, h_lo),
+                        interpolation=_cv2.INTER_AREA,
+                    )
+                    # Multiply en demi res (gain alpha 044 preserve :
+                    # on ne multiplie plus 650k px en full res).
+                    bgr_zeroed_lo = bgr_f_lo * not_text_lo[..., None]
+                    # Kernel boxFilter
+                    decor_r_lo = max(1, DECOR_R // 2)
+                    decor_ksize_lo = (2 * decor_r_lo + 1, 2 * decor_r_lo + 1)
+                    decor_sum_lo = _cv2.boxFilter(
+                        bgr_zeroed_lo, -1, decor_ksize_lo,
+                        normalize=False, borderType=_cv2.BORDER_REPLICATE,
+                    )
+                    weight_sum_lo = _cv2.boxFilter(
+                        not_text_lo, -1, decor_ksize_lo,
+                        normalize=False, borderType=_cv2.BORDER_REPLICATE,
+                    )
+                    # Division safe (cf. commentaire bas) en demi res.
+                    weight_safe_lo = _np.maximum(weight_sum_lo, 1.0)
+                    decor_mean_lo = decor_sum_lo / weight_safe_lo[..., None]
+                    no_decor_lo = (weight_sum_lo == 0)
+                    if no_decor_lo.any():
+                        decor_mean_lo[no_decor_lo] = 0.0
+                    # Upscale a la taille originale.
+                    decor_mean = _cv2.resize(
+                        decor_mean_lo, (w_img, h_img),
+                        interpolation=_cv2.INTER_LINEAR,
+                    )
+                    decor_mean = _np.clip(decor_mean, 0, 255).astype(_np.uint8)
+                    t_decor = _time.monotonic()
+
+                    # Construction du QImage final OPAQUE (v0.2 alpha 022) :
+                    # On REJOUE l'image SC capturee, avec les pixels texte
+                    # remplaces par leur decor moyen. Alpha = 255 partout
+                    # (la fenetre est opaque depuis l'alpha 022 pour que
+                    # SetWindowDisplayAffinity fonctionne).
+                    #   - Pixels texte    : RGBA = (decor_mean R, G, B, 255)
+                    #   - Pixels non-texte: RGBA = (sc_pixel R, G, B, 255)
+                    # En BGR du grab mss, indices : 0=B 1=G 2=R.
+                    # En RGBA pour QImage Format_RGBA8888, on swap.
+                    rgba = _np.empty((h_img, w_img, 4), dtype=_np.uint8)
+                    # Par defaut : copier l'image SC capturee (bgr -> rgb).
+                    rgba[..., 0] = bgr[..., 2]  # R = bgr.R
+                    rgba[..., 1] = bgr[..., 1]  # G = bgr.G
+                    rgba[..., 2] = bgr[..., 0]  # B = bgr.B
+                    rgba[..., 3] = 255          # alpha plein partout
+                    # Remplacer les pixels texte par la couleur du decor
+                    # moyen (calculee plus haut, en BGR -> swap RGB).
+                    if is_text.any():
+                        rgb_decor = decor_mean[..., ::-1]  # B,G,R -> R,G,B
+                        rgba[..., 0][is_text] = rgb_decor[..., 0][is_text]
+                        rgba[..., 1][is_text] = rgb_decor[..., 1][is_text]
+                        rgba[..., 2][is_text] = rgb_decor[..., 2][is_text]
+                        # alpha reste a 255
+
+                    qimg = _qimage_from_rgba(rgba)
+                    try:
+                        self.sig_image_ready.emit(qimg)
+                    except Exception:
+                        pass
+                    t_emit = _time.monotonic()
+
+                    # v0.2 alpha 040 : log des durees par etape pour
+                    # identifier le goulot du pipeline. Aggrege 1x/sec.
+                    if not hasattr(self, "_perf_acc"):
+                        self._perf_acc = {
+                            "t_start": _time.monotonic(),
+                            "frames":  0,
+                            "grab":    0.0,
+                            "detect":  0.0,
+                            "blob":    0.0,
+                            "hist":    0.0,
+                            "decor":   0.0,
+                            "emit":    0.0,
+                            "total":   0.0,
+                            "grab_max":   0.0,
+                            "detect_max": 0.0,
+                            "blob_max":   0.0,
+                            "hist_max":   0.0,
+                            "decor_max":  0.0,
+                            "emit_max":   0.0,
+                        }
+                    pa = self._perf_acc
+                    pa["frames"] += 1
+                    d_grab   = t_grab   - t0
+                    d_detect = t_detect - t_grab
+                    d_blob   = t_blob   - t_detect
+                    d_hist   = t_hist   - t_blob
+                    d_decor  = t_decor  - t_hist
+                    d_emit   = t_emit   - t_decor
+                    d_total  = t_emit   - t0
+                    pa["grab"]   += d_grab
+                    pa["detect"] += d_detect
+                    pa["blob"]   += d_blob
+                    pa["hist"]   += d_hist
+                    pa["decor"]  += d_decor
+                    pa["emit"]   += d_emit
+                    pa["total"]  += d_total
+                    if d_grab   > pa["grab_max"]:   pa["grab_max"]   = d_grab
+                    if d_detect > pa["detect_max"]: pa["detect_max"] = d_detect
+                    if d_blob   > pa["blob_max"]:   pa["blob_max"]   = d_blob
+                    if d_hist   > pa["hist_max"]:   pa["hist_max"]   = d_hist
+                    if d_decor  > pa["decor_max"]:  pa["decor_max"]  = d_decor
+                    if d_emit   > pa["emit_max"]:   pa["emit_max"]   = d_emit
+                    # v0.2 alpha 056 : log periodique passe de 1s a 30s
+                    # (sur demande utilisateur). Les agregats avg/max
+                    # restent representatifs sur 30s.
+                    if _time.monotonic() - pa["t_start"] >= 30.0:
+                        if _CORE_AVAILABLE:
+                            try:
+                                n = max(1, pa["frames"])
+                                _core._dbg_log(
+                                    f"[MASK PERF 30s] frames={n} "
+                                    f"total_avg={1000*pa['total']/n:.1f}ms "
+                                    f"grab={1000*pa['grab']/n:.1f}/{1000*pa['grab_max']:.1f} "
+                                    f"detect={1000*pa['detect']/n:.1f}/{1000*pa['detect_max']:.1f} "
+                                    f"blob={1000*pa['blob']/n:.1f}/{1000*pa['blob_max']:.1f} "
+                                    f"hist={1000*pa['hist']/n:.1f}/{1000*pa['hist_max']:.1f} "
+                                    f"decor={1000*pa['decor']/n:.1f}/{1000*pa['decor_max']:.1f} "
+                                    f"emit={1000*pa['emit']/n:.1f}/{1000*pa['emit_max']:.1f} "
+                                    f"(avg/max ms)"
+                                )
+                            except Exception:
+                                pass
+                        self._perf_acc = {
+                            "t_start": _time.monotonic(),
+                            "frames":  0,
+                            "grab":    0.0, "detect": 0.0, "blob": 0.0,
+                            "hist":    0.0, "decor":  0.0, "emit": 0.0,
+                            "total":   0.0,
+                            "grab_max":   0.0, "detect_max": 0.0,
+                            "blob_max":   0.0, "hist_max":   0.0,
+                            "decor_max":  0.0, "emit_max":   0.0,
+                        }
+
+                    elapsed = _time.monotonic() - t0
+                    if elapsed < self._period_s:
+                        _time.sleep(self._period_s - elapsed)
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        f"[MASK SMART] worker run KO : {e}"
+                    )
+                except Exception:
+                    pass
+        finally:
+            # v0.2 alpha 042 : liberer bettercam proprement. Sinon
+            # l'objet COM persiste et peut empecher une nouvelle creation
+            # ou bloquer la sortie propre du process.
+            if _bettercam_cam is not None:
+                try:
+                    _bettercam_cam.release()
+                except Exception:
+                    pass
+
+
+def _qimage_from_rgba(rgba_array):
+    """Construit un QImage RGBA8888 depuis un numpy array de shape (H,W,4)
+    et dtype uint8. Le QImage est en COPIE des donnees (sinon il garde
+    juste un pointeur vers le buffer numpy qui peut etre libere apres)."""
+    h, w = rgba_array.shape[:2]
+    # bytesPerLine = stride. Pour un array C-contiguous (4 canaux uint8) :
+    bpl = w * 4
+    # PySide6 : passer .tobytes() est plus sur que le pointeur direct
+    # car le QImage prend ownership du buffer.
+    raw = rgba_array.tobytes()
+    qimg = QImage(raw, w, h, bpl, QImage.Format_RGBA8888)
+    # .copy() pour que QImage ne reference pas le buffer Python local
+    # (sinon corruption quand 'raw' sort de scope).
+    return qimg.copy()
+
+
+# ======================================================================
+# Service partage du worker de capture du masque DisplayInfo
+# (v0.2 alpha 060)
+# ======================================================================
+# Encapsule le QThread + _DisplayInfoMaskWorker, et expose un compteur
+# d'attache : les consommateurs (DisplayInfoMaskWindow, DisplayInfoMaskWindowOBS)
+# appellent attach() pour s'abonner au signal sig_image_ready et detach()
+# pour se desabonner. Quand le compteur passe de 0 a 1, le worker demarre ;
+# quand il passe de 1 a 0, il s'arrete.
+#
+# Avantage : la fenetre OBS peut maintenant tourner SEULE (sans fenetre
+# ecran active). Inversement, la fenetre ecran peut tourner seule comme
+# avant. Et si les deux sont actives, un seul worker tourne et alimente
+# les deux consommateurs avec le meme QImage.
+#
+# Refactor de l'alpha 060 : avant, _DisplayInfoMaskWorker etait cree par
+# DisplayInfoMaskWindow elle-meme. Maintenant, ce service est instancie
+# une fois par ClientUI au boot, et les deux fenetres s'y attachent.
+
+class _DisplayInfoMaskWorkerService(QObject):
+    """Service singleton (au sein du ClientUI) qui gere le cycle de vie
+    du worker de capture du masque. Compteur d'attache pour auto-start /
+    auto-stop."""
+
+    # Re-emis sur le signal sig_image_ready des consommateurs attaches.
+    # Identique a _DisplayInfoMaskWorker.sig_image_ready (QImage).
+    sig_image_ready = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._worker: "_DisplayInfoMaskWorker | None" = None
+        self._worker_thread: "QThread | None" = None
+        # Liste des callbacks attaches (consumer_id -> callback). On
+        # utilise un dict pour permettre detach par ID, plus simple
+        # qu'une liste qu'on devrait scanner.
+        self._consumers: dict[int, "callable"] = {}
+        self._next_consumer_id = 1
+        # Region courante (cf. set_region). Stockee ici aussi pour pouvoir
+        # re-pousser au worker s'il est restart apres un stop.
+        self._region: tuple[int, int, int, int] | None = None
+        # Periode courante (FPS). Idem : stockee pour restart.
+        self._period_s: float = 1.0 / 60.0
+
+    def attach(self, callback) -> int:
+        """Attache un consommateur. callback(QImage) sera appele a chaque
+        nouvelle image. Retourne un consumer_id a passer a detach().
+
+        Demarre le worker si c'est le 1er consommateur."""
+        cid = self._next_consumer_id
+        self._next_consumer_id += 1
+        self._consumers[cid] = callback
+        # Connecter ce consommateur au signal aggregat. On utilise une
+        # connexion unique par consommateur (le signal Qt accepte plusieurs
+        # slots, mais Qt n'a pas d'API directe pour "deconnecter le slot
+        # ajoute a la position N", donc on garde notre propre liste).
+        try:
+            self.sig_image_ready.connect(callback)
+        except Exception:
+            pass
+        # Demarrer le worker si pas deja en cours.
+        if len(self._consumers) == 1 and self._worker is None:
+            self._start_worker()
+        if _CORE_AVAILABLE:
+            try:
+                _core._dbg_log(
+                    f"[MASK SVC] attach consumer #{cid} "
+                    f"(total : {len(self._consumers)})"
+                )
+            except Exception:
+                pass
+        return cid
+
+    def detach(self, consumer_id: int) -> None:
+        """Detache un consommateur. Arrete le worker si plus de
+        consommateur."""
+        cb = self._consumers.pop(consumer_id, None)
+        if cb is not None:
+            try:
+                self.sig_image_ready.disconnect(cb)
+            except Exception:
+                pass
+        if _CORE_AVAILABLE:
+            try:
+                _core._dbg_log(
+                    f"[MASK SVC] detach consumer #{consumer_id} "
+                    f"(restants : {len(self._consumers)})"
+                )
+            except Exception:
+                pass
+        if not self._consumers and self._worker is not None:
+            self._stop_worker()
+
+    def set_region(self, left: int, top: int, width: int, height: int) -> None:
+        """Met a jour la region a capturer. Memorise et transmet au worker
+        s'il tourne deja."""
+        self._region = (int(left), int(top), int(width), int(height))
+        if self._worker is not None:
+            try:
+                self._worker.set_region(left, top, width, height)
+            except Exception:
+                pass
+
+    def set_period(self, period_s: float) -> None:
+        """Met a jour la periode (FPS) du worker. Memorise et transmet
+        au worker s'il tourne deja."""
+        try:
+            self._period_s = max(0.005, float(period_s))
+        except Exception:
+            return
+        if self._worker is not None:
+            try:
+                self._worker.set_period(self._period_s)
+            except Exception:
+                pass
+
+    def is_running(self) -> bool:
+        return self._worker is not None
+
+    # ------------------------------------------------------------------
+    # Gestion interne du worker
+    # ------------------------------------------------------------------
+    def _on_worker_image(self, qimg):
+        """Slot interne connecte au signal du worker. Re-emit sur notre
+        propre signal aggregat (auquel les consommateurs sont connectes).
+        Permet aux consommateurs d'etre reconnectes proprement meme si
+        le worker est detruit / recree."""
+        try:
+            self.sig_image_ready.emit(qimg)
+        except Exception:
+            pass
+
+    def _start_worker(self) -> None:
+        if self._worker is not None:
+            return
+        try:
+            self._worker_thread = QThread()
+            self._worker = _DisplayInfoMaskWorker(owner_window=None)
+            # Appliquer la periode memorisee AVANT moveToThread (encore
+            # accessible depuis ce thread).
+            try:
+                self._worker.set_period(self._period_s)
+            except Exception:
+                pass
+            self._worker.moveToThread(self._worker_thread)
+            # Le worker emet sur _on_worker_image (slot du service, qui
+            # re-emit sur sig_image_ready pour les consommateurs).
+            self._worker.sig_image_ready.connect(self._on_worker_image)
+            self._worker_thread.started.connect(self._worker.run)
+            self._worker_thread.start()
+            # Pousser la region courante au worker s'il y en a une.
+            if self._region is not None:
+                try:
+                    self._worker.set_region(*self._region)
+                except Exception:
+                    pass
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        f"[MASK SVC] worker demarre "
+                        f"(periode {self._period_s*1000:.0f}ms)"
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(f"[MASK SVC] _start_worker KO : {e}")
+                except Exception:
+                    pass
+            self._worker = None
+            self._worker_thread = None
+
+    def _stop_worker(self) -> None:
+        try:
+            if self._worker is not None:
+                try:
+                    self._worker.request_stop()
+                except Exception:
+                    pass
+            if self._worker_thread is not None:
+                try:
+                    self._worker_thread.quit()
+                    if not self._worker_thread.wait(500):
+                        self._worker_thread.terminate()
+                        self._worker_thread.wait(200)
+                except Exception:
+                    pass
+        finally:
+            self._worker = None
+            self._worker_thread = None
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log("[MASK SVC] worker arrete")
+                except Exception:
+                    pass
+
+    def shutdown(self) -> None:
+        """Arret total : detache tous les consommateurs et arrete le
+        worker. A appeler au closeEvent du ClientUI."""
+        for cid, cb in list(self._consumers.items()):
+            try:
+                self.sig_image_ready.disconnect(cb)
+            except Exception:
+                pass
+        self._consumers.clear()
+        if self._worker is not None:
+            self._stop_worker()
+
+
+class DisplayInfoMaskWindow(QWidget):
+    """Overlay topmost frameless click-through qui masque la zone
+    DisplayInfo du HUD Star Citizen.
+
+    Le placement est calcule a partir de la geometrie d'un QScreen donne
+    (l'ecran qui contient la zone OCR). Click-through via
+    Qt.WindowTransparentForInput : les clics passent au jeu en-dessous.
+
+    Mode de rendu (v0.2 alpha 006) : "smart mask" base sur la detection
+    des pixels du texte HUD. Un thread worker capture la zone via MSS,
+    detecte les pixels appartenant au texte (luminosite + canaux R/G
+    eleves) et calcule un remplacement par la couleur du decor moyen
+    autour. Resultat : seuls les caracteres sont masques, le decor du
+    jeu reste totalement visible entre les lignes.
+
+    Tant que le worker n'a pas encore produit sa premiere image (premier
+    capture en cours), on dessine en fallback un rectangle arrondi
+    semi-transparent (= comportement v0.2 alpha 005). Idem si la capture
+    echoue de maniere repetee : on a au moins un masque visible plutot
+    que rien.
+
+    Cette fenetre est intentionnellement minimale : pas d'edition, pas
+    de drag, pas de redimensionnement utilisateur, pas de header."""
+
+    def __init__(self, screen_obj, fps: int = 60, service=None):
+        # fps : frequence de rafraichissement du worker (FPS).
+        # Modifiable a chaud via update_fps() depuis l'UI.
+        # service : v0.2 alpha 060, _DisplayInfoMaskWorkerService partage
+        # injecte par ClientUI. Si None, la fenetre ne pourra pas afficher
+        # de masque calcule (juste le fallback rectangle).
+        self._fps = max(1, int(fps))
+        self._service = service
+        # ID retourne par service.attach() pour pouvoir se detach.
+        # None tant qu'on n'est pas attache.
+        self._service_consumer_id: int | None = None
+        # Pas de parent (top-level), pour pouvoir traverser les ecrans
+        # sans contrainte. Flags :
+        #   FramelessWindowHint           : pas de barre de titre
+        #   WindowStaysOnTopHint          : reste au-dessus du jeu
+        #   Tool                          : ne s'affiche pas dans la
+        #                                    barre des taches Windows
+        #   WindowTransparentForInput     : les clics passent a travers
+        #   NoDropShadowWindowHint        : pas d'ombre portee Windows
+        super().__init__(
+            None,
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
+            | Qt.WindowTransparentForInput
+            | Qt.NoDropShadowWindowHint
+        )
+        # Empeche Qt de marquer la fenetre comme activable (sinon elle
+        # peut voler le focus au jeu au moment du show()).
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        # v0.2 alpha 022 : on N'utilise PLUS WA_TranslucentBackground.
+        # Raison : avec cet attribut, la fenetre est dans la categorie
+        # UpdateLayeredWindow (per-pixel alpha), et Windows refuse
+        # SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) sur ces
+        # fenetres (error 0x08). Sans exclusion -> MSS capture notre
+        # propre masque -> larsen visuel.
+        # Nouvelle approche : fenetre OPAQUE. SetWindowDisplayAffinity
+        # accepte. MSS voit l'image SC pure (sans le masque). Le worker
+        # produit un QImage opaque qui REJOUE l'image SC capturee avec
+        # les pixels texte remplaces par leur decor moyen. La fenetre
+        # dessine ce QImage a plein ecran. Resultat : l'utilisateur voit
+        # l'image SC sans le texte, sans clignotement.
+        # WA_NoSystemBackground garde pour eviter le flash du fond
+        # par defaut Qt avant le premier paintEvent.
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+
+        self._screen = screen_obj
+
+        # QPixmap recu du worker smart (None tant qu'aucune image n'a
+        # encore ete produite -> fallback rectangle arrondi).
+        self._mask_pixmap: "QPixmap | None" = None
+        # Cache du QImage brut pour rescaling eventuel (non utilise pour
+        # l'instant ; le worker emet a la taille exacte de la fenetre).
+        self._last_qimage = None
+
+        # Statut de l'exclusion de capture (WDA_EXCLUDEFROMCAPTURE).
+        # Le worker smart n'est demarre QU'APRES confirmation, sinon
+        # son rendu se capture lui-meme et cree un larsen visuel
+        # (le masque flou contient son ancien masque, qui contient
+        # l'ancien, etc.). En cas d'echec definitif, on reste sur le
+        # fallback rectangle arrondi semi-transparent.
+        self._capture_exclusion_ok    = False
+        self._capture_exclusion_tried = 0  # nombre de retries effectues
+
+        # Workers : crees plus tard, apres confirmation exclusion.
+        self._worker_thread: "QThread | None" = None
+        self._worker: "_DisplayInfoMaskWorker | None" = None
+
+        # Etat memoire pour les callbacks OCR (cf. _slot_hide_for_ocr).
+        self._was_visible_before_ocr = False
+        self._ocr_pre_cb  = None
+        self._ocr_post_cb = None
+        # Etat memoire pour le hide/show du worker (cf. _slot_hide_for_worker).
+        # Le worker se cache lui-meme juste avant son grab MSS pour eviter
+        # le larsen visuel (capture de son propre rendu).
+        self._was_visible_before_worker = False
+
+        # Appliquer la geometrie initiale (le worker, s'il sera demarre,
+        # recevra la region apres son demarrage).
+        self._apply_geometry()
+
+        # v0.2 alpha 023 : callbacks pre/post OCR DESACTIVES.
+        # Avant l'alpha 022, on avait besoin de cacher la fenetre du
+        # masque pendant chaque capture OCR parce que MSS la capturait
+        # sinon (l'API SetWindowDisplayAffinity refusait l'exclusion
+        # avec WA_TranslucentBackground -> err 0x08).
+        # Depuis l'alpha 022, la fenetre est opaque, l'exclusion marche,
+        # MSS ne voit plus le masque. Plus besoin de hide/show 4-5x/sec
+        # autour de chaque capture OCR. Et c'etait justement ce hide/show
+        # qui causait le clignotement visible (texte SC qui reapparait
+        # brievement a chaque flash invisible/visible).
+        # Code conserve commente au cas ou. Pour reactiver si l'exclusion
+        # de capture redevient KO sur un PC particulier, decommenter.
+        # self._register_ocr_callbacks()
+
+    def _start_worker(self):
+        """v0.2 alpha 060 : REFACTOR.
+        Avant, on creait ici notre propre QThread + _DisplayInfoMaskWorker.
+        Desormais, on s'attache au service partage du ClientUI
+        (self._service). Le service gere le worker thread, mutualise avec
+        la fenetre OBS si elle est aussi active, et auto-stop le worker
+        quand le dernier consommateur se detache.
+
+        Cette methode reste appelee uniquement APRES confirmation de
+        l'exclusion de capture (cf. _try_capture_exclusion_then_start_worker).
+        """
+        try:
+            if self._service is None:
+                # Pas de service injecte : on ne peut pas demarrer.
+                # Ne devrait pas arriver, voir __init__ qui prend le service.
+                if _CORE_AVAILABLE:
+                    try:
+                        _core._dbg_log(
+                            "[MASK SMART] _start_worker : service absent, "
+                            "fenetre ecran ne pourra pas afficher de masque."
+                        )
+                    except Exception:
+                        pass
+                return
+            # Periode demandee par cette fenetre.
+            try:
+                self._service.set_period(1.0 / float(self._fps))
+            except Exception:
+                pass
+            # Attache : le service demarre le worker si pas deja, et nous
+            # connecte au signal sig_image_ready (= _on_image_ready).
+            if self._service_consumer_id is None:
+                self._service_consumer_id = self._service.attach(
+                    self._on_image_ready
+                )
+            # Pousser la geometrie courante au service (qui la transmet
+            # au worker).
+            self._apply_geometry()
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        f"[MASK SMART] _start_worker KO : {e}"
+                    )
+                except Exception:
+                    pass
+
+    def _stop_worker(self):
+        """v0.2 alpha 060 : REFACTOR.
+        Se detache du service partage. Le service auto-stoppera le worker
+        si on etait le dernier consommateur."""
+        try:
+            if self._service is not None and self._service_consumer_id is not None:
+                self._service.detach(self._service_consumer_id)
+                self._service_consumer_id = None
+        except Exception:
+            pass
+
+    def _apply_geometry(self):
+        """Calcule la geometrie du rectangle a partir de la zone OCR
+        et la positionne avec une hauteur multipliee par 19 (= nombre
+        approximatif de lignes affichees par r_DisplayInfo dans SC).
+
+        v0.2 alpha 027 : avant on scalait depuis une reference 4K
+        (DISPLAYINFO_MASK_REF_4K). Maintenant on utilise directement la
+        zone OCR du HUD (state.zone_coords) qui represente la PREMIERE
+        LIGNE du DisplayInfo. La hauteur totale du masque = hauteur de
+        cette ligne x 19, ce qui couvre les 19 lignes du HUD.
+
+        Avantages :
+          - S'adapte automatiquement a la calibration utilisateur.
+          - Plus de dependance a une reference 4K stricte.
+          - Position pile-poil sur le HUD reel, pas approximative.
+
+        Subtilite DPI : Qt setGeometry attend des coords LOGIQUES.
+        zone_coords est en pixels PHYSIQUES. On divise par DPR de
+        l'ecran cible pour convertir."""
+        if self._screen is None:
+            return
+        try:
+            geo = self._screen.geometry()  # QRect en pixels logiques
+            dpr = self._screen.devicePixelRatio() or 1.0
+        except Exception:
+            return
+        # Recuperer la zone OCR (en pixels physiques absolus du desktop).
+        zone = getattr(state, "zone_coords", None) if _CORE_AVAILABLE else None
+        if not isinstance(zone, dict):
+            # Fallback : si pas de zone OCR (cas debug avec bypass), on
+            # garde l'ancien comportement base sur la reference 4K.
+            sw = geo.width()
+            sh = geo.height()
+            x, y, w, h = _compute_displayinfo_mask_rect(sw, sh)
+            gx = geo.x() + x
+            gy = geo.y() + y
+            self.setGeometry(gx, gy, w, h)
+            phys_left   = int(round((geo.x() + x) * dpr))
+            phys_top    = int(round((geo.y() + y) * dpr))
+            phys_width  = int(round(w * dpr))
+            phys_height = int(round(h * dpr))
+        else:
+            # Nouveau : on construit la fenetre a partir de la zone OCR.
+            # v0.2 alpha 045 : facteurs hauteur/largeur configurables.
+            # Hauteur = zone OCR.h x hauteur_factor (defaut 19, = 19
+            # lignes du HUD DisplayInfo). Largeur = zone OCR.w x
+            # largeur_factor (defaut 1.0). Le masque reste colle au
+            # bord droit : si largeur > 1.0, il s'etend vers la gauche.
+            try:
+                _cfg = _load_cfg() if _CORE_AVAILABLE else {}
+                height_factor = int(_cfg.get("displayinfo_mask_height_factor", 19))
+                width_factor  = float(_cfg.get("displayinfo_mask_width_factor", 1.0))
+            except Exception:
+                height_factor = 19
+                width_factor  = 1.0
+            try:
+                zone_left   = int(zone.get("left",   0))
+                zone_top    = int(zone.get("top",    0))
+                zone_width  = int(zone.get("width",  0))
+                zone_height = int(zone.get("height", 0))
+                phys_top    = zone_top
+                phys_height = zone_height * max(1, height_factor)
+                # Largeur ajustee : on garde le bord DROIT colle a la
+                # zone OCR. Si width_factor > 1, on etend vers la gauche
+                # (= phys_left decroit). Si < 1, on retrecit (phys_left
+                # croit).
+                new_width = int(round(zone_width * max(0.1, width_factor)))
+                right_edge = zone_left + zone_width
+                phys_left  = right_edge - new_width
+                phys_width = new_width
+            except (TypeError, ValueError):
+                return
+            if phys_width <= 0 or phys_height <= 0:
+                return
+            # Conversion physique -> logique pour setGeometry Qt.
+            gx = int(round(phys_left   / dpr))
+            gy = int(round(phys_top    / dpr))
+            gw = int(round(phys_width  / dpr))
+            gh = int(round(phys_height / dpr))
+            self.setGeometry(gx, gy, gw, gh)
+
+        # Envoyer la region en pixels PHYSIQUES au service partage (qui la
+        # transmet au worker). mss/bettercam travaillent en pixels
+        # physiques (= absolus du desktop).
+        if self._service is not None:
+            try:
+                self._service.set_region(
+                    phys_left, phys_top, phys_width, phys_height
+                )
+            except Exception:
+                pass
+        # Une nouvelle geometrie invalide l'ancien pixmap (il etait
+        # dimensionne pour l'ancienne taille). On le drop pour que le
+        # paintEvent retombe sur le fallback en attendant la prochaine
+        # image du worker.
+        self._mask_pixmap = None
+
+    def update_for_screen(self, screen_obj):
+        """Re-applique la geometrie pour un nouvel ecran (utilise si la
+        zone OCR change d'ecran)."""
+        self._screen = screen_obj
+        self._apply_geometry()
+
+    def update_fps(self, fps: int):
+        """Change la frequence du worker a chaud via le service."""
+        try:
+            self._fps = max(1, int(fps))
+        except (TypeError, ValueError):
+            return
+        if self._service is not None:
+            try:
+                self._service.set_period(1.0 / float(self._fps))
+            except Exception:
+                pass
+
+    @Slot(object)
+    def _on_image_ready(self, qimg):
+        """Recoit le QImage produit par le worker (signal sig_image_ready).
+        Convertit en QPixmap (operation main-thread-only) et redessine."""
+        try:
+            if qimg is None:
+                return
+            # Si la taille du qimage ne correspond pas a la fenetre courante
+            # (race condition : geometry change pendant qu'on traitait),
+            # on l'ignore : la prochaine emit aura la bonne taille.
+            qw = qimg.width()
+            qh = qimg.height()
+            # La fenetre est en logique, le qimage en physique (taille
+            # de la zone MSS capturee). On accepte tant que le qimage
+            # est >= 1 px. Lors du dessin on stretchera si besoin.
+            if qw <= 0 or qh <= 0:
+                return
+            self._last_qimage = qimg
+            self._mask_pixmap = QPixmap.fromImage(qimg)
+            self.update()
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        f"[MASK SMART] _on_image_ready KO : {e}"
+                    )
+                except Exception:
+                    pass
+
+    def paintEvent(self, event):
+        """Dessine le smart mask si dispo, sinon un rectangle arrondi
+        semi-transparent en fallback."""
+        try:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            if self._mask_pixmap is not None and not self._mask_pixmap.isNull():
+                # Smart mask dispo : dessine le pixmap. drawPixmap avec
+                # un QRect cible scale automatiquement le pixmap a la
+                # taille de la fenetre (pour le cas DPR > 1 ou les races
+                # de geometry change).
+                painter.drawPixmap(self.rect(), self._mask_pixmap)
+            else:
+                # Fallback : rectangle noir arrondi semi-transparent
+                # (= comportement v0.2 alpha 005). On voit cela pendant
+                # ~200-300ms apres l'apparition du masque, le temps que
+                # le worker produise sa premiere image.
+                opacity = max(0.0, min(1.0, float(DISPLAYINFO_MASK_OPACITY)))
+                alpha   = int(round(opacity * 255))
+                color   = QColor(0, 0, 0, alpha)
+                painter.setBrush(color)
+                painter.setPen(Qt.NoPen)
+                radius = max(0, int(DISPLAYINFO_MASK_RADIUS))
+                painter.drawRoundedRect(self.rect(), radius, radius)
+            painter.end()
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        f"[MASK] paintEvent KO : {e}"
+                    )
+                except Exception:
+                    pass
+
+    def showEvent(self, event):
+        """Appelle SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) la
+        premiere fois que la fenetre est montree. Doit etre fait apres
+        show() pour que le HWND existe.
+
+        WDA_EXCLUDEFROMCAPTURE (Windows 10 2004+) : la fenetre reste
+        visible a l'oeil mais est *invisible* aux APIs de capture
+        d'ecran (DXGI, BitBlt, GDI). Donc :
+          - L'utilisateur voit le masque par-dessus la zone DisplayInfo
+            de SC : la feature visuelle marche.
+          - L'OCR (MSS = BitBlt) capture l'image SC SANS le masque :
+            la lecture des coordonnees continue normalement.
+          - OBS / autres outils de capture ne voient pas le masque
+            non plus, ce qui est aligne avec le cas d'usage streamer.
+          - Le worker smart, qui utilise aussi MSS, voit l'image SC
+            SANS le masque (= il capture le texte original, pas son
+            propre rendu). Pas de larsen visuel infini.
+
+        Le worker smart n'est demarre QU'APRES confirmation de
+        l'exclusion : sans elle, le worker capturerait sa propre sortie
+        et creerait un larsen visuel + casserait l'OCR (vu en
+        production : err=0x00000008 au 1er essai, taux OCR a 20%).
+
+        Robustesse : si l'API echoue au 1er essai (timing du compositeur
+        Windows, hwnd pas encore pret), on retry jusqu'a 5 fois avec
+        un delai de 100ms entre chaque. Si toujours en echec apres
+        5 tentatives, on bascule en mode degrade (rectangle arrondi
+        semi-transparent, sans worker smart) pour ne PAS casser l'OCR.
+        """
+        try:
+            super().showEvent(event)
+        except Exception:
+            pass
+        # Une seule sequence d'init par instance (ignore re-show apres hide).
+        if getattr(self, "_capture_exclusion_started", False):
+            return
+        self._capture_exclusion_started = True
+        # Tentative immediate. Si echec, retry differe.
+        self._try_capture_exclusion_then_start_worker()
+
+    def _try_capture_exclusion_then_start_worker(self):
+        """Tente l'exclusion de capture. Si succes : tres bien, le smart
+        mask est invisible aux APIs de capture (OCR + OBS).
+
+        Si echec et qu'il reste des retries : reprogramme dans 100ms.
+
+        v0.2 alpha 010 : meme si l'exclusion echoue definitivement, on
+        demarre quand meme le worker smart (avant l'alpha 010 on tombait
+        en mode degrade rectangle uniforme). La raison : l'OCR est deja
+        protege par les callbacks pre/post capture (hide ~5ms le temps
+        de la capture MSS de l'OCR). Donc l'OCR voit l'image SC pure,
+        meme sans l'exclusion d'affinity.
+
+        Cote worker smart : il continuera a capturer son propre rendu
+        (larsen visuel), mais le rendu reste lisible visuellement
+        (degrade mais utilisable). Le hide cote worker sera fait dans
+        une iteration future si necessaire."""
+        MAX_RETRIES = 5
+        ok = self._apply_capture_exclusion()
+        if ok:
+            self._capture_exclusion_ok = True
+            # OK -> demarre le worker smart, qui ne capturera PAS son
+            # propre rendu (cas ideal).
+            self._start_worker()
+            return
+        self._capture_exclusion_tried += 1
+        if self._capture_exclusion_tried < MAX_RETRIES:
+            # Retry differe. QTimer.singleShot s'execute sur le thread Qt
+            # (= ici), donc thread-safe pour rappeler la methode.
+            QTimer.singleShot(
+                100, self._try_capture_exclusion_then_start_worker
+            )
+        else:
+            # Echec definitif des retries. On demarre quand meme le
+            # worker smart : l'OCR est protege par les callbacks
+            # pre/post (hide 5ms autour de chaque capture OCR), donc
+            # pas de pollution OCR meme sans l'exclusion. Le worker
+            # va capturer son propre rendu en larsen visuel (degrade
+            # mais utilisable), traitable plus tard si necessaire.
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        f"[MASK] Capture exclusion impossible apres "
+                        f"{MAX_RETRIES} essais. Demarrage du smart mask "
+                        f"quand meme (OCR protege par les callbacks "
+                        f"pre/post). Larsen visuel possible cote worker."
+                    )
+                except Exception:
+                    pass
+            self._start_worker()
+
+    def closeEvent(self, event):
+        """Arret propre du worker thread quand la fenetre est detruite.
+        Debranche aussi les callbacks pre/post OCR pour eviter qu'ils
+        referencent une fenetre detruite."""
+        try:
+            self._unregister_ocr_callbacks()
+        except Exception:
+            pass
+        try:
+            self._stop_worker()
+        except Exception:
+            pass
+        try:
+            super().closeEvent(event)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------
+    # Hide/show pendant la capture OCR (v0.2 alpha 009)
+    # ------------------------------------------------------------
+    # L'OCR (circusvoip_sc_ocr.capture_region) appelle MSS pour capturer
+    # la zone des coordonnees du HUD. Si notre masque est visible au
+    # moment de cette capture, MSS le voit aussi (sur Windows avec
+    # WA_TranslucentBackground, l'API SetWindowDisplayAffinity refuse
+    # l'exclusion -> bug Win10/11 ERROR_NOT_ENOUGH_MEMORY 0x08). Resultat :
+    # l'OCR voit un masque opaque/semi-transparent au-dessus du texte SC
+    # -> taux de parses chute a 20%.
+    #
+    # Workaround : on cache la fenetre Qt pendant CHAQUE capture OCR
+    # (~5ms par capture, 2-3 captures/sec). L'oeil ne percoit pas un
+    # masque cache 5ms toutes les 333ms. L'OCR voit l'image SC pure.
+    #
+    # Coordination :
+    #   - Le client expose 2 slots Qt (_slot_hide_for_ocr / _slot_show_after_ocr)
+    #     qui s'executent dans le thread Qt principal.
+    #   - circusvoip_sc_ocr.set_capture_callbacks(pre, post) recoit 2
+    #     fonctions qui invoke ces slots en BlockingQueuedConnection
+    #     depuis le thread OCR -> le thread OCR attend que Qt ait
+    #     effectivement cache la fenetre AVANT de capturer.
+
+    @Slot()
+    def _slot_hide_for_ocr(self):
+        """Slot Qt invoque depuis le thread OCR. Cache la fenetre du
+        masque (mais garde son etat en memoire pour la remettre apres).
+        Tourne dans le thread Qt principal."""
+        try:
+            if self.isVisible():
+                self._was_visible_before_ocr = True
+                self.setVisible(False)
+            else:
+                self._was_visible_before_ocr = False
+        except Exception:
+            pass
+
+    @Slot()
+    def _slot_show_after_ocr(self):
+        """Slot Qt invoque apres la capture OCR. Remontre la fenetre
+        si elle etait visible avant. Tourne dans le thread Qt principal."""
+        try:
+            if getattr(self, "_was_visible_before_ocr", False):
+                self.setVisible(True)
+                self._was_visible_before_ocr = False
+        except Exception:
+            pass
+
+    @Slot()
+    def _slot_hide_for_worker(self):
+        """Slot Qt invoque depuis le thread WORKER juste avant son grab
+        MSS. v0.2 alpha 021 : test setWindowOpacity au lieu de move
+        (qui s'etait fait clamper par Windows a x=32767 et n'avait pas
+        empeche MSS de capturer la fenetre). L'opacite est censee etre
+        moins lourde a appliquer que setVisible() ou move() : pas de
+        re-composition globale, juste un changement de blending."""
+        try:
+            # Memorise l'opacite actuelle (normalement 1.0 mais on
+            # ne fait pas d'hypothese).
+            self._opacity_before_worker = self.windowOpacity()
+            self.setWindowOpacity(0.0)
+        except Exception:
+            pass
+
+    @Slot()
+    def _slot_show_after_worker(self):
+        """Slot Qt invoque par le worker apres son grab MSS. Restaure
+        l'opacite d'origine."""
+        try:
+            op_before = getattr(self, "_opacity_before_worker", None)
+            if op_before is not None:
+                self.setWindowOpacity(op_before)
+                self._opacity_before_worker = None
+        except Exception:
+            pass
+
+    def _register_ocr_callbacks(self):
+        """Branche les callbacks pre/post capture sur circusvoip_sc_ocr.
+        A appeler au boot de la fenetre. Les callbacks invoquent les
+        slots Qt en BlockingQueuedConnection -> le thread OCR attend
+        que Qt ait traite le show/hide AVANT de continuer."""
+        try:
+            # _sco est importe directement dans ce module (ligne ~325).
+            # Si l'import a echoue (cas degrade : OCR indispo), _sco
+            # n'existe pas ou est None.
+            sco_mod = _sco if "_sco" in globals() else None
+            if sco_mod is None:
+                return
+            set_cb = getattr(sco_mod, "set_capture_callbacks", None)
+            if set_cb is None:
+                # Version sc_ocr trop ancienne, pas de support callbacks.
+                if _CORE_AVAILABLE:
+                    try:
+                        _core._dbg_log(
+                            "[MASK] sc_ocr.set_capture_callbacks indispo "
+                            "(version trop ancienne). OCR sera pollue."
+                        )
+                    except Exception:
+                        pass
+                return
+            # Wrappers fermeture sur self pour exposer les bons handlers
+            # au module sc_ocr. Les wrappers font le invokeMethod en
+            # blocking pour que le thread OCR attende.
+            def _pre():
+                try:
+                    QMetaObject.invokeMethod(
+                        self, "_slot_hide_for_ocr",
+                        Qt.BlockingQueuedConnection,
+                    )
+                except Exception:
+                    pass
+
+            def _post():
+                try:
+                    QMetaObject.invokeMethod(
+                        self, "_slot_show_after_ocr",
+                        Qt.BlockingQueuedConnection,
+                    )
+                except Exception:
+                    pass
+
+            self._ocr_pre_cb  = _pre
+            self._ocr_post_cb = _post
+            set_cb(_pre, _post)
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        "[MASK] OCR pre/post callbacks branches : le "
+                        "masque sera cache ~5ms autour de chaque capture "
+                        "OCR (OCR pur, pas de scintillement perceptible)."
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        f"[MASK] _register_ocr_callbacks KO : {e}"
+                    )
+                except Exception:
+                    pass
+
+    def _unregister_ocr_callbacks(self):
+        """Debranche les callbacks. A appeler au closeEvent pour eviter
+        que sc_ocr appelle un slot d'une fenetre detruite."""
+        try:
+            sco_mod = _sco if "_sco" in globals() else None
+            if sco_mod is None:
+                return
+            set_cb = getattr(sco_mod, "set_capture_callbacks", None)
+            if set_cb is None:
+                return
+            set_cb(None, None)
+            self._ocr_pre_cb  = None
+            self._ocr_post_cb = None
+        except Exception:
+            pass
+
+    def _apply_capture_exclusion(self) -> bool:
+        """Exclut la fenetre de la capture d'ecran via l'API Win32
+        SetWindowDisplayAffinity. Retourne True si succes, False sinon.
+        No-op sur non-Windows (retourne True : pas de larsen attendu
+        de toute facon hors Windows car le worker MSS n'existe pas)."""
+        # Import paresseux : on ne tape pas dans ctypes au boot si on
+        # n'utilise jamais le masque.
+        try:
+            import sys as _sys
+            if not _sys.platform.startswith("win"):
+                return True  # rien a exclure, mais on autorise le worker
+            import ctypes
+            hwnd = int(self.winId())
+            if hwnd == 0:
+                return False
+            WDA_EXCLUDEFROMCAPTURE = 0x00000011  # Windows 10 2004+
+            user32 = ctypes.windll.user32
+            # Signature : BOOL SetWindowDisplayAffinity(HWND hwnd, DWORD dwAffinity)
+            user32.SetWindowDisplayAffinity.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint
+            ]
+            user32.SetWindowDisplayAffinity.restype = ctypes.c_int
+            ok = user32.SetWindowDisplayAffinity(
+                ctypes.c_void_p(hwnd), WDA_EXCLUDEFROMCAPTURE
+            )
+            if not ok:
+                # Recupere le code d'erreur pour diagnostic. Codes typiques :
+                #   0x00000008 (ERROR_NOT_ENOUGH_MEMORY) - timing, retry
+                #   0x00000057 (ERROR_INVALID_PARAMETER) - Windows trop ancien
+                #   0x00000578 (ERROR_INVALID_WINDOW_HANDLE)
+                #   0x000005AA (ERROR_NO_SYSTEM_RESOURCES)
+                err = ctypes.windll.kernel32.GetLastError()
+                if _CORE_AVAILABLE:
+                    try:
+                        retry_n = getattr(self, "_capture_exclusion_tried", 0)
+                        _core._dbg_log(
+                            f"[MASK] SetWindowDisplayAffinity KO "
+                            f"(err=0x{err:08X}, essai {retry_n + 1}). "
+                            f"Retry differe..."
+                        )
+                    except Exception:
+                        pass
+                return False
+            else:
+                if _CORE_AVAILABLE:
+                    try:
+                        retry_n = getattr(self, "_capture_exclusion_tried", 0)
+                        _core._dbg_log(
+                            f"[MASK] SetWindowDisplayAffinity OK "
+                            f"(essai {retry_n + 1}). Masque exclu de la "
+                            f"capture d'ecran (OCR + OBS)."
+                        )
+                    except Exception:
+                        pass
+                return True
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        f"[MASK] _apply_capture_exclusion KO : {e}"
+                    )
+                except Exception:
+                    pass
+            return False
+
+
+# ======================================================================
 # Fenetre principale
 # ======================================================================
 
@@ -3123,6 +6415,224 @@ class OverlayManager(QObject):
 # Mini popup non-modal qui affiche un slider 0-200% pour regler le volume
 # d'un joueur specifique. Sauve dans cfg client1 sous "player_volumes".
 # Applique en live via state.audio_io.set_user_volume_multiplier(name, ratio).
+
+
+# ======================================================================
+# Source OBS du masque DisplayInfo (v0.2 alpha 058, refactor alpha 060)
+# ======================================================================
+# Fenetre "soeur" de DisplayInfoMaskWindow qui sert de source de capture
+# pour OBS Studio. Elle :
+#   - est positionnee HORS ECRAN (x=-3000) pour ne PAS gener l'utilisateur
+#   - n'a PAS WDA_EXCLUDEFROMCAPTURE : elle est intentionnellement
+#     capturable par OBS (et donc aussi par d'autres APIs de capture, mais
+#     elle n'a aucun pixel "sensible" : juste un masque deja calcule)
+#   - v0.2 alpha 060 : s'attache au service partage
+#     _DisplayInfoMaskWorkerService qui mutualise le worker entre la
+#     fenetre ecran et la fenetre OBS. La fenetre OBS peut donc tourner
+#     SEULE (sans fenetre ecran) : utile pour les streamers qui veulent
+#     cacher leur HUD aux viewers SANS l'avoir masque sur leur propre
+#     ecran de jeu.
+#
+# Le streamer ajoute dans OBS une source "Window Capture" / "Capture de
+# fenetre" en mode "Windows 10 Graphics Capture" pointant sur la fenetre
+# de titre "CircusVOIP - Mask Source for OBS". Il positionne cette source
+# dans sa scene OBS par-dessus son Game Capture, sur la zone HUD.
+
+class DisplayInfoMaskWindowOBS(QWidget):
+    """Fenetre offscreen qui rejoue le QImage du masque pour qu'OBS puisse
+    la capturer en tant que source dediee.
+
+    Positionnee hors ecran (x=-3000, y=-3000) avec la meme taille que la
+    zone HUD. Pas de SetWindowDisplayAffinity : elle est intentionnellement
+    capturable. v0.2 alpha 060 : s'attache au service partage
+    _DisplayInfoMaskWorkerService au showEvent / s'en detache au closeEvent.
+
+    Titre de fenetre stable : "CircusVOIP - Mask Source for OBS" (utilise
+    par le streamer pour identifier la source dans OBS).
+    """
+
+    OBS_WINDOW_TITLE = "CircusVOIP - Mask Source for OBS"
+
+    def __init__(self, screen_obj, service=None):
+        # service : v0.2 alpha 060, _DisplayInfoMaskWorkerService partage
+        # injecte par ClientUI. Si None, la fenetre ne pourra pas afficher
+        # de masque calcule.
+        # Pas de parent (top-level). Flags :
+        #   FramelessWindowHint           : pas de barre de titre
+        #   WindowTransparentForInput     : par securite, meme si la
+        #                                    fenetre est hors ecran et
+        #                                    en theorie inatteignable
+        #                                    par les clics
+        #   NoDropShadowWindowHint        : pas d'ombre portee Windows
+        #
+        # v0.2 alpha 059 : on N'utilise PLUS Qt.Tool. Raison : Qt.Tool
+        # ajoute WS_EX_TOOLWINDOW au style Win32, et OBS "Window Capture"
+        # (mode Windows 10 Graphics Capture) filtre les fenetres avec ce
+        # flag (considerees comme des outils flottants type Discord
+        # overlay). Resultat : la fenetre n'apparaissait pas dans la liste
+        # OBS. Sans Qt.Tool, la fenetre apparait dans la taskbar Windows
+        # et Alt-Tab, mais c'est le prix a payer pour qu'OBS la voit. Le
+        # titre explicite ("CircusVOIP - Mask Source for OBS") rend
+        # l'entree comprehensible pour l'utilisateur.
+        #
+        # NB : on N'utilise PAS WindowStaysOnTopHint (rien a montrer a
+        # l'utilisateur). On N'utilise PAS WA_TranslucentBackground (on
+        # veut une fenetre opaque comme la fenetre ecran, le QImage emis
+        # par le worker est deja opaque cf. alpha 022).
+        super().__init__(
+            None,
+            Qt.FramelessWindowHint
+            | Qt.WindowTransparentForInput
+            | Qt.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        # Titre de fenetre explicite : c'est ce que le streamer va chercher
+        # dans OBS (Window Capture) ET ce qui apparaitra dans la taskbar
+        # / Alt-Tab.
+        self.setWindowTitle(self.OBS_WINDOW_TITLE)
+
+        self._screen = screen_obj
+        self._mask_pixmap: "QPixmap | None" = None
+        self._last_qimage = None
+
+        # v0.2 alpha 060 : service partage du worker masque.
+        self._service = service
+        self._service_consumer_id: int | None = None
+
+        # Geometrie : meme taille que la zone HUD masquee. Position : hors
+        # ecran (x = -3000, y = -3000). Si l'utilisateur a plusieurs ecrans
+        # qui s'etendent loin a gauche, -3000 ne suffira peut-etre pas,
+        # mais c'est extremement rare. Si besoin on adaptera.
+        self._refresh_geometry()
+
+    def _refresh_geometry(self, ref_geometry=None) -> None:
+        """(Re)calcule la geometrie de la fenetre offscreen.
+
+        Si `ref_geometry` (un QRect) est fourni, on prend ses dimensions
+        (la fenetre OBS aura exactement la meme taille que la fenetre
+        masque ecran). C'est l'appel normal depuis _update_displayinfo_mask
+        une fois que la fenetre ecran a calcule sa propre geometrie.
+
+        Sinon, on fait un best-effort minimal avec _compute_displayinfo_mask_rect
+        sur la geometrie de l'ecran cible. Dans les deux cas, la position
+        est forcee hors ecran (-3000, -3000)."""
+        try:
+            if ref_geometry is not None:
+                w = max(1, int(ref_geometry.width()))
+                h = max(1, int(ref_geometry.height()))
+            else:
+                # Fallback : calcul approximatif depuis l'ecran cible. Ne
+                # tient pas compte des facteurs height/width configurables.
+                # Sera corrige des qu'on aura ref_geometry au prochain tick.
+                geo = self._screen.geometry()
+                _x, _y, w, h = _compute_displayinfo_mask_rect(
+                    geo.width(), geo.height()
+                )
+                if w <= 0 or h <= 0:
+                    w, h = 600, 400
+        except Exception:
+            w, h = 600, 400
+        # Position fixe hors ecran : pas visible pour l'utilisateur, mais
+        # toujours rendue par DWM donc capturable par OBS via "Windows 10
+        # Graphics Capture".
+        self.setGeometry(-3000, -3000, int(w), int(h))
+
+    @Slot(object)
+    def on_image_ready(self, qimg):
+        """Recoit le QImage produit par le worker (signal sig_image_ready
+        du worker de la fenetre ECRAN, qu'on reutilise). Convertit en
+        QPixmap (main-thread-only) et redessine.
+
+        Le QImage transmit est exactement celui qu'affiche la fenetre
+        ecran : meme qualite, meme latence. Le streamer aura donc le
+        meme rendu chez ses viewers que ce qu'il voit lui-meme a l'ecran
+        (modulo le decalage temporel entre Game Capture OBS et notre
+        fenetre offscreen, cf. discussion alpha 058)."""
+        try:
+            if qimg is None:
+                return
+            if qimg.width() <= 0 or qimg.height() <= 0:
+                return
+            self._last_qimage = qimg
+            self._mask_pixmap = QPixmap.fromImage(qimg)
+            self.update()
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        f"[MASK OBS] on_image_ready KO : {e}"
+                    )
+                except Exception:
+                    pass
+
+    def paintEvent(self, event):
+        """Dessine le mask pixmap si dispo, sinon rectangle gris fallback
+        (au cas ou la fenetre est visible avant que le worker ait emit
+        sa premiere image)."""
+        try:
+            from PySide6.QtGui import QPainter, QColor
+            painter = QPainter(self)
+            try:
+                if self._mask_pixmap is not None:
+                    # Stretch pour remplir toute la fenetre. Normalement
+                    # le QImage du worker fait deja la bonne taille
+                    # (calculee depuis la meme geometrie).
+                    painter.drawPixmap(self.rect(), self._mask_pixmap)
+                else:
+                    # Fallback rectangle gris fonce opaque le temps que
+                    # le worker emit sa 1ere image. Mieux que du blanc
+                    # par defaut Qt qui pourrait flasher chez les viewers.
+                    painter.fillRect(self.rect(), QColor(32, 32, 32, 255))
+            finally:
+                painter.end()
+        except Exception:
+            pass
+
+    def showEvent(self, event):
+        """v0.2 alpha 060 : s'attache au service partage au premier show.
+        Le service auto-demarre le worker s'il n'est pas deja en cours."""
+        try:
+            super().showEvent(event)
+        except Exception:
+            pass
+        if self._service is None:
+            return
+        if self._service_consumer_id is None:
+            try:
+                self._service_consumer_id = self._service.attach(
+                    self.on_image_ready
+                )
+                if _CORE_AVAILABLE:
+                    try:
+                        _core._dbg_log(
+                            "[MASK OBS] attachee au service partage "
+                            f"(consumer_id={self._service_consumer_id})"
+                        )
+                    except Exception:
+                        pass
+            except Exception as e:
+                if _CORE_AVAILABLE:
+                    try:
+                        _core._dbg_log(f"[MASK OBS] attach KO : {e}")
+                    except Exception:
+                        pass
+
+    def closeEvent(self, event):
+        """v0.2 alpha 060 : se detache du service partage. Le service
+        auto-stoppera le worker si c'etait le dernier consommateur."""
+        try:
+            if (self._service is not None
+                    and self._service_consumer_id is not None):
+                self._service.detach(self._service_consumer_id)
+                self._service_consumer_id = None
+        except Exception:
+            pass
+        try:
+            super().closeEvent(event)
+        except Exception:
+            pass
+
 
 class VolumePopup(QDialog):
     """Mini popup volume joueur. Non-modal pour pouvoir cliquer ailleurs
@@ -4251,6 +7761,2559 @@ class PlayerCard(QWidget):
         )
 
 
+class SoundboardWindow(QWidget):
+    """Fenetre flottante du soundboard. Apparait au clic du bouton
+    'Soundboard' dans le panneau principal, disparait au reclic.
+    Contient un bouton par son disponible.
+
+    v0.2 alpha 029 : fenetre simple, 1 son (alarme).
+    v0.2 alpha 034 : ajout cooldown 2s par bouton + grisage de tous les
+    boutons pendant la lecture (regle "un seul son a la fois").
+    Future evolution : raccourcis clavier, permissions.
+
+    Le parent doit etre la MainWindow (qui possede les methodes
+    _on_soundboard_sound_clicked et le cache _soundboard_cache)."""
+
+    # Duree de cooldown par bouton (en secondes). Pendant ce delai, les
+    # clics sur le MEME bouton sont ignores. Cooldown distinct de
+    # "un seul son a la fois" : le cooldown empeche le spam d'un meme
+    # son, "un seul son" empeche de declencher un autre son par dessus.
+    COOLDOWN_S = 2.0
+
+    def __init__(self, parent=None):
+        # v0.2 alpha 037 : Qt.Popup au lieu de Qt.Tool. Une fenetre Popup
+        # se ferme automatiquement des qu'un clic survient en dehors de
+        # son perimetre (comportement standard d'un menu deroulant).
+        # Combine avec FramelessWindowHint pour pas de barre de titre.
+        # Plus besoin de WA_ShowWithoutActivating : Popup prend
+        # toujours le focus, c'est justement comme ca qu'il sait quand
+        # se fermer.
+        super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
+        self._main = parent
+        self.setStyleSheet(
+            "QWidget { background-color: #1e1e22; border: 1px solid #555; }"
+            "QPushButton { background-color: #2a2a30; color: #ddd; "
+            "padding: 8px 12px; border: 1px solid #444; font-size: 10pt; }"
+            "QPushButton:hover { background-color: #3a3a45; border-color: #888; }"
+            "QPushButton:pressed { background-color: #4a4a55; }"
+            "QPushButton:disabled { background-color: #1a1a1d; color: #555; "
+            "border-color: #2a2a2d; }"
+        )
+        # Layout : 1 bouton par son dispo. Pour 1 son au demarrage,
+        # tres simple. Quand on aura plus de sons, on les groupera en
+        # grille (ex: 4 par ligne) plus tard.
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+        # Construction des boutons depuis MainWindow.SOUNDBOARD_FILES.
+        # On garde une reference au QPushButton et le timestamp du
+        # dernier clic accepte pour gerer le cooldown 2s par bouton.
+        self._buttons: dict = {}        # sound_id -> QPushButton
+        self._last_click_ts: dict = {}  # sound_id -> monotonic ts du dernier clic
+        # Etat global "un son joue actuellement" (regle un seul son a la
+        # fois). Quand True, tous les boutons sont disabled visuellement.
+        self._is_playing_now = False
+        if self._main is not None and hasattr(self._main, "SOUNDBOARD_FILES"):
+            files = self._main.SOUNDBOARD_FILES
+        else:
+            files = {}
+        if not files:
+            v.addWidget(QLabel("(Aucun son disponible)"))
+        for sound_id in files.keys():
+            label = self._format_label(sound_id)
+            btn = QPushButton(label)
+            btn.clicked.connect(
+                lambda checked=False, sid=sound_id: self._on_clicked(sid)
+            )
+            self._buttons[sound_id] = btn
+            v.addWidget(btn)
+        # Taille auto au contenu
+        self.adjustSize()
+
+    @staticmethod
+    def _format_label(sound_id: str) -> str:
+        """Met en forme le label d'un bouton a partir du sound_id."""
+        emoji_map = {
+            "alarme": "🚨",
+        }
+        emoji = emoji_map.get(sound_id, "🔊")
+        # Capitalise sound_id pour affichage
+        return f"{emoji}  {sound_id.capitalize()}"
+
+    def _on_clicked(self, sound_id: str):
+        """Relaie le clic vers MainWindow._on_soundboard_sound_clicked.
+        Applique d'abord :
+          1. Cooldown 2s par bouton (anti-spam, ignore les clics rapides).
+          2. Regle "un seul son a la fois" : si un son joue actuellement,
+             on rejette le nouveau clic sans rien envoyer.
+        Si le clic passe les 2 filtres, on emet le message WS au serveur.
+        Le ts du dernier clic accepte est stocke pour le cooldown."""
+        now = time.monotonic()
+        # 1. Cooldown 2s
+        last_ts = self._last_click_ts.get(sound_id, 0.0)
+        if now - last_ts < self.COOLDOWN_S:
+            # Trop tot, on ignore silencieusement (pas de log spam).
+            return
+        # 2. "Un seul son a la fois" - on demande l'etat a audio_io.
+        # Note : on consulte audio_io directement plutot que
+        # self._is_playing_now parce que ce flag est mis a jour via
+        # un QTimer cote MainWindow et peut etre un peu en retard
+        # (race condition possible juste apres un clic).
+        try:
+            audio = getattr(state, "audio_io", None) if _CORE_AVAILABLE else None
+            if audio is not None and audio.is_soundboard_playing():
+                # Un son joue deja -> on ignore. Pas de log non plus
+                # (l'utilisateur a peut-etre clique vite par mistake,
+                # pas la peine de spammer).
+                return
+        except Exception:
+            pass
+        # Clic accepte : on memorise et on transmet.
+        self._last_click_ts[sound_id] = now
+        if self._main is not None:
+            try:
+                self._main._on_soundboard_sound_clicked(sound_id)
+            except Exception as e:
+                try:
+                    self._main._on_log(
+                        f"[SOUNDBOARD] click handler KO : {e}"
+                    )
+                except Exception:
+                    pass
+
+    def set_playing_state(self, playing: bool):
+        """Met a jour l'etat de lecture. Appele par MainWindow via un
+        QTimer qui interroge audio_io.is_soundboard_playing() toutes les
+        100ms. Quand playing change, on grise/degrise tous les boutons
+        visuellement (l'utilisateur sait qu'il ne peut pas relancer)."""
+        if playing == self._is_playing_now:
+            return  # rien a faire
+        self._is_playing_now = playing
+        for btn in self._buttons.values():
+            try:
+                btn.setEnabled(not playing)
+            except Exception:
+                pass
+
+
+# ======================================================================
+# CircusPhone (Feature 4, D4) : overlay smartphone
+# ======================================================================
+# Fenetre overlay frameless + topmost qui reproduit un smartphone :
+# corps noir arrondi, bandeau "CircusPhone", grand ecran. L'ecran affiche
+# differents "ecrans" (pages internes) ; D4 etape 1 ne gere que l'ecran
+# par defaut : la liste de l'annuaire (contacts connectes / deconnectes).
+# Les ecrans appel entrant / en cours / messagerie viendront ensuite.
+#
+# Apparition : animation de montee depuis le bas (400ms), position finale
+# aux 3/4 droite de l'ecran. Taille adaptative selon la resolution.
+
+# --- Palette du smartphone (reprise du mockup SVG) ---
+_PHONE_BODY_COLOR    = "#1a1a1a"   # corps du telephone
+_PHONE_BTN_COLOR     = "#0a0a0a"   # boutons lateraux
+_PHONE_SCREEN_BG     = "#ffffff"   # fond de l'ecran
+_PHONE_BANNER_GREY   = "#888888"   # "Circus" (petit, gris)
+_PHONE_BANNER_WHITE  = "#ffffff"   # "Phone" (grand, blanc)
+_PHONE_DOT_ONLINE    = "#3fb950"   # pastille joueur connecte (vert)
+_PHONE_DOT_OFFLINE   = "#7a1f1f"   # pastille joueur deconnecte (rouge fonce)
+_PHONE_NAME_ONLINE   = "#1a1a1a"   # nom d'un connecte (sombre, lisible)
+_PHONE_NAME_OFFLINE  = "#9aa0a6"   # nom d'un deconnecte (gris)
+_PHONE_ACCENT        = "#2f6fed"   # accent (icones cliquables)
+_PHONE_SCREEN_TXT    = "#3a3f44"   # texte courant sur l'ecran
+# Boutons d'appel (ecrans incoming / outgoing / in_call)
+_PHONE_BTN_ACCEPT       = "#3fb950"   # decrocher (vert)
+_PHONE_BTN_HANGUP       = "#f85149"   # refuser / raccrocher (rouge)
+_PHONE_BTN_TOGGLE_OFF   = "#6e7681"   # toggle inactif (gris)
+_PHONE_BTN_TOGGLE_ON    = "#f85149"   # toggle mute actif (rouge : muet)
+_PHONE_BTN_TOGGLE_SPEAKER = "#ffffff" # toggle HP actif (blanc, spec)
+
+
+class _AvatarWidget(QLabel):
+    """[D5] Avatar rond pour les emplacements CircusPhone (header MP,
+    header appel, item contact). Affiche un JPEG passe en bytes, clippe
+    par un cercle (QPainterPath). Si aucune photo n'est fournie (bytes
+    None ou vides), le widget reste vide visuellement (transparent) :
+    selon la spec D5, pas de placeholder graphique - l'emplacement
+    'disparait' simplement.
+
+    Pour gerer le 'pas d'avatar = pas d'emplacement', le parent doit
+    appeler set_photo_bytes(None) ou setVisible(False) selon le rendu
+    voulu. Ce widget ne cache pas tout seul (un layout qui le contient
+    peut decider de le hider via setVisible).
+    """
+
+    def __init__(self, size: int, parent=None):
+        super().__init__(parent)
+        self._size = int(size)
+        self.setFixedSize(self._size, self._size)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setStyleSheet("background:transparent;")
+        self._has_photo: bool = False
+        self._pixmap: QPixmap | None = None
+
+    def set_photo_bytes(self, jpeg_bytes):
+        """Charge un JPEG depuis des bytes. None ou bytes vides -> pas de
+        photo (widget transparent)."""
+        if not jpeg_bytes:
+            self._has_photo = False
+            self._pixmap = None
+            self.update()
+            return
+        try:
+            pm = QPixmap()
+            ok = pm.loadFromData(jpeg_bytes, "JPEG") or pm.loadFromData(jpeg_bytes)
+            if not ok or pm.isNull():
+                self._has_photo = False
+                self._pixmap = None
+                self.update()
+                return
+            # Resize au max au cote du widget pour limiter le travail
+            # de QPainter et eviter l'aliasing.
+            self._pixmap = pm.scaled(
+                self._size * 2, self._size * 2,
+                Qt.KeepAspectRatioByExpanding,
+                Qt.SmoothTransformation,
+            )
+            self._has_photo = True
+        except Exception:
+            self._has_photo = False
+            self._pixmap = None
+        self.update()
+
+    def has_photo(self) -> bool:
+        return self._has_photo
+
+    def paintEvent(self, ev):
+        if not self._has_photo or self._pixmap is None:
+            return
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.Antialiasing, True)
+            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            # Clip circulaire.
+            path = QPainterPath()
+            path.addEllipse(0, 0, self._size, self._size)
+            p.setClipPath(path)
+            # Centrer le pixmap (qui est plus grand que le widget pour le
+            # crop center via KeepAspectRatioByExpanding).
+            pm = self._pixmap
+            x = (self._size - pm.width()) // 2
+            y = (self._size - pm.height()) // 2
+            p.drawPixmap(x, y, pm)
+        finally:
+            p.end()
+
+
+class _PhoneIconLabel(QLabel):
+    """Petite icone vectorielle dessinee en QPainter (combine / enveloppe).
+    Cliquable : emet sig_clicked si enabled. Utilisee dans les lignes de
+    contact (icone telephone + icone lettre en bout de ligne).
+    Support optionnel d'un badge "unread" : un petit cercle rouge dans le
+    coin superieur droit, utilise pour signaler des MP non lus sur
+    l'enveloppe (D4 etape 3)."""
+
+    sig_clicked = Signal()
+
+    def __init__(self, kind: str, size: int, enabled: bool, parent=None):
+        super().__init__(parent)
+        self._kind = kind          # "phone" | "letter" | "forget"
+        self._sz = size
+        self._enabled_click = enabled
+        self._badge = False
+        # Surbrillance navigation clavier (D-pad) : quand True, on dessine
+        # un halo arrondi derriere l'icone pour montrer que cette action
+        # (Appeler / Message) est celle qui sera declenchee par Entree.
+        self._nav_sel = False
+        self.setFixedSize(size, size)
+        self.setCursor(Qt.PointingHandCursor if enabled else Qt.ArrowCursor)
+
+    def set_badge(self, on: bool):
+        """Active/desactive le badge rouge "unread". Repeint si change."""
+        on = bool(on)
+        if self._badge != on:
+            self._badge = on
+            self.update()
+
+    def set_nav_selected(self, on: bool):
+        """Active/desactive le halo de selection navigation clavier."""
+        on = bool(on)
+        if self._nav_sel != on:
+            self._nav_sel = on
+            self.update()
+
+    def mousePressEvent(self, ev):
+        if self._enabled_click and ev.button() == Qt.LeftButton:
+            self.sig_clicked.emit()
+        super().mousePressEvent(ev)
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        s = self._sz
+        # Carre de selection navigation clavier : dessine EN PREMIER (sous
+        # l'icone) pour signaler l'action ciblee par le D-pad. Carre a bords
+        # arrondis, bleu accent avec transparence (fond leger).
+        if self._nav_sel:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(_PHONE_ACCENT))
+            p.setOpacity(0.22)
+            p.drawRoundedRect(0, 0, s, s, s * 0.28, s * 0.28)
+            p.setOpacity(1.0)
+        # Couleur : accent si cliquable, gris si non.
+        col = QColor(_PHONE_ACCENT if self._enabled_click else "#c2c6cb")
+        if self._kind == "phone":
+            # TODO REVERT (icone v2) : combine telephone "fluide" en plein
+            # (style smartphone moderne). Pour revenir a l'ancien arc + 2 ronds :
+            # restaurer le bloc drawArc + 2 drawEllipse precedent.
+            #
+            # Forme : combine type iOS, plein, en diagonale. Path normalise
+            # sur un viewport 80x80 (avec une marge ~10% autour) puis
+            # rescaled a s. Toutes les coords sont en proportions de s.
+            from PySide6.QtGui import QPainterPath
+            path = QPainterPath()
+            def P(x, y):
+                # 80x80 source -> s actuel
+                return (x / 80.0) * s, (y / 80.0) * s
+            # On reproduit le path SVG choisi (proposition 2).
+            # Origine : haut-gauche du combine
+            x, y = P(18, 18)
+            path.moveTo(x, y)
+            # Q 18 12, 24 12
+            cx1, cy1 = P(18, 12); ex, ey = P(24, 12)
+            path.quadTo(cx1, cy1, ex, ey)
+            # L 32 12
+            ex, ey = P(32, 12)
+            path.lineTo(ex, ey)
+            # Q 38 12, 38 18
+            cx1, cy1 = P(38, 12); ex, ey = P(38, 18)
+            path.quadTo(cx1, cy1, ex, ey)
+            # L 38 24
+            ex, ey = P(38, 24)
+            path.lineTo(ex, ey)
+            # Q 38 30, 34 32
+            cx1, cy1 = P(38, 30); ex, ey = P(34, 32)
+            path.quadTo(cx1, cy1, ex, ey)
+            # Q 32 33, 32 36
+            cx1, cy1 = P(32, 33); ex, ey = P(32, 36)
+            path.quadTo(cx1, cy1, ex, ey)
+            # Q 32 44, 40 52
+            cx1, cy1 = P(32, 44); ex, ey = P(40, 52)
+            path.quadTo(cx1, cy1, ex, ey)
+            # Q 48 60, 56 60
+            cx1, cy1 = P(48, 60); ex, ey = P(56, 60)
+            path.quadTo(cx1, cy1, ex, ey)
+            # Q 59 60, 60 58
+            cx1, cy1 = P(59, 60); ex, ey = P(60, 58)
+            path.quadTo(cx1, cy1, ex, ey)
+            # Q 62 54, 68 54
+            cx1, cy1 = P(62, 54); ex, ey = P(68, 54)
+            path.quadTo(cx1, cy1, ex, ey)
+            # L 74 54
+            ex, ey = P(74, 54)
+            path.lineTo(ex, ey)
+            # Q 80 54, 80 60
+            cx1, cy1 = P(80, 54); ex, ey = P(80, 60)
+            path.quadTo(cx1, cy1, ex, ey)
+            # L 80 68
+            ex, ey = P(80, 68)
+            path.lineTo(ex, ey)
+            # Q 80 74, 74 74
+            cx1, cy1 = P(80, 74); ex, ey = P(74, 74)
+            path.quadTo(cx1, cy1, ex, ey)
+            # Q 50 74, 30 54
+            cx1, cy1 = P(50, 74); ex, ey = P(30, 54)
+            path.quadTo(cx1, cy1, ex, ey)
+            # Q 18 38, 18 28
+            cx1, cy1 = P(18, 38); ex, ey = P(18, 28)
+            path.quadTo(cx1, cy1, ex, ey)
+            path.closeSubpath()
+            p.setPen(Qt.NoPen)
+            p.setBrush(col)
+            p.drawPath(path)
+        elif self._kind == "letter":
+            # Enveloppe : rectangle + rabat en V.
+            pen = QPen(col, max(1.6, s * 0.11))
+            pen.setJoinStyle(Qt.RoundJoin)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            m = s * 0.20
+            w = s - 2 * m
+            h = w * 0.68
+            top = (s - h) / 2
+            p.drawRect(int(m), int(top), int(w), int(h))
+            # Rabat
+            p.drawLine(int(m), int(top), int(s / 2), int(top + h * 0.55))
+            p.drawLine(int(s / 2), int(top + h * 0.55),
+                       int(m + w), int(top))
+        elif self._kind == "forget":
+            # Croix "oublier ce contact".
+            pen = QPen(col, max(1.6, s * 0.14))
+            pen.setCapStyle(Qt.RoundCap)
+            p.setPen(pen)
+            m = s * 0.30
+            p.drawLine(int(m), int(m), int(s - m), int(s - m))
+            p.drawLine(int(s - m), int(m), int(m), int(s - m))
+        elif self._kind == "back":
+            # Fleche retour vers la gauche (chevron).
+            pen = QPen(col, max(2.0, s * 0.14))
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            cx = s * 0.56
+            cy = s * 0.5
+            arm = s * 0.22
+            p.drawLine(int(cx), int(cy - arm), int(cx - arm), int(cy))
+            p.drawLine(int(cx - arm), int(cy), int(cx), int(cy + arm))
+            # Petite barre horizontale pour suggerer "retour".
+            p.drawLine(int(cx - arm), int(cy), int(s * 0.84), int(cy))
+        elif self._kind == "send":
+            # Avion en papier / fleche d'envoi (triangle vers la droite).
+            p.setPen(Qt.NoPen)
+            p.setBrush(col)
+            from PySide6.QtGui import QPolygon
+            poly = QPolygon([
+                QPoint(int(s * 0.18), int(s * 0.30)),
+                QPoint(int(s * 0.82), int(s * 0.50)),
+                QPoint(int(s * 0.18), int(s * 0.70)),
+                QPoint(int(s * 0.30), int(s * 0.50)),
+            ])
+            p.drawPolygon(poly)
+        elif self._kind == "gear":
+            # Engrenage (D5 a venir : reglages profil). 8 dents
+            # rectangulaires reparties tous les 45° autour d'un anneau
+            # central + trou au milieu. Dessin en plein pour bien voir
+            # a petite taille.
+            cx = s / 2.0
+            cy = s / 2.0
+            # Rayon externe (pointe des dents) et interne (anneau)
+            r_out = s * 0.46
+            r_in  = s * 0.34
+            # Largeur angulaire de chaque dent
+            tooth_half_deg = 14  # demi-angle en degres
+            p.setPen(Qt.NoPen)
+            p.setBrush(col)
+            # 1) Dents : 8 polygones trapezoidaux
+            import math
+            for i in range(8):
+                base_angle = i * 45  # degres
+                a1 = math.radians(base_angle - tooth_half_deg)
+                a2 = math.radians(base_angle + tooth_half_deg)
+                # 4 sommets : 2 sur le cercle interne, 2 sur l'externe
+                from PySide6.QtGui import QPolygonF
+                from PySide6.QtCore import QPointF
+                poly = QPolygonF([
+                    QPointF(cx + r_in * math.cos(a1), cy + r_in * math.sin(a1)),
+                    QPointF(cx + r_out * math.cos(a1), cy + r_out * math.sin(a1)),
+                    QPointF(cx + r_out * math.cos(a2), cy + r_out * math.sin(a2)),
+                    QPointF(cx + r_in * math.cos(a2), cy + r_in * math.sin(a2)),
+                ])
+                p.drawPolygon(poly)
+            # 2) Anneau central : disque plein
+            p.drawEllipse(QPointF(cx, cy), r_in, r_in)
+            # 3) Trou au milieu : on dessine un cercle blanc (= couleur de
+            #    fond du telephone) plutot que de "trouer" avec
+            #    CompositionMode_Clear. Avant, le clear creait une vraie
+            #    transparence dans le QPixmap, ce qui faisait apparaitre
+            #    ce qui est derriere le widget icone (noir, jaune selon
+            #    contexte) au lieu du fond blanc du telephone. Un cercle
+            #    blanc plein est plus simple et fiable.
+            hole_r = s * 0.13
+            p.setBrush(QColor("#ffffff"))
+            p.drawEllipse(QPointF(cx, cy), hole_r, hole_r)
+        # Badge "unread" : cercle rouge dans le coin superieur droit. Pose
+        # par-dessus l'icone. Taille proportionnelle a l'icone.
+        if self._badge:
+            br = max(4, int(s * 0.30))
+            bx = s - br - max(1, int(s * 0.04))
+            by = max(1, int(s * 0.04))
+            p.setPen(Qt.NoPen)
+            # Liseret blanc fin pour bien detacher du fond.
+            p.setBrush(QColor("#ffffff"))
+            p.drawEllipse(bx - 1, by - 1, br + 2, br + 2)
+            p.setBrush(QColor("#f85149"))
+            p.drawEllipse(bx, by, br, br)
+        p.end()
+
+
+class _PhoneContactRow(QWidget):
+    """Une ligne de contact dans l'ecran annuaire : pastille de statut,
+    [D5 optionnel : avatar rond si photo disponible], nom, et en bout de
+    ligne soit (telephone + lettre) si connecte, soit (croix "oublier") si
+    deconnecte."""
+
+    sig_call    = Signal(str)   # pseudo : clic sur l'icone telephone
+    sig_message = Signal(str)   # pseudo : clic sur l'icone lettre
+    sig_forget  = Signal(str)   # pseudo : clic sur la croix "oublier"
+
+    def __init__(self, pseudo: str, online: bool, row_h: int,
+                 unread: bool = False, photo_bytes=None, parent=None):
+        super().__init__(parent)
+        self._pseudo = pseudo
+        self._online = online
+        self.setFixedHeight(row_h)
+        icon_sz = max(14, int(row_h * 0.55))
+        dot_sz  = max(7, int(row_h * 0.28))
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 0, 8, 0)
+        lay.setSpacing(6)
+
+        # Pastille de statut (cercle plein dessine via QSS border-radius).
+        dot = QLabel()
+        dot.setFixedSize(dot_sz, dot_sz)
+        dot_col = _PHONE_DOT_ONLINE if online else _PHONE_DOT_OFFLINE
+        dot.setStyleSheet(
+            f"background:{dot_col}; border-radius:{dot_sz // 2}px;"
+        )
+        lay.addWidget(dot)
+
+        # [D5] Avatar : insere SEULEMENT si on a des bytes valides.
+        # Pas de photo -> rien (spec : on ne reserve pas d'emplacement).
+        self._avatar = None
+        if photo_bytes:
+            av_sz = max(20, int(row_h * 0.80))
+            self._avatar = _AvatarWidget(av_sz, self)
+            self._avatar.set_photo_bytes(photo_bytes)
+            if self._avatar.has_photo():
+                lay.addWidget(self._avatar)
+            else:
+                # Bytes corrompus : on ne montre rien.
+                self._avatar.deleteLater()
+                self._avatar = None
+
+        # Nom du contact.
+        name = QLabel(pseudo)
+        name_col = _PHONE_NAME_ONLINE if online else _PHONE_NAME_OFFLINE
+        weight = "600" if online else "400"
+        name.setStyleSheet(
+            f"color:{name_col}; font-size:10pt; font-weight:{weight}; "
+            "background:transparent;"
+        )
+        lay.addWidget(name, stretch=1)
+
+        # Actions en bout de ligne.
+        # Refs exposees pour la navigation clavier (D-pad). None si l'icone
+        # n'existe pas sur cette ligne (ex: contact deconnecte = pas
+        # d'icones phone/letter).
+        self._ic_phone = None
+        self._ic_letter = None
+        if online:
+            # Connecte : telephone + lettre, tous deux cliquables.
+            ic_phone = _PhoneIconLabel("phone", icon_sz, True, self)
+            ic_phone.sig_clicked.connect(
+                lambda: self.sig_call.emit(self._pseudo)
+            )
+            lay.addWidget(ic_phone)
+            self._ic_phone = ic_phone
+            ic_letter = _PhoneIconLabel("letter", icon_sz, True, self)
+            ic_letter.set_badge(bool(unread))
+            ic_letter.sig_clicked.connect(
+                lambda: self.sig_message.emit(self._pseudo)
+            )
+            lay.addWidget(ic_letter)
+            self._ic_letter = ic_letter
+        else:
+            # Deconnecte : seulement la croix "oublier".
+            ic_forget = _PhoneIconLabel("forget", icon_sz, True, self)
+            ic_forget.sig_clicked.connect(
+                lambda: self.sig_forget.emit(self._pseudo)
+            )
+            lay.addWidget(ic_forget)
+
+    def pseudo(self) -> str:
+        """Pseudo du contact de cette ligne."""
+        return self._pseudo
+
+    def is_online(self) -> bool:
+        """True si le contact est connecte (donc navigable au D-pad)."""
+        return self._online
+
+    def set_nav_highlight(self, selected: bool, action: int = 0):
+        """Surbrillance navigation clavier.
+          selected : True si cette ligne est la ligne courante du D-pad.
+          action   : 0 = Appeler (phone), 1 = Message (letter). Ignore si
+                     la ligne n'est pas selectionnee.
+        Dessine un halo sur l'icone de l'action ciblee. Sur une ligne
+        deconnectee (pas d'icones), rien (ces lignes ne sont pas navigables
+        dans le scope actuel : appel + message uniquement)."""
+        if self._ic_phone is not None:
+            self._ic_phone.set_nav_selected(selected and action == 0)
+        if self._ic_letter is not None:
+            self._ic_letter.set_nav_selected(selected and action == 1)
+
+
+class _PhoneMessageInput(QTextEdit):
+    """Champ de saisie multi-lignes pour la messagerie. Compact a vide
+    (~1.5 ligne), grandit jusqu'a 4 lignes max quand on tape, puis scroll
+    interne. Entree envoie le message (sig_submit), Shift+Entree insere
+    une nouvelle ligne. Limite la longueur a max_chars caracteres."""
+
+    sig_submit  = Signal()
+    sig_changed = Signal(str)
+
+    # Styles QSS : normal vs selectionne par la navigation clavier (bordure
+    # bleue accent + fond legerement teinte, coherent avec le carre des
+    # icones).
+    _QSS_NORMAL = (
+        "QTextEdit { background:#f0f1f3; color:#1a1a1a; "
+        "font-size:10pt; border:1px solid #d0d3d7; border-radius:6px; "
+        "padding:4px 6px; }"
+    )
+    _QSS_NAV_SEL = (
+        "QTextEdit { background:#eaf0fd; color:#1a1a1a; "
+        "font-size:10pt; border:1px solid %s; border-radius:6px; "
+        "padding:4px 6px; }" % _PHONE_ACCENT
+    )
+
+    def set_nav_selected(self, on: bool):
+        """Surbrillance navigation clavier : bordure accent quand le champ
+        est la cible courante du D-pad (avant d'y entrer pour taper)."""
+        self.setStyleSheet(self._QSS_NAV_SEL if on else self._QSS_NORMAL)
+
+    def __init__(self, max_chars: int = 500, parent=None):
+        super().__init__(parent)
+        self._max_chars = max_chars
+        self._silent = False
+        self.setAcceptRichText(False)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setStyleSheet(self._QSS_NORMAL)
+        # Hauteur initiale ~ 1.5 ligne.
+        fm = self.fontMetrics()
+        self._line_h = fm.lineSpacing()
+        self.setFixedHeight(self._line_h + 14)
+        self._max_height = self._line_h * 4 + 14
+        self.textChanged.connect(self._on_text_changed)
+
+    def _on_text_changed(self):
+        # Tronquer si depasse max_chars.
+        txt = self.toPlainText()
+        if len(txt) > self._max_chars:
+            txt = txt[:self._max_chars]
+            self.blockSignals(True)
+            self.setPlainText(txt)
+            # Replacer le curseur a la fin.
+            c = self.textCursor()
+            c.movePosition(QTextCursor.End)
+            self.setTextCursor(c)
+            self.blockSignals(False)
+        # Adapter la hauteur (entre 1 ligne + padding et max 4 lignes).
+        doc_h = int(self.document().size().height()) + 10
+        new_h = max(self._line_h + 14, min(self._max_height, doc_h))
+        if new_h != self.height():
+            self.setFixedHeight(new_h)
+        if not self._silent:
+            self.sig_changed.emit(txt)
+
+    def set_text_silent(self, text: str):
+        """Remplit le champ SANS emettre sig_changed (utilise pour
+        restaurer un brouillon sans declencher de boucle de sauvegarde)."""
+        self._silent = True
+        try:
+            self.setPlainText(text or "")
+            # Curseur en fin.
+            c = self.textCursor()
+            c.movePosition(QTextCursor.End)
+            self.setTextCursor(c)
+        finally:
+            self._silent = False
+
+    def keyPressEvent(self, ev):
+        # Entree sans modificateurs : envoyer. Shift+Entree : nouvelle ligne.
+        if ev.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if ev.modifiers() & Qt.ShiftModifier:
+                super().keyPressEvent(ev)
+            else:
+                self.sig_submit.emit()
+                return
+        else:
+            super().keyPressEvent(ev)
+
+
+class _PhoneMessageBubble(QFrame):
+    """Bulle d'un message dans la conversation. is_me=True : a droite,
+    couleur accent ; is_me=False : a gauche, couleur grise. Largeur max
+    a ~75% de la largeur d'ecran pour laisser de la respiration.
+
+    Le timestamp est affiche en petit en bas a droite de la bulle (style
+    messagerie type WhatsApp). Format "JJ/MM HH:MM" (ajout 23/05/2026)."""
+
+    def __init__(self, body: str, is_me: bool, screen_w: int,
+                 ts: float = 0.0, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.NoFrame)
+        # On utilise un QHBoxLayout exterieur pour pousser la bulle a
+        # gauche ou a droite via un stretch sur l'autre cote.
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        # Conteneur interne : body + timestamp empiles verticalement, le
+        # tout dans un QFrame stylise (la bulle).
+        bubble = QFrame(self)
+        inner = QVBoxLayout(bubble)
+        inner.setContentsMargins(10, 6, 10, 4)
+        inner.setSpacing(2)
+        # Body
+        lbl_body = QLabel(body or "")
+        lbl_body.setWordWrap(True)
+        lbl_body.setStyleSheet("background:transparent; font-size:12pt;")
+        inner.addWidget(lbl_body)
+        # Timestamp : format "JJ/MM HH:MM" (ex: "23/05 12:34"). Si ts=0
+        # (vieux message sans ts dans le JSON, ou bug), on n'affiche rien
+        # plutot que "01/01 01:00" qui serait trompeur.
+        ts_text = ""
+        if ts and ts > 0:
+            try:
+                ts_text = time.strftime("%d/%m %H:%M", time.localtime(ts))
+            except Exception:
+                ts_text = ""
+        if ts_text:
+            lbl_ts = QLabel(ts_text)
+            # Alignement a droite dans tous les cas (style messagerie).
+            lbl_ts.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            inner.addWidget(lbl_ts)
+        else:
+            lbl_ts = None
+        # Largeur max sur le conteneur (pas sur le QLabel body, sinon Qt
+        # peut wrap differemment).
+        bubble.setMaximumWidth(int(screen_w * 0.72))
+        # Style de la bulle + couleur du timestamp selon l'expediteur.
+        if is_me:
+            bubble.setStyleSheet(
+                f"QFrame {{ background:{_PHONE_ACCENT}; border-radius:10px; }}"
+            )
+            lbl_body.setStyleSheet(
+                "background:transparent; color:#ffffff; font-size:12pt;"
+            )
+            if lbl_ts is not None:
+                # Timestamp semi-transparent sur fond accent : blanc 60%.
+                lbl_ts.setStyleSheet(
+                    "background:transparent; color:rgba(255,255,255,160); "
+                    "font-size:8pt;"
+                )
+            outer.addStretch(1)
+            outer.addWidget(bubble)
+        else:
+            bubble.setStyleSheet(
+                "QFrame { background:#e8eaed; border-radius:10px; }"
+            )
+            lbl_body.setStyleSheet(
+                "background:transparent; color:#1a1a1a; font-size:12pt;"
+            )
+            if lbl_ts is not None:
+                # Timestamp semi-transparent sur fond clair : gris fonce 55%.
+                lbl_ts.setStyleSheet(
+                    "background:transparent; color:rgba(26,26,26,140); "
+                    "font-size:8pt;"
+                )
+            outer.addWidget(bubble)
+            outer.addStretch(1)
+
+
+class _PhoneCircleButton(QLabel):
+    """Bouton rond plein dessine en QPainter, avec une icone vectorielle
+    blanche au centre. Utilise pour les actions principales des ecrans
+    d'appel : decrocher (vert), raccrocher / refuser (rouge).
+      kind : "phone_acc"  (combine droit, decrocher)
+             "phone_hang" (combine penche, raccrocher / refuser)
+    """
+
+    sig_clicked = Signal()
+
+    def __init__(self, kind: str, bg_color: str, size: int, parent=None):
+        super().__init__(parent)
+        self._kind = kind
+        self._bg = bg_color
+        self._sz = size
+        self.setFixedSize(size, size)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            self.sig_clicked.emit()
+        super().mousePressEvent(ev)
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        s = self._sz
+        # Cercle de fond.
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(self._bg))
+        p.drawEllipse(0, 0, s, s)
+        # TODO REVERT (icone v2) : icone combine "fluide" en plein, blanc
+        # sur fond colore. Memes courbes que _PhoneIconLabel proposition 2.
+        # Pour le bouton "raccrocher", on pivote l'icone de 135° (combine
+        # basculé). Pour revenir a l'ancien arc + 2 ronds : restaurer
+        # l'ancien bloc drawArc + 2 drawEllipse.
+        from PySide6.QtGui import QPainterPath
+        # Le combine est dessine dans un viewport 80x80 source, mais la
+        # forme reelle occupe x=12..80 (largeur 68) et y=12..74 (hauteur 62).
+        # Son centre est donc en (46, 43) et NON (40, 40). Pour bien le
+        # centrer dans le bouton rond, on doit donc decaler en consequence.
+        icon_scale = (s * 0.72) / 80.0    # echelle viewport -> bouton
+        # Centre voulu dans le bouton : (s/2, s/2)
+        # Centre actuel de l'icone apres scale : (46 * icon_scale, 43 * icon_scale)
+        # Offset = (s/2) - (centre_icone_apres_scale)
+        ox = s / 2.0 - 46 * icon_scale
+        oy = s / 2.0 - 43 * icon_scale
+        def P(x, y):
+            return ox + x * icon_scale, oy + y * icon_scale
+        path = QPainterPath()
+        x, y = P(18, 18); path.moveTo(x, y)
+        cx1, cy1 = P(18, 12); ex, ey = P(24, 12); path.quadTo(cx1, cy1, ex, ey)
+        ex, ey = P(32, 12); path.lineTo(ex, ey)
+        cx1, cy1 = P(38, 12); ex, ey = P(38, 18); path.quadTo(cx1, cy1, ex, ey)
+        ex, ey = P(38, 24); path.lineTo(ex, ey)
+        cx1, cy1 = P(38, 30); ex, ey = P(34, 32); path.quadTo(cx1, cy1, ex, ey)
+        cx1, cy1 = P(32, 33); ex, ey = P(32, 36); path.quadTo(cx1, cy1, ex, ey)
+        cx1, cy1 = P(32, 44); ex, ey = P(40, 52); path.quadTo(cx1, cy1, ex, ey)
+        cx1, cy1 = P(48, 60); ex, ey = P(56, 60); path.quadTo(cx1, cy1, ex, ey)
+        cx1, cy1 = P(59, 60); ex, ey = P(60, 58); path.quadTo(cx1, cy1, ex, ey)
+        cx1, cy1 = P(62, 54); ex, ey = P(68, 54); path.quadTo(cx1, cy1, ex, ey)
+        ex, ey = P(74, 54); path.lineTo(ex, ey)
+        cx1, cy1 = P(80, 54); ex, ey = P(80, 60); path.quadTo(cx1, cy1, ex, ey)
+        ex, ey = P(80, 68); path.lineTo(ex, ey)
+        cx1, cy1 = P(80, 74); ex, ey = P(74, 74); path.quadTo(cx1, cy1, ex, ey)
+        cx1, cy1 = P(50, 74); ex, ey = P(30, 54); path.quadTo(cx1, cy1, ex, ey)
+        cx1, cy1 = P(18, 38); ex, ey = P(18, 28); path.quadTo(cx1, cy1, ex, ey)
+        path.closeSubpath()
+        # Bouton "raccrocher" : on pivote l'icone 135° autour du centre.
+        if self._kind == "phone_hang":
+            p.save()
+            p.translate(s / 2, s / 2)
+            p.rotate(135)
+            p.translate(-s / 2, -s / 2)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#ffffff"))
+        p.drawPath(path)
+        if self._kind == "phone_hang":
+            p.restore()
+        p.end()
+
+
+class _PhoneToggleButton(QLabel):
+    """Bouton circulaire toggleable (mute micro / haut-parleur). Change de
+    couleur de fond entre l'etat inactif et actif. Une icone vectorielle
+    (microphone ou haut-parleur) est dessinee par-dessus.
+      kind : "mic"     (microphone, barre quand actif = mute)
+             "speaker" (haut-parleur)
+    """
+
+    sig_toggled = Signal(bool)   # emis avec le nouvel etat actif
+
+    def __init__(self, kind: str, color_off: str, color_on: str,
+                 size: int, parent=None):
+        super().__init__(parent)
+        self._kind = kind
+        self._color_off = color_off
+        self._color_on  = color_on
+        self._sz = size
+        self._active = False
+        self.setFixedSize(size, size)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def is_active(self) -> bool:
+        return self._active
+
+    def set_active(self, active: bool, emit: bool = True):
+        """Force l'etat actif/inactif. Si emit=False, ne reemet pas le
+        signal (utilise au reset entre 2 appels)."""
+        if self._active == bool(active):
+            return
+        self._active = bool(active)
+        self.update()
+        if emit:
+            self.sig_toggled.emit(self._active)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            self.set_active(not self._active, emit=True)
+        super().mousePressEvent(ev)
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        s = self._sz
+        bg = self._color_on if self._active else self._color_off
+        # Cercle de fond.
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(bg))
+        p.drawEllipse(0, 0, s, s)
+        # Icone : la couleur de l'icone contraste avec le fond. Pour le HP
+        # actif (fond blanc), on dessine l'icone en noir ; sinon en blanc.
+        ic_color = "#1a1a1a" if (self._active and self._kind == "speaker") \
+                   else "#ffffff"
+        pen = QPen(QColor(ic_color), max(2.0, s * 0.10))
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        if self._kind == "mic":
+            # Microphone : ovale en haut + arc + pied.
+            cx = s / 2
+            top = s * 0.22
+            bot = s * 0.56
+            w = s * 0.22
+            # Capsule ovale du micro.
+            p.setBrush(QColor(ic_color))
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(int(cx - w / 2), int(top),
+                              int(w), int(bot - top),
+                              int(w / 2), int(w / 2))
+            # Arc de support + pied.
+            p.setBrush(Qt.NoBrush)
+            p.setPen(pen)
+            arc_left = s * 0.30
+            arc_right = s * 0.70
+            arc_top = s * 0.46
+            arc_bot = s * 0.66
+            p.drawArc(int(arc_left), int(arc_top),
+                      int(arc_right - arc_left), int(arc_bot - arc_top),
+                      180 * 16, 180 * 16)
+            p.drawLine(int(cx), int(arc_bot), int(cx), int(s * 0.78))
+            # Barre "muted" : ligne diagonale quand actif.
+            if self._active:
+                pen2 = QPen(QColor(ic_color), max(2.5, s * 0.12))
+                pen2.setCapStyle(Qt.RoundCap)
+                p.setPen(pen2)
+                p.drawLine(int(s * 0.22), int(s * 0.22),
+                           int(s * 0.78), int(s * 0.78))
+        elif self._kind == "speaker":
+            # Haut-parleur : carre trapezoidale + 2 arcs d'ondes.
+            p.setBrush(QColor(ic_color))
+            p.setPen(Qt.NoPen)
+            # Corps du HP (petit rect + trapeze)
+            box_l = s * 0.26
+            box_r = s * 0.42
+            box_t = s * 0.40
+            box_b = s * 0.60
+            from PySide6.QtGui import QPolygon
+            poly = QPolygon([
+                QPoint(int(box_l), int(box_t)),
+                QPoint(int(box_r), int(box_t)),
+                QPoint(int(s * 0.58), int(s * 0.28)),
+                QPoint(int(s * 0.58), int(s * 0.72)),
+                QPoint(int(box_r), int(box_b)),
+                QPoint(int(box_l), int(box_b)),
+            ])
+            p.drawPolygon(poly)
+            # 2 arcs d'ondes a droite.
+            pen2 = QPen(QColor(ic_color), max(1.8, s * 0.07))
+            pen2.setCapStyle(Qt.RoundCap)
+            p.setPen(pen2)
+            p.setBrush(Qt.NoBrush)
+            p.drawArc(int(s * 0.60), int(s * 0.36),
+                      int(s * 0.16), int(s * 0.28),
+                      -60 * 16, 120 * 16)
+            p.drawArc(int(s * 0.66), int(s * 0.30),
+                      int(s * 0.22), int(s * 0.40),
+                      -60 * 16, 120 * 16)
+        p.end()
+
+
+class _PhoneNavKeyListener:
+    """Listener pynput dedie a la navigation clavier du CircusPhone quand
+    l'overlay est ouvert. Capte uniquement les 5 touches D-pad : fleches
+    up/down/left/right + enter. Demarre a l'ouverture de l'overlay, arrete
+    a la fermeture, pour ne pas reserver ces touches en permanence.
+
+    Tourne dans un thread pynput daemon. Pour chaque touche pertinente, il
+    appelle le callback `on_nav(direction)` fourni (direction in
+    {'up','down','left','right','enter'}). Le callback DOIT etre thread-safe
+    (typiquement : emettre un signal Qt vers le main thread). Calque sur
+    DisplayInfoMaskKeyListener (meme modele start/stop, meme normaliseur).
+
+    NB : ZQSD gere le deplacement dans Star Citizen, donc capter les
+    fleches pendant que le telephone est ouvert ne gene pas le mouvement
+    du joueur. Le listener ne consomme pas l'evenement (pynput on_press ne
+    bloque pas la touche cote jeu), il ne fait qu'observer."""
+
+    _NAV_KEYS = {"up", "down", "left", "right", "enter", "esc"}
+
+    def __init__(self, on_nav):
+        self._on_nav = on_nav
+        self._kb_listener = None
+
+    def start(self) -> None:
+        if self._kb_listener is not None:
+            return
+        try:
+            from pynput import keyboard as kb
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try: _core._dbg_log(f"[PHONE NAV] pynput indisponible : {e}")
+                except Exception: pass
+            return
+
+        def _on_press(key):
+            try:
+                if _CORE_AVAILABLE:
+                    norm = _core._normalize_pynput_key(key)
+                else:
+                    norm = getattr(key, "name", None)
+                    if norm: norm = norm.lower()
+                if norm in self._NAV_KEYS:
+                    self._on_nav(norm)
+            except Exception as e:
+                if _CORE_AVAILABLE:
+                    try: _core._dbg_log(f"[PHONE NAV] on_press KO : {e}")
+                    except Exception: pass
+
+        try:
+            self._kb_listener = kb.Listener(on_press=_on_press)
+            self._kb_listener.daemon = True
+            self._kb_listener.start()
+            if _CORE_AVAILABLE:
+                try: _core._dbg_log("[PHONE NAV] listener demarre (D-pad)")
+                except Exception: pass
+        except Exception as e:
+            self._kb_listener = None
+            if _CORE_AVAILABLE:
+                try: _core._dbg_log(f"[PHONE NAV] start KO : {e}")
+                except Exception: pass
+
+    def stop(self) -> None:
+        if self._kb_listener is None:
+            return
+        try:
+            self._kb_listener.stop()
+        except Exception:
+            pass
+        self._kb_listener = None
+        if _CORE_AVAILABLE:
+            try: _core._dbg_log("[PHONE NAV] listener stoppe")
+            except Exception: pass
+
+
+class PhoneOverlayWindow(QWidget):
+    """Overlay smartphone CircusPhone. Fenetre frameless topmost, parent
+    MainWindow. D4 etape 1 : chassis + ecran annuaire (liste contacts).
+
+    Apparition animee (montee depuis le bas, 400ms). Position finale aux
+    3/4 droite de l'ecran. Taille adaptative a la resolution.
+
+    Le parent (MainWindow) appelle :
+      - show_animated()  : affiche avec l'animation de montee
+      - hide_animated()  : (re)cache (toggle par re-appui du raccourci)
+      - refresh_contacts(): reconstruit la liste depuis annuaire + joueurs
+    Et ecoute :
+      - sig_call(pseudo)    : l'utilisateur veut appeler ce contact
+      - sig_message(pseudo) : l'utilisateur veut ouvrir la messagerie
+      - sig_forget(pseudo)  : l'utilisateur veut oublier ce contact
+    """
+
+    sig_call    = Signal(str)
+    sig_message = Signal(str)
+    sig_forget  = Signal(str)
+    # Signaux d'appel (ecrans incoming / outgoing / in_call).
+    # Pas de payload : MainWindow connait deja l'etat d'appel courant.
+    sig_accept_call   = Signal()    # decrocher (ecran incoming)
+    sig_decline_call  = Signal()    # refuser   (ecran incoming)
+    sig_hangup_call   = Signal()    # annuler   (outgoing) ou raccrocher (in_call)
+    sig_mute_toggled  = Signal(bool)   # mute micro toggle (in_call)
+    sig_speaker_toggled = Signal(bool) # haut-parleur toggle (in_call)
+    # Signaux de la messagerie (D4 etape 3, ecran conversation).
+    sig_send_message    = Signal(str, str)  # target, body : clic envoyer
+    sig_back_contacts   = Signal()          # fleche retour : revenir a Contacts
+    sig_draft_changed   = Signal(str, str)  # target, draft : texte en cours
+    # Reglages profil (D5+) : ecran dedie dans l'overlay. L'engrenage du
+    # header Contacts emet sig_settings_clicked, qui bascule sur l'ecran.
+    # Tous les boutons internes (choisir, supprimer, zoom +/-, fleches
+    # directionnelles, reset, retour) emettent leurs propres signaux que
+    # MainWindow connecte au _profile_photos.
+    sig_settings_clicked    = Signal()
+    sig_settings_back       = Signal()        # fleche retour -> Contacts
+    sig_settings_choose     = Signal()        # bouton "Choisir une photo"
+    sig_settings_remove     = Signal()        # bouton "Supprimer"
+    sig_settings_zoom_in    = Signal()        # bouton +
+    sig_settings_zoom_out   = Signal()        # bouton -
+    sig_settings_move       = Signal(int, int) # signe (dx, dy) : -1/0/+1
+    sig_settings_recenter   = Signal()        # bouton centre du pad
+    # Navigation clavier D-pad (thread pynput -> Qt). Emis depuis le thread
+    # du listener, recu en main thread Qt (queued connection auto).
+    sig_nav_key = Signal(str)   # 'up'|'down'|'left'|'right'|'enter'
+
+    def __init__(self, main_window):
+        super().__init__(
+            main_window,
+            Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+            | Qt.NoDropShadowWindowHint | Qt.Tool,
+        )
+        self._mw = main_window
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setObjectName("PhoneOverlay")
+
+        # [D5] Callable injecte par MainWindow pour recuperer les bytes
+        # JPEG d'un pair (ou None si pas en cache). Si None, on n'affiche
+        # aucun avatar (spec : "vide" = rien, pas de placeholder).
+        self._photo_provider = None
+        # Pseudos actuellement affiches dans chaque ecran (None si l'ecran
+        # n'est pas en train d'afficher quelqu'un). Sert a update_avatar_for
+        # pour savoir s'il faut rafraichir tel ou tel avatar quand une
+        # nouvelle photo arrive.
+        self._current_outgoing_peer: str = ""
+        self._current_incoming_peer: str = ""
+        self._current_in_call_peer:  str = ""
+
+        # --- Dimensions adaptatives selon la resolution de l'ecran ---
+        # On vise une hauteur de telephone ~= 62% de la hauteur ecran,
+        # bornee, et une largeur deduite du ratio du mockup (corps 200x440).
+        screen = QGuiApplication.primaryScreen()
+        try:
+            geo = screen.availableGeometry()
+            scr_w, scr_h = geo.width(), geo.height()
+        except Exception:
+            scr_w, scr_h = 1920, 1080
+        body_h = int(scr_h * 0.62)
+        body_h = max(420, min(760, body_h))         # bornes raisonnables
+        body_w = int(body_h * (200.0 / 440.0))      # ratio du mockup
+        self._body_w = body_w
+        self._body_h = body_h
+
+        # Geometrie interne (reprise des proportions du SVG mockup) :
+        #   corps   : 200 x 440, rx 28
+        #   ecran   : marge laterale 12, haut 56 (bandeau), bas 16
+        sx = body_w / 200.0
+        sy = body_h / 440.0
+        self._radius      = int(28 * sx)
+        self._banner_h    = int(56 * sy)            # hauteur du bandeau
+        self._screen_x    = int(12 * sx)
+        self._screen_y    = self._banner_h
+        self._screen_w    = body_w - 2 * self._screen_x
+        self._screen_h    = body_h - self._banner_h - int(16 * sy)
+        self._screen_rad  = int(14 * sx)
+
+        # La fenetre fait exactement la taille du corps du telephone.
+        self.setFixedSize(body_w, body_h)
+
+        self._anim: QPropertyAnimation | None = None
+        self._visible_state = False   # True quand l'overlay est "ouvert"
+
+        # --- Navigation clavier D-pad (ecran contacts uniquement) ---
+        # _nav_index : index dans la liste des lignes navigables (contacts
+        #   connectes uniquement, car eux seuls ont les actions phone/letter).
+        # _nav_action : 0 = Appeler (phone), 1 = Message (letter).
+        # _nav_rows : refs des _PhoneContactRow navigables, reconstruites a
+        #   chaque refresh_contacts. Liste vide => rien a naviguer.
+        self._nav_index = 0
+        self._nav_action = 0
+        self._nav_rows = []
+        # Navigation D-pad ecran conversation : 3 cibles cyclables.
+        #   _convo_nav_index : 0 = fleche Retour, 1 = champ texte, 2 = Envoyer
+        #   _convo_in_field  : True quand on a donne le focus au champ pour
+        #     taper (les fleches deplacent alors le curseur ; Echap ressort).
+        self._convo_nav_index = 0
+        self._convo_in_field = False
+        self._nav_listener = _PhoneNavKeyListener(
+            on_nav=lambda d: self.sig_nav_key.emit(d)
+        )
+        self.sig_nav_key.connect(self._on_nav_key)
+
+        self._build_screen()
+
+    # ------------------------------------------------------------------
+    # Construction de l'ecran (zone blanche) + son contenu
+    # ------------------------------------------------------------------
+    def _build_screen(self):
+        """Construit le widget de l'ecran (zone blanche) et y place un
+        QStackedWidget contenant les 4 ecrans possibles :
+          - "contacts" : interface par defaut (annuaire)
+          - "outgoing" : appel sortant en cours, ca sonne chez la cible
+          - "incoming" : appel entrant, en sonnerie locale
+          - "in_call" : appel decroche, conversation en cours
+        Le passage d'un ecran a l'autre se fait via show_screen_*().
+        Le chassis (corps noir + bandeau) est dessine dans paintEvent."""
+        # Widget-ecran : positionne en absolu sur la zone blanche.
+        self._screen = QWidget(self)
+        self._screen.setGeometry(
+            self._screen_x, self._screen_y,
+            self._screen_w, self._screen_h,
+        )
+        self._screen.setObjectName("PhoneScreen")
+        self._screen.setStyleSheet(
+            f"QWidget#PhoneScreen {{ background:{_PHONE_SCREEN_BG}; "
+            f"border-radius:{self._screen_rad}px; }}"
+        )
+        outer = QVBoxLayout(self._screen)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._stack = QStackedWidget()
+        self._stack.setStyleSheet("background:transparent;")
+        outer.addWidget(self._stack)
+
+        # Hauteur d'une ligne de contact (utilisee par refresh_contacts).
+        self._row_h = max(30, int(self._screen_h * 0.082))
+
+        # Build chacun des 6 ecrans (ordre = ordre d'index dans le stack).
+        self._page_contacts = self._build_screen_contacts()
+        self._page_outgoing = self._build_screen_outgoing()
+        self._page_incoming = self._build_screen_incoming()
+        self._page_in_call  = self._build_screen_in_call()
+        self._page_convo    = self._build_screen_conversation()
+        self._page_settings = self._build_screen_settings()
+        self._stack.addWidget(self._page_contacts)   # idx 0
+        self._stack.addWidget(self._page_outgoing)   # idx 1
+        self._stack.addWidget(self._page_incoming)   # idx 2
+        self._stack.addWidget(self._page_in_call)    # idx 3
+        self._stack.addWidget(self._page_convo)      # idx 4
+        self._stack.addWidget(self._page_settings)   # idx 5
+        # Demarrage : ecran Contacts.
+        self._stack.setCurrentWidget(self._page_contacts)
+
+    # ------------------------------------------------------------------
+    # Construction des 4 ecrans
+    # ------------------------------------------------------------------
+    def _build_screen_contacts(self) -> QWidget:
+        """Ecran par defaut : titre 'Contacts' + liste annuaire.
+        D5 a venir : bouton engrenage en haut a droite (reglages profil)."""
+        page = QWidget()
+        page.setStyleSheet("background:transparent;")
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 10, 0, 10)
+        v.setSpacing(0)
+
+        # Header : titre centre + engrenage a droite (D5 reglages profil).
+        # Layout horizontal a 3 zones : spacer-gauche, titre centre, engrenage-droite.
+        # Le spacer gauche a la meme largeur que l'engrenage pour que le titre
+        # reste reellement centre visuellement.
+        header = QWidget()
+        header.setStyleSheet("background:transparent;")
+        h = QHBoxLayout(header)
+        h.setContentsMargins(8, 0, 8, 0)
+        h.setSpacing(0)
+        gear_size = 18
+        # Spacer gauche (meme largeur que l'engrenage pour centrer le titre)
+        spacer_left = QWidget()
+        spacer_left.setFixedSize(gear_size, gear_size)
+        spacer_left.setStyleSheet("background:transparent;")
+        h.addWidget(spacer_left)
+        # Titre centre
+        title = QLabel("Contacts")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(
+            f"color:{_PHONE_SCREEN_TXT}; font-size:12pt; font-weight:700; "
+            "background:transparent; padding-bottom:6px;"
+        )
+        h.addWidget(title, stretch=1)
+        # Engrenage cliquable (D5 : ouvre la popup Reglages profil)
+        gear = _PhoneIconLabel("gear", gear_size, True, header)
+        gear.sig_clicked.connect(self.sig_settings_clicked.emit)
+        h.addWidget(gear)
+        v.addWidget(header)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color:#e3e5e8; background:#e3e5e8; max-height:1px;")
+        v.addWidget(sep)
+
+        # Zone scrollable de la liste.
+        self._contacts_scroll = QScrollArea()
+        self._contacts_scroll.setWidgetResizable(True)
+        self._contacts_scroll.setFrameShape(QFrame.NoFrame)
+        self._contacts_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff
+        )
+        self._contacts_scroll.setStyleSheet(
+            "QScrollArea { background:transparent; }"
+            "QScrollBar:vertical { width:6px; background:transparent; }"
+            "QScrollBar::handle:vertical { background:#d0d3d7; "
+            "  border-radius:3px; }"
+        )
+        self._contacts_host = QWidget()
+        self._contacts_host.setStyleSheet("background:transparent;")
+        self._contacts_layout = QVBoxLayout(self._contacts_host)
+        self._contacts_layout.setContentsMargins(0, 4, 0, 4)
+        self._contacts_layout.setSpacing(2)
+        self._contacts_layout.addStretch(1)
+        self._contacts_scroll.setWidget(self._contacts_host)
+        v.addWidget(self._contacts_scroll, stretch=1)
+
+        # Etat "liste vide" affiche quand l'annuaire n'a aucun contact.
+        self._lbl_empty = QLabel(
+            "Annuaire vide.\nLes joueurs croises\napparaitront ici."
+        )
+        self._lbl_empty.setAlignment(Qt.AlignCenter)
+        self._lbl_empty.setStyleSheet(
+            "color:#9aa0a6; font-size:9pt; background:transparent;"
+        )
+        self._lbl_empty.setVisible(False)
+        v.addWidget(self._lbl_empty)
+        return page
+
+    def _build_screen_outgoing(self) -> QWidget:
+        """Ecran 'Appel sortant' : ca sonne chez la cible, on attend.
+        Petit texte 'Appel en cours' + gros nom + bouton raccrocher rouge.
+        Fond noir (cf spec utilisateur D4 finition) pour donner une
+        signature visuelle distincte au mode appel."""
+        page = QWidget()
+        page.setObjectName("PhoneScreenCallOutgoing")
+        page.setStyleSheet(
+            "QWidget#PhoneScreenCallOutgoing { "
+            f"background:{_PHONE_BODY_COLOR}; "
+            f"border-radius:{self._screen_rad}px; }}"
+        )
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 20, 0, 20)
+        v.setSpacing(0)
+
+        lbl_top = QLabel("Appel en cours")
+        lbl_top.setAlignment(Qt.AlignCenter)
+        lbl_top.setStyleSheet(
+            "color:#c2c6cb; font-size:10pt; font-weight:500; "
+            "background:transparent;"
+        )
+        v.addWidget(lbl_top)
+
+        v.addStretch(1)
+        # [D5] Avatar : visible seulement si on a la photo du correspondant.
+        # Pour rester cliquable cote spec ("rien si pas de photo"), on cache
+        # tout le widget via setVisible quand pas de photo.
+        self._av_outgoing = _AvatarWidget(int(self._screen_w * 0.60), page)
+        self._av_outgoing.setVisible(False)
+        row_av = QHBoxLayout()
+        row_av.addStretch(1)
+        row_av.addWidget(self._av_outgoing)
+        row_av.addStretch(1)
+        v.addLayout(row_av)
+        v.addSpacing(8)
+        self._lbl_outgoing_name = QLabel("")
+        self._lbl_outgoing_name.setAlignment(Qt.AlignCenter)
+        self._lbl_outgoing_name.setStyleSheet(
+            "color:#ffffff; font-size:18pt; font-weight:700; "
+            "background:transparent;"
+        )
+        self._lbl_outgoing_name.setWordWrap(True)
+        v.addWidget(self._lbl_outgoing_name)
+
+        lbl_anim = QLabel("...")
+        lbl_anim.setAlignment(Qt.AlignCenter)
+        lbl_anim.setStyleSheet(
+            "color:#888888; font-size:14pt; background:transparent;"
+        )
+        v.addWidget(lbl_anim)
+        v.addStretch(2)
+
+        # Bouton raccrocher rouge (annule l'appel sortant).
+        h = QHBoxLayout()
+        h.addStretch(1)
+        btn = _PhoneCircleButton("phone_hang", _PHONE_BTN_HANGUP,
+                                 self._action_btn_size())
+        btn.sig_clicked.connect(self.sig_hangup_call)
+        h.addWidget(btn)
+        h.addStretch(1)
+        v.addLayout(h)
+
+        # Placeholder pour le raccourci (sera branche a l'etape raccourcis).
+        self._lbl_outgoing_shortcut = QLabel("—")
+        self._lbl_outgoing_shortcut.setAlignment(Qt.AlignCenter)
+        self._lbl_outgoing_shortcut.setStyleSheet(
+            "color:#9aa0a6; font-size:8pt; background:transparent;"
+        )
+        v.addWidget(self._lbl_outgoing_shortcut)
+        return page
+
+    def _build_screen_incoming(self) -> QWidget:
+        """Ecran 'Appel entrant' : 'appel entrant' en haut, gros nom au
+        milieu, 2 boutons en bas (vert decrocher / rouge refuser) avec
+        leur raccourci affiche dessous (placeholder en attendant l'etape
+        raccourcis). Fond noir (cf D4 finition)."""
+        page = QWidget()
+        page.setObjectName("PhoneScreenCallIncoming")
+        page.setStyleSheet(
+            "QWidget#PhoneScreenCallIncoming { "
+            f"background:{_PHONE_BODY_COLOR}; "
+            f"border-radius:{self._screen_rad}px; }}"
+        )
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 20, 0, 20)
+        v.setSpacing(0)
+
+        lbl_top = QLabel("Appel entrant")
+        lbl_top.setAlignment(Qt.AlignCenter)
+        lbl_top.setStyleSheet(
+            "color:#c2c6cb; font-size:10pt; font-weight:500; "
+            "background:transparent;"
+        )
+        v.addWidget(lbl_top)
+
+        v.addStretch(1)
+        # [D5] Avatar : visible seulement si on a la photo de l'appelant.
+        self._av_incoming = _AvatarWidget(int(self._screen_w * 0.60), page)
+        self._av_incoming.setVisible(False)
+        row_av_in = QHBoxLayout()
+        row_av_in.addStretch(1)
+        row_av_in.addWidget(self._av_incoming)
+        row_av_in.addStretch(1)
+        v.addLayout(row_av_in)
+        v.addSpacing(8)
+        self._lbl_incoming_name = QLabel("")
+        self._lbl_incoming_name.setAlignment(Qt.AlignCenter)
+        self._lbl_incoming_name.setStyleSheet(
+            "color:#ffffff; font-size:18pt; font-weight:700; "
+            "background:transparent;"
+        )
+        self._lbl_incoming_name.setWordWrap(True)
+        v.addWidget(self._lbl_incoming_name)
+        v.addStretch(2)
+
+        # 2 boutons cote a cote : vert decrocher | rouge refuser.
+        btn_sz = self._action_btn_size()
+        h = QHBoxLayout()
+        h.setSpacing(int(self._screen_w * 0.08))
+
+        col_acc = QVBoxLayout()
+        col_acc.setAlignment(Qt.AlignCenter)
+        b_acc = _PhoneCircleButton("phone_acc", _PHONE_BTN_ACCEPT, btn_sz)
+        b_acc.sig_clicked.connect(self.sig_accept_call)
+        col_acc.addWidget(b_acc, alignment=Qt.AlignCenter)
+        self._lbl_incoming_acc_shortcut = QLabel("—")
+        self._lbl_incoming_acc_shortcut.setAlignment(Qt.AlignCenter)
+        self._lbl_incoming_acc_shortcut.setStyleSheet(
+            "color:#9aa0a6; font-size:8pt; background:transparent;"
+        )
+        col_acc.addWidget(self._lbl_incoming_acc_shortcut)
+
+        col_dec = QVBoxLayout()
+        col_dec.setAlignment(Qt.AlignCenter)
+        b_dec = _PhoneCircleButton("phone_hang", _PHONE_BTN_HANGUP, btn_sz)
+        b_dec.sig_clicked.connect(self.sig_decline_call)
+        col_dec.addWidget(b_dec, alignment=Qt.AlignCenter)
+        self._lbl_incoming_dec_shortcut = QLabel("—")
+        self._lbl_incoming_dec_shortcut.setAlignment(Qt.AlignCenter)
+        self._lbl_incoming_dec_shortcut.setStyleSheet(
+            "color:#9aa0a6; font-size:8pt; background:transparent;"
+        )
+        col_dec.addWidget(self._lbl_incoming_dec_shortcut)
+
+        h.addStretch(1)
+        h.addLayout(col_acc)
+        h.addLayout(col_dec)
+        h.addStretch(1)
+        v.addLayout(h)
+        return page
+
+    def _build_screen_in_call(self) -> QWidget:
+        """Ecran 'En appel' : nom du correspondant + 3 boutons en bas
+        (raccrocher / mute / haut-parleur). Mute et HP sont toggleables
+        avec un style visuel actif/inactif (couleur du logo).
+        Fond noir (cf D4 finition)."""
+        page = QWidget()
+        page.setObjectName("PhoneScreenCallInCall")
+        page.setStyleSheet(
+            "QWidget#PhoneScreenCallInCall { "
+            f"background:{_PHONE_BODY_COLOR}; "
+            f"border-radius:{self._screen_rad}px; }}"
+        )
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 20, 0, 20)
+        v.setSpacing(0)
+
+        lbl_top = QLabel("En appel avec")
+        lbl_top.setAlignment(Qt.AlignCenter)
+        lbl_top.setStyleSheet(
+            "color:#c2c6cb; font-size:10pt; font-weight:500; "
+            "background:transparent;"
+        )
+        v.addWidget(lbl_top)
+
+        v.addStretch(1)
+        # [D5] Avatar : visible seulement si on a la photo du correspondant.
+        self._av_in_call = _AvatarWidget(int(self._screen_w * 0.60), page)
+        self._av_in_call.setVisible(False)
+        row_av_ic = QHBoxLayout()
+        row_av_ic.addStretch(1)
+        row_av_ic.addWidget(self._av_in_call)
+        row_av_ic.addStretch(1)
+        v.addLayout(row_av_ic)
+        v.addSpacing(8)
+        self._lbl_in_call_name = QLabel("")
+        self._lbl_in_call_name.setAlignment(Qt.AlignCenter)
+        self._lbl_in_call_name.setStyleSheet(
+            "color:#ffffff; font-size:18pt; font-weight:700; "
+            "background:transparent;"
+        )
+        self._lbl_in_call_name.setWordWrap(True)
+        v.addWidget(self._lbl_in_call_name)
+        v.addStretch(2)
+
+        # 3 boutons : mute | raccrocher | haut-parleur. Le raccrocher au
+        # centre pour qu'il soit toujours dominant visuellement.
+        btn_sz = self._action_btn_size()
+        btn_sz_small = int(btn_sz * 0.82)
+        h = QHBoxLayout()
+        h.setSpacing(int(self._screen_w * 0.05))
+
+        # Mute micro (toggleable). Logo gris quand inactif (micro ouvert),
+        # rouge quand actif (micro coupe).
+        col_mute = QVBoxLayout()
+        col_mute.setAlignment(Qt.AlignCenter)
+        self._btn_mute = _PhoneToggleButton(
+            "mic", _PHONE_BTN_TOGGLE_OFF, _PHONE_BTN_TOGGLE_ON, btn_sz_small
+        )
+        self._btn_mute.sig_toggled.connect(self.sig_mute_toggled)
+        col_mute.addWidget(self._btn_mute, alignment=Qt.AlignCenter)
+        self._lbl_mute_shortcut = QLabel("—")
+        self._lbl_mute_shortcut.setAlignment(Qt.AlignCenter)
+        self._lbl_mute_shortcut.setStyleSheet(
+            "color:#9aa0a6; font-size:8pt; background:transparent;"
+        )
+        col_mute.addWidget(self._lbl_mute_shortcut)
+
+        # Raccrocher.
+        col_hang = QVBoxLayout()
+        col_hang.setAlignment(Qt.AlignCenter)
+        b_hang = _PhoneCircleButton("phone_hang", _PHONE_BTN_HANGUP, btn_sz)
+        b_hang.sig_clicked.connect(self.sig_hangup_call)
+        col_hang.addWidget(b_hang, alignment=Qt.AlignCenter)
+        self._lbl_hang_shortcut = QLabel("—")
+        self._lbl_hang_shortcut.setAlignment(Qt.AlignCenter)
+        self._lbl_hang_shortcut.setStyleSheet(
+            "color:#9aa0a6; font-size:8pt; background:transparent;"
+        )
+        col_hang.addWidget(self._lbl_hang_shortcut)
+
+        # Haut-parleur (toggleable). Gris inactif, blanc actif.
+        col_sp = QVBoxLayout()
+        col_sp.setAlignment(Qt.AlignCenter)
+        self._btn_speaker = _PhoneToggleButton(
+            "speaker", _PHONE_BTN_TOGGLE_OFF, _PHONE_BTN_TOGGLE_SPEAKER,
+            btn_sz_small,
+        )
+        self._btn_speaker.sig_toggled.connect(self.sig_speaker_toggled)
+        col_sp.addWidget(self._btn_speaker, alignment=Qt.AlignCenter)
+        self._lbl_sp_shortcut = QLabel("—")
+        self._lbl_sp_shortcut.setAlignment(Qt.AlignCenter)
+        self._lbl_sp_shortcut.setStyleSheet(
+            "color:#9aa0a6; font-size:8pt; background:transparent;"
+        )
+        col_sp.addWidget(self._lbl_sp_shortcut)
+
+        h.addStretch(1)
+        h.addLayout(col_mute)
+        h.addLayout(col_hang)
+        h.addLayout(col_sp)
+        h.addStretch(1)
+        v.addLayout(h)
+        return page
+
+    def _action_btn_size(self) -> int:
+        """Taille standard d'un bouton d'action (raccrocher / decrocher).
+        Calculee a partir de la largeur d'ecran pour rester adaptative."""
+        return max(36, int(self._screen_w * 0.22))
+
+    def _build_screen_conversation(self) -> QWidget:
+        """Ecran de conversation privee : en haut une fleche retour + nom
+        du contact, au milieu la liste des messages (bulles), en bas un
+        champ de saisie multi-lignes + bouton envoyer. D4 etape 3."""
+        page = QWidget()
+        page.setStyleSheet("background:transparent;")
+        v = QVBoxLayout(page)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(4)
+
+        # --- Bandeau du haut : fleche retour + [avatar] + nom du correspondant ---
+        top = QHBoxLayout()
+        top.setSpacing(4)
+        self._convo_back = _PhoneIconLabel(
+            "back", max(16, int(self._row_h * 0.7)), True
+        )
+        self._convo_back.sig_clicked.connect(self.sig_back_contacts)
+        top.addWidget(self._convo_back)
+        # [D5] Avatar : visible seulement si on a la photo du correspondant.
+        av_sz = max(20, int(self._row_h * 0.80))
+        self._av_convo = _AvatarWidget(av_sz, page)
+        self._av_convo.setVisible(False)
+        top.addWidget(self._av_convo)
+        self._convo_title = QLabel("")
+        self._convo_title.setStyleSheet(
+            f"color:{_PHONE_NAME_ONLINE}; font-size:11pt; font-weight:700; "
+            "background:transparent;"
+        )
+        self._convo_title.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        top.addWidget(self._convo_title, stretch=1)
+        v.addLayout(top)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color:#e3e5e8; background:#e3e5e8; max-height:1px;")
+        v.addWidget(sep)
+
+        # --- Zone scrollable des messages (bulles) ---
+        self._convo_scroll = QScrollArea()
+        self._convo_scroll.setWidgetResizable(True)
+        self._convo_scroll.setFrameShape(QFrame.NoFrame)
+        self._convo_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff
+        )
+        self._convo_scroll.setStyleSheet(
+            "QScrollArea { background:transparent; }"
+            "QScrollBar:vertical { width:6px; background:transparent; }"
+            "QScrollBar::handle:vertical { background:#d0d3d7; "
+            "  border-radius:3px; }"
+        )
+        self._convo_host = QWidget()
+        self._convo_host.setStyleSheet("background:transparent;")
+        self._convo_layout = QVBoxLayout(self._convo_host)
+        self._convo_layout.setContentsMargins(2, 2, 2, 2)
+        self._convo_layout.setSpacing(4)
+        self._convo_layout.addStretch(1)   # pousse les bulles vers le bas
+        self._convo_scroll.setWidget(self._convo_host)
+        v.addWidget(self._convo_scroll, stretch=1)
+
+        # Auto-scroll en bas robuste (ajout 25/05/2026 Kainan).
+        # Avant : un QTimer.singleShot(0, ...) dans refresh_conversation
+        # tentait de scroller a la fin, mais Qt n'avait pas encore mis a
+        # jour scrollbar.maximum() au moment du timer (le layout pass
+        # n'avait pas eu lieu), donc le scroll restait en haut.
+        # Fix : on se branche sur le signal rangeChanged du scrollbar qui
+        # se declenche APRES que Qt a calcule la nouvelle plage (= apres
+        # le layout pass). Et on utilise un flag _convo_should_scroll_to_bottom
+        # pour ne scroller que quand on le veut explicitement (ouverture
+        # d'une conversation, reception d'un nouveau message), pas a
+        # chaque resize de fenetre ni si l'utilisateur a scrolle manuellement
+        # vers le haut.
+        self._convo_should_scroll_to_bottom = False
+
+        def _on_convo_range_changed(_mn=None, _mx=None):
+            if self._convo_should_scroll_to_bottom:
+                bar = self._convo_scroll.verticalScrollBar()
+                bar.setValue(bar.maximum())
+                self._convo_should_scroll_to_bottom = False
+        self._convo_scroll.verticalScrollBar().rangeChanged.connect(
+            _on_convo_range_changed
+        )
+
+        # --- Zone de saisie + bouton envoyer ---
+        bottom = QHBoxLayout()
+        bottom.setSpacing(4)
+        # Le champ : QTextEdit multi-lignes, grandit avec le contenu.
+        # On utilise un QTextEdit (pas un QLineEdit) pour le retour a la
+        # ligne automatique et la possibilite de plusieurs lignes.
+        self._convo_input = _PhoneMessageInput(max_chars=PHONE_MAX_BODY_LEN)
+        self._convo_input.sig_submit.connect(self._on_convo_submit)
+        self._convo_input.sig_changed.connect(self._on_convo_draft_changed)
+        bottom.addWidget(self._convo_input, stretch=1)
+        # Bouton envoyer (fleche).
+        send_sz = max(28, int(self._row_h * 0.85))
+        self._btn_send = _PhoneIconLabel("send", send_sz, True)
+        self._btn_send.sig_clicked.connect(self._on_convo_submit)
+        bottom.addWidget(self._btn_send, alignment=Qt.AlignBottom)
+        v.addLayout(bottom)
+
+        # Pseudo du correspondant courant (mis a jour par show_screen_conversation).
+        self._convo_pseudo = ""
+        return page
+
+    def _on_convo_submit(self):
+        """Bouton envoyer (ou Entree) : recupere le texte du champ, le
+        vide, emet sig_send_message au parent."""
+        if not self._convo_pseudo:
+            return
+        body = self._convo_input.toPlainText().strip()
+        if not body:
+            return
+        # Trim au cas ou (le widget limite deja a max_chars).
+        if len(body) > PHONE_MAX_BODY_LEN:
+            body = body[:PHONE_MAX_BODY_LEN]
+        self.sig_send_message.emit(self._convo_pseudo, body)
+        # Vide le champ apres envoi (l'envoi est synchrone : MainWindow
+        # stockera et rappellera refresh_conversation pour afficher).
+        self._convo_input.clear()
+        # Signaler que le draft est maintenant vide.
+        self.sig_draft_changed.emit(self._convo_pseudo, "")
+
+    def _on_convo_draft_changed(self, text: str):
+        """Le texte du champ a change : on relaie au parent pour qu'il
+        sauvegarde le brouillon (case 'appel pendant redaction' de la
+        spec)."""
+        if not self._convo_pseudo:
+            return
+        self.sig_draft_changed.emit(self._convo_pseudo, text)
+
+    def refresh_conversation(self, messages_items):
+        """Reaffiche la liste des bulles. messages_items est une liste
+        [(ts, body, is_me), ...] triee chronologiquement. Appelee a
+        l'ouverture de l'ecran et a chaque envoi / reception qui concerne
+        la conversation actuellement affichee."""
+        # Vider les bulles existantes (tout sauf le stretch initial).
+        # On utilise setParent(None) + deleteLater() : setParent(None)
+        # detache immediatement le widget du layout (donc disparait du
+        # rendu), deleteLater() programme la liberation memoire propre.
+        while self._convo_layout.count() > 1:
+            item = self._convo_layout.takeAt(1)
+            if item is None:
+                break
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        # Armer l'auto-scroll en bas pour le prochain rangeChanged (qui
+        # va se declencher des que les bulles ci-dessous seront ajoutees
+        # et le layout recalcule). Le flag est consomme une seule fois
+        # par _on_convo_range_changed et ne se redeclenche pas si
+        # l'utilisateur scroll manuellement entre temps. Modif 25/05/2026.
+        self._convo_should_scroll_to_bottom = True
+        # Reinserer les bulles dans l'ordre. ts passe a la bulle pour
+        # afficher le timestamp en bas (ajout 23/05/2026).
+        for ts, body, is_me in messages_items:
+            bubble = _PhoneMessageBubble(body, is_me, self._screen_w, ts=ts)
+            self._convo_layout.addWidget(bubble)
+
+    # ------------------------------------------------------------------
+    # [D5+] Ecran Reglages profil (page interne du telephone)
+    # ------------------------------------------------------------------
+    def _build_screen_settings(self) -> QWidget:
+        """Ecran Reglages profil : preview ronde + zoom +/- + pad
+        directionnel + boutons Choisir / Supprimer. Tous les widgets
+        emettent leurs signaux respectifs ; MainWindow les connecte au
+        manager des photos. La preview est rafraichie via
+        refresh_settings_preview() apres chaque action."""
+        page = QWidget()
+        page.setStyleSheet("background:transparent;")
+        v = QVBoxLayout(page)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(4)
+
+        # --- Bandeau du haut : fleche retour + titre ---
+        top = QHBoxLayout()
+        top.setSpacing(4)
+        back_btn = _PhoneIconLabel(
+            "back", max(16, int(self._row_h * 0.7)), True
+        )
+        back_btn.sig_clicked.connect(self.sig_settings_back.emit)
+        top.addWidget(back_btn)
+        title = QLabel("Reglages profil")
+        title.setStyleSheet(
+            f"color:{_PHONE_NAME_ONLINE}; font-size:11pt; font-weight:700; "
+            "background:transparent;"
+        )
+        title.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        top.addWidget(title, stretch=1)
+        v.addLayout(top)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color:#e3e5e8; background:#e3e5e8; max-height:1px;")
+        v.addWidget(sep)
+
+        # --- Preview ronde (taille adaptee a la largeur ecran) ---
+        # Avatar ~ 50% de la largeur ecran -> bien visible mais laisse
+        # de la place pour le pad directionnel a cote.
+        prev_sz = max(80, int(self._screen_w * 0.50))
+        self._settings_preview = _AvatarWidget(prev_sz, page)
+        self._settings_no_photo = QLabel("(aucune photo)")
+        self._settings_no_photo.setAlignment(Qt.AlignCenter)
+        self._settings_no_photo.setFixedSize(prev_sz, prev_sz)
+        self._settings_no_photo.setStyleSheet(
+            "background:#2a2a2a; border:1px solid #444; "
+            f"border-radius:{prev_sz // 2}px; color:#888; font-size:8pt;"
+        )
+
+        from PySide6.QtWidgets import QStackedLayout, QGridLayout
+        prev_holder = QWidget()
+        prev_holder.setFixedSize(prev_sz, prev_sz)
+        stack = QStackedLayout(prev_holder)
+        stack.setStackingMode(QStackedLayout.StackAll)
+        stack.addWidget(self._settings_no_photo)
+        stack.addWidget(self._settings_preview)
+
+        # --- Pad directionnel a droite de la preview ---
+        # Boutons compacts pour tenir dans l'ecran telephone.
+        def _mk_pad_btn(text: str):
+            b = QPushButton(text)
+            b.setFixedSize(26, 26)
+            b.setStyleSheet(
+                "QPushButton { background:#2a2a2a; color:#fff; "
+                "border:1px solid #444; border-radius:4px; font-size:9pt; }"
+                "QPushButton:hover { background:#3a3a3a; }"
+                "QPushButton:pressed { background:#1a1a1a; }"
+            )
+            return b
+        self._settings_btn_up    = _mk_pad_btn("▲")
+        self._settings_btn_left  = _mk_pad_btn("◄")
+        self._settings_btn_reset = _mk_pad_btn("●")
+        self._settings_btn_right = _mk_pad_btn("►")
+        self._settings_btn_down  = _mk_pad_btn("▼")
+        self._settings_btn_up.clicked.connect(
+            lambda: self.sig_settings_move.emit(0, -1))
+        self._settings_btn_down.clicked.connect(
+            lambda: self.sig_settings_move.emit(0, +1))
+        self._settings_btn_left.clicked.connect(
+            lambda: self.sig_settings_move.emit(-1, 0))
+        self._settings_btn_right.clicked.connect(
+            lambda: self.sig_settings_move.emit(+1, 0))
+        self._settings_btn_reset.clicked.connect(self.sig_settings_recenter.emit)
+
+        pad_holder = QWidget()
+        pad_holder.setFixedSize(26 * 3 + 6, 26 * 3 + 6)
+        pad_grid = QGridLayout(pad_holder)
+        pad_grid.setContentsMargins(0, 0, 0, 0)
+        pad_grid.setHorizontalSpacing(3)
+        pad_grid.setVerticalSpacing(3)
+        pad_grid.addWidget(self._settings_btn_up,    0, 1)
+        pad_grid.addWidget(self._settings_btn_left,  1, 0)
+        pad_grid.addWidget(self._settings_btn_reset, 1, 1)
+        pad_grid.addWidget(self._settings_btn_right, 1, 2)
+        pad_grid.addWidget(self._settings_btn_down,  2, 1)
+
+        row_prev = QHBoxLayout()
+        row_prev.addStretch(1)
+        row_prev.addWidget(prev_holder)
+        row_prev.addSpacing(8)
+        row_prev.addWidget(pad_holder, alignment=Qt.AlignVCenter)
+        row_prev.addStretch(1)
+        v.addLayout(row_prev)
+
+        # --- Ligne zoom : - [Zoom XX%] + ---
+        row_zoom = QHBoxLayout()
+        row_zoom.addStretch(1)
+        btn_zoom_minus = QPushButton("−")
+        btn_zoom_minus.setFixedSize(32, 26)
+        btn_zoom_minus.setStyleSheet(
+            "QPushButton { background:#2a2a2a; color:#fff; "
+            "border:1px solid #444; border-radius:4px; font-size:11pt; }"
+            "QPushButton:hover { background:#3a3a3a; }"
+        )
+        btn_zoom_plus = QPushButton("+")
+        btn_zoom_plus.setFixedSize(32, 26)
+        btn_zoom_plus.setStyleSheet(btn_zoom_minus.styleSheet())
+        btn_zoom_minus.clicked.connect(self.sig_settings_zoom_out.emit)
+        btn_zoom_plus.clicked.connect(self.sig_settings_zoom_in.emit)
+        self._settings_lbl_zoom = QLabel("Zoom : 100%")
+        self._settings_lbl_zoom.setStyleSheet(
+            "color:#c0c0c0; font-size:9pt; background:transparent;"
+        )
+        self._settings_lbl_zoom.setAlignment(Qt.AlignCenter)
+        row_zoom.addWidget(btn_zoom_minus)
+        row_zoom.addSpacing(8)
+        row_zoom.addWidget(self._settings_lbl_zoom)
+        row_zoom.addSpacing(8)
+        row_zoom.addWidget(btn_zoom_plus)
+        row_zoom.addStretch(1)
+        v.addLayout(row_zoom)
+
+        # --- Boutons Choisir / Supprimer ---
+        row_btns = QHBoxLayout()
+        btn_choose = QPushButton("Choisir...")
+        btn_remove = QPushButton("Supprimer")
+        for b in (btn_choose, btn_remove):
+            b.setStyleSheet(
+                "QPushButton { background:#2a2a2a; color:#fff; "
+                "border:1px solid #444; border-radius:4px; "
+                "padding:4px 8px; font-size:9pt; }"
+                "QPushButton:hover { background:#3a3a3a; }"
+            )
+        btn_choose.clicked.connect(self.sig_settings_choose.emit)
+        btn_remove.clicked.connect(self.sig_settings_remove.emit)
+        row_btns.addWidget(btn_choose)
+        row_btns.addWidget(btn_remove)
+        v.addLayout(row_btns)
+
+        v.addStretch(1)
+        return page
+
+    def refresh_settings_preview(self, jpeg_bytes, zoom_percent: int):
+        """Met a jour la preview ronde et le label de zoom dans l'ecran
+        Reglages. Appele par MainWindow apres chaque action utilisateur
+        (choix de photo, zoom +/-, fleche, recentrer, suppression).
+          jpeg_bytes    : bytes JPEG de la photo actuelle, ou None/b''
+                          si aucune photo.
+          zoom_percent  : valeur entre 40 et 200, affichee en pourcentage.
+        """
+        if not hasattr(self, "_settings_preview"):
+            return  # ecran pas encore construit
+        if jpeg_bytes:
+            self._settings_preview.set_photo_bytes(jpeg_bytes)
+            has = self._settings_preview.has_photo()
+        else:
+            self._settings_preview.set_photo_bytes(None)
+            has = False
+        self._settings_preview.setVisible(has)
+        self._settings_no_photo.setVisible(not has)
+        try:
+            self._settings_lbl_zoom.setText(f"Zoom : {int(zoom_percent)}%")
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # [D5] Avatars : injection du provider + helpers de rafraichissement
+    # ------------------------------------------------------------------
+    def set_photo_provider(self, fn):
+        """Injecte un callable (pseudo)->bytes|None pour la recuperation
+        des photos de pairs. MainWindow appelle ca juste apres avoir cree
+        l'overlay. Si jamais appele, les avatars restent invisibles."""
+        self._photo_provider = fn
+
+    def _peer_photo_bytes(self, pseudo: str):
+        """Retourne les bytes JPEG d'un pair s'ils sont en cache, sinon
+        None. Demande aussi a MainWindow de declencher un request si la
+        photo n'est pas connue. Best-effort, jamais bloquant."""
+        if not pseudo or self._photo_provider is None:
+            return None
+        try:
+            return self._photo_provider(pseudo)
+        except Exception:
+            return None
+
+    def _apply_avatar(self, avatar_widget, pseudo: str):
+        """Applique la photo d'un pseudo a un _AvatarWidget. Si la photo
+        n'est pas en cache, l'avatar reste invisible (spec : pas de
+        placeholder).
+
+        Declenche TOUJOURS une request asynchrone, meme si on a deja la
+        photo en cache : c'est ainsi qu'on detecte qu'un pair a change
+        sa photo (le serveur compare le hash if-none-match et nous
+        renvoie 'unchanged' si rien n'a bouge, sinon la nouvelle photo
+        qui declenchera update_avatar_for via _on_profile_photo_response).
+        Le cout d'une request est minime, et c'est anti-double-shot
+        (un seul request en vol par pseudo)."""
+        if avatar_widget is None:
+            return
+        b = self._peer_photo_bytes(pseudo) if pseudo else None
+        if b:
+            avatar_widget.set_photo_bytes(b)
+            avatar_widget.setVisible(avatar_widget.has_photo())
+        else:
+            avatar_widget.set_photo_bytes(None)
+            avatar_widget.setVisible(False)
+        # Pousser la request asynchrone systematiquement (verifie aussi
+        # la fraicheur du cache, pas seulement le remplir).
+        if pseudo:
+            try:
+                mw = self._mw
+                if mw is not None and hasattr(mw, "_profile_photos"):
+                    mw._profile_photos.request_peer_photo(pseudo)
+            except Exception:
+                pass
+
+    def update_avatar_for(self, pseudo: str):
+        """[D5] Appele par MainWindow quand une nouvelle photo d'un pair
+        est arrivee. Rafraichit tous les avatars actuellement affiches
+        pour ce pseudo (contacts si visible, ecrans d'appel, conversation)."""
+        if not pseudo:
+            return
+        # Conversation
+        if getattr(self, "_convo_pseudo", "") == pseudo:
+            self._apply_avatar(self._av_convo, pseudo)
+        # Ecrans d'appel
+        if self._current_outgoing_peer == pseudo:
+            self._apply_avatar(self._av_outgoing, pseudo)
+        if self._current_incoming_peer == pseudo:
+            self._apply_avatar(self._av_incoming, pseudo)
+        if self._current_in_call_peer == pseudo:
+            self._apply_avatar(self._av_in_call, pseudo)
+        # Ecran contacts : on doit reconstruire la ligne concernee. Pour
+        # rester simple, on demande a MainWindow de refresh tous les
+        # contacts (couteux mais rare).
+        try:
+            mw = self._mw
+            if (mw is not None
+                    and self._stack.currentWidget() is self._page_contacts):
+                if hasattr(mw, "_phone_refresh_overlay_contacts"):
+                    mw._phone_refresh_overlay_contacts()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # API publique : changement d'ecran
+    # ------------------------------------------------------------------
+    def show_screen_contacts(self):
+        """Bascule sur l'ecran par defaut (annuaire)."""
+        self._stack.setCurrentWidget(self._page_contacts)
+        # Sortir proprement du mode frappe conversation et effacer sa
+        # surbrillance, puis re-appliquer celle des contacts.
+        self._convo_in_field = False
+        self._apply_convo_nav_highlight()
+        self._apply_nav_highlight()
+
+    def show_screen_outgoing(self, peer: str):
+        """Bascule sur l'ecran appel sortant. peer = nom de la cible."""
+        self._lbl_outgoing_name.setText(peer or "")
+        self._current_outgoing_peer = peer or ""
+        self._apply_avatar(self._av_outgoing, peer or "")
+        self._stack.setCurrentWidget(self._page_outgoing)
+
+    def show_screen_incoming(self, caller: str):
+        """Bascule sur l'ecran appel entrant. caller = nom de l'appelant."""
+        self._lbl_incoming_name.setText(caller or "")
+        self._current_incoming_peer = caller or ""
+        self._apply_avatar(self._av_incoming, caller or "")
+        self._stack.setCurrentWidget(self._page_incoming)
+
+    def show_screen_in_call(self, peer: str):
+        """Bascule sur l'ecran en cours. peer = correspondant. Reset les
+        toggles mute/HP a inactif a chaque nouvel appel."""
+        self._lbl_in_call_name.setText(peer or "")
+        self._current_in_call_peer = peer or ""
+        self._apply_avatar(self._av_in_call, peer or "")
+        # Reset toggles : nouveau appel = micro ouvert, HP coupe.
+        self._btn_mute.set_active(False, emit=False)
+        self._btn_speaker.set_active(False, emit=False)
+        self._stack.setCurrentWidget(self._page_in_call)
+
+    def show_screen_conversation(self, pseudo: str, items, draft: str = ""):
+        """Bascule sur l'ecran conversation avec `pseudo`.
+          items : liste [(ts, body, is_me), ...] triee chrono
+          draft : brouillon a restaurer dans le champ (vide par defaut)
+        Le widget memorise le pseudo en cours pour les signaux."""
+        self._convo_pseudo = pseudo or ""
+        self._convo_title.setText(pseudo or "")
+        self._apply_avatar(self._av_convo, pseudo or "")
+        # Restaure le brouillon SANS declencher sig_draft_changed (sinon
+        # boucle : reload -> draft -> save -> reload). Le widget input
+        # offre un setter silencieux.
+        self._convo_input.set_text_silent(draft or "")
+        self.refresh_conversation(items or [])
+        self._stack.setCurrentWidget(self._page_convo)
+        # Reset navigation D-pad : on demarre sur le champ texte (cible la
+        # plus utile en arrivant), hors mode frappe. Surbrillance appliquee.
+        self._convo_nav_index = 1
+        self._convo_in_field = False
+        try:
+            self._convo_input.clearFocus()
+        except Exception:
+            pass
+        self._apply_convo_nav_highlight()
+        # Effacer toute surbrillance residuelle de l'ecran contacts.
+        self._apply_nav_highlight()
+
+    def show_screen_settings(self):
+        """[D5+] Bascule sur l'ecran Reglages profil. MainWindow doit
+        appeler refresh_settings_preview() juste apres pour peupler
+        l'affichage avec la photo et le zoom courants."""
+        self._stack.setCurrentWidget(self._page_settings)
+
+    def update_shortcut_labels(self, accept_key: str = "", decline_key: str = "",
+                                mute_key: str = "", speaker_key: str = ""):
+        """Met a jour l'affichage des raccourcis sous les boutons d'appel.
+        Chaque parametre est la chaine du raccourci (forme canonique, ex:
+        'ctrl+shift+m') ou vide. Si vide, le label affiche '—'. Sinon il
+        affiche la forme presentable (Ctrl + Shift + M). MainWindow
+        appelle cette methode au boot de l'overlay et a chaque fois qu'un
+        raccourci telephone est modifie dans les Parametres."""
+        def fmt(key):
+            if not key:
+                return "—"
+            try:
+                import circusvoip_core as _c
+                return _c.format_hotkey_for_display(key) or "—"
+            except Exception:
+                return key
+        a = fmt(accept_key)
+        d = fmt(decline_key)
+        m = fmt(mute_key)
+        s = fmt(speaker_key)
+        # Ecran appel sortant : seul le bouton raccrocher (rouge) est la,
+        # donc le raccourci affiche est celui de "refuser/raccrocher".
+        if hasattr(self, "_lbl_outgoing_shortcut"):
+            self._lbl_outgoing_shortcut.setText(d)
+        # Ecran appel entrant : 2 boutons (decrocher + refuser).
+        if hasattr(self, "_lbl_incoming_acc_shortcut"):
+            self._lbl_incoming_acc_shortcut.setText(a)
+        if hasattr(self, "_lbl_incoming_dec_shortcut"):
+            self._lbl_incoming_dec_shortcut.setText(d)
+        # Ecran en cours : mute, raccrocher, haut-parleur.
+        if hasattr(self, "_lbl_mute_shortcut"):
+            self._lbl_mute_shortcut.setText(m)
+        if hasattr(self, "_lbl_hang_shortcut"):
+            self._lbl_hang_shortcut.setText(d)
+        if hasattr(self, "_lbl_sp_shortcut"):
+            self._lbl_sp_shortcut.setText(s)
+
+    # ------------------------------------------------------------------
+    # Rafraichissement de la liste des contacts
+    # ------------------------------------------------------------------
+    def refresh_contacts(self, annuaire: dict, online_names,
+                         my_name: str = "", unread_set=None,
+                         photo_provider=None, last_msg_ts_map=None):
+        """Reconstruit la liste des contacts a partir de l'annuaire et de
+        l'ensemble des joueurs actuellement en ligne.
+          annuaire     : dict {"contacts": {pseudo: {...}}}
+          online_names : iterable des pseudos connectes maintenant
+          my_name      : mon pseudo, exclu de la liste
+          unread_set   : iterable des pseudos qui ont des MP non lus (D4
+                         etape 3). L'enveloppe de ces contacts affiche
+                         un badge rouge.
+          photo_provider : callable optionnel (pseudo) -> bytes|None.
+                         [D5] Fournit les bytes JPEG d'un pair s'ils
+                         sont en cache. Si absent ou None retourne, la
+                         ligne ne montre pas d'avatar (spec : vide).
+          last_msg_ts_map : dict optionnel {pseudo: float ts}. Pour chaque
+                         contact qui a une conversation active, le ts du
+                         dernier message echange (sent OU received, le
+                         plus recent). Les pseudos absents du dict ou
+                         avec ts <= 0 sont consideres "sans conversation".
+                         Ajout 24/05/2026 Kainan.
+        Tri (24/05/2026) : 2 groupes (connectes en haut, deconnectes en
+        bas). DANS chaque groupe, contacts avec une conversation tries
+        par ts du dernier message (recent en haut), puis contacts sans
+        conversation tries alphabetiquement. Style messagerie type
+        WhatsApp/Telegram, mais en conservant la separation connecte /
+        deconnecte (pastille verte/grise reste lisible)."""
+        online = set(online_names or [])
+        unread = set(unread_set or [])
+        ts_map = last_msg_ts_map or {}
+        contacts = (annuaire or {}).get("contacts", {})
+
+        # Vider les lignes existantes (tout sauf le stretch final).
+        while self._contacts_layout.count() > 1:
+            item = self._contacts_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        # Construire les 2 groupes, en excluant mon propre pseudo.
+        names = [n for n in contacts.keys() if n and n != my_name]
+
+        def _sort_group(pseudos):
+            """Tri intra-groupe : convos par ts du dernier message (recent
+            en haut), puis sans-convo par ordre alpha."""
+            with_convo = []
+            without_convo = []
+            for p in pseudos:
+                ts = float(ts_map.get(p, 0.0) or 0.0)
+                if ts > 0:
+                    with_convo.append((ts, p))
+                else:
+                    without_convo.append(p)
+            # ts desc (plus recent en haut), tie-break alpha
+            with_convo.sort(key=lambda x: (-x[0], x[1].lower()))
+            without_convo.sort(key=str.lower)
+            return [p for _, p in with_convo] + without_convo
+
+        connected = _sort_group([n for n in names if n in online])
+        disconnected = _sort_group([n for n in names if n not in online])
+
+        if not connected and not disconnected:
+            self._contacts_scroll.setVisible(False)
+            self._lbl_empty.setVisible(True)
+            return
+        self._contacts_scroll.setVisible(True)
+        self._lbl_empty.setVisible(False)
+
+        def _photo(p):
+            if photo_provider is None:
+                return None
+            try:
+                return photo_provider(p)
+            except Exception:
+                return None
+
+        idx = 0
+        nav_rows = []
+        for pseudo in connected:
+            row = _PhoneContactRow(
+                pseudo, True, self._row_h, unread=(pseudo in unread),
+                photo_bytes=_photo(pseudo),
+            )
+            row.sig_call.connect(self.sig_call)
+            row.sig_message.connect(self.sig_message)
+            self._contacts_layout.insertWidget(idx, row)
+            idx += 1
+            nav_rows.append(row)
+        for pseudo in disconnected:
+            row = _PhoneContactRow(
+                pseudo, False, self._row_h,
+                photo_bytes=_photo(pseudo),
+            )
+            row.sig_forget.connect(self.sig_forget)
+            self._contacts_layout.insertWidget(idx, row)
+            idx += 1
+
+        # Reconstruire l'etat de navigation D-pad : seules les lignes
+        # connectees (avec phone+letter) sont navigables. On clampe l'index
+        # courant et on re-applique la surbrillance.
+        self._nav_rows = nav_rows
+        if not nav_rows:
+            self._nav_index = 0
+        else:
+            self._nav_index = max(0, min(self._nav_index, len(nav_rows) - 1))
+        self._nav_action = 0 if self._nav_action not in (0, 1) else self._nav_action
+        self._apply_nav_highlight()
+
+    # ------------------------------------------------------------------
+    # Navigation clavier D-pad (ecran contacts : Appeler / Message)
+    # ------------------------------------------------------------------
+    def _apply_nav_highlight(self):
+        """Re-applique la surbrillance sur toutes les lignes navigables
+        selon _nav_index / _nav_action. Ne fait rien hors ecran contacts
+        (la surbrillance reste posee mais invisible tant qu'on n'est pas
+        sur cet ecran ; on l'efface quand meme pour rester propre)."""
+        on_contacts = (self._stack.currentWidget() is self._page_contacts)
+        for i, row in enumerate(self._nav_rows):
+            try:
+                sel = on_contacts and (i == self._nav_index)
+                row.set_nav_highlight(sel, self._nav_action)
+            except Exception:
+                pass
+
+    @Slot(str)
+    def _on_nav_key(self, direction: str):
+        """Slot main-thread : route une touche D-pad selon l'ecran courant.
+        Ecran contacts -> _nav_contacts ; ecran conversation -> _nav_convo.
+        Les autres ecrans ne sont pas navigables au clavier (scope actuel)."""
+        try:
+            cur = self._stack.currentWidget()
+            if cur is self._page_contacts:
+                self._nav_contacts(direction)
+            elif cur is self._page_convo:
+                self._nav_convo(direction)
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try: _core._dbg_log(f"[PHONE NAV] route KO : {e}")
+                except Exception: pass
+
+    def _nav_contacts(self, direction: str):
+        """Navigation D-pad ecran contacts.
+          up/down  : change de ligne (contact connecte)
+          left/right : bascule l'action Appeler <-> Message
+          enter    : declenche l'action sur la ligne courante
+        Ignore si rien a naviguer."""
+        try:
+            n = len(self._nav_rows)
+            if n == 0:
+                return
+            if direction == "up":
+                self._nav_index = (self._nav_index - 1) % n
+                self._ensure_nav_visible()
+            elif direction == "down":
+                self._nav_index = (self._nav_index + 1) % n
+                self._ensure_nav_visible()
+            elif direction == "left":
+                self._nav_action = 0   # Appeler
+            elif direction == "right":
+                self._nav_action = 1   # Message
+            elif direction == "enter":
+                row = self._nav_rows[self._nav_index]
+                pseudo = row.pseudo()
+                if self._nav_action == 0:
+                    self.sig_call.emit(pseudo)
+                else:
+                    self.sig_message.emit(pseudo)
+                return  # l'action peut changer d'ecran : pas de re-highlight
+            self._apply_nav_highlight()
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try: _core._dbg_log(f"[PHONE NAV] contacts KO : {e}")
+                except Exception: pass
+
+    def _nav_convo(self, direction: str):
+        """Navigation D-pad ecran conversation. 3 cibles : Retour (0),
+        champ texte (1), Envoyer (2).
+        Hors champ :
+          left/up    : cible precedente
+          right/down : cible suivante
+          enter      : Retour -> back ; Envoyer -> submit ; Champ -> focus
+                       (entre dans le champ pour taper)
+        Dans le champ (_convo_in_field=True) :
+          esc        : ressort du champ, rend la navigation
+          (le reste est gere par le QTextEdit : frappe, Entree=submit via
+           keyPressEvent du champ, fleches=curseur). On n'intercepte pas."""
+        try:
+            # Si on est dans le champ pour taper : seul Echap nous interesse,
+            # pour ressortir. Tout le reste appartient au QTextEdit.
+            if self._convo_in_field:
+                if direction == "esc":
+                    self._convo_in_field = False
+                    try:
+                        self._convo_input.clearFocus()
+                    except Exception:
+                        pass
+                    self._apply_convo_nav_highlight()
+                return
+
+            if direction in ("left", "up"):
+                self._convo_nav_index = (self._convo_nav_index - 1) % 3
+            elif direction in ("right", "down"):
+                self._convo_nav_index = (self._convo_nav_index + 1) % 3
+            elif direction == "enter":
+                idx = self._convo_nav_index
+                if idx == 0:
+                    self.sig_back_contacts.emit()
+                    return   # changement d'ecran
+                elif idx == 2:
+                    self._on_convo_submit()
+                    # reste sur la conversation, le champ est vide : on
+                    # garde la selection sur Envoyer.
+                elif idx == 1:
+                    # Entrer dans le champ pour taper. La fenetre overlay a
+                    # le flag Qt.Tool : un setFocus() seul ne suffit pas a
+                    # lui donner le focus clavier (le champ ne s'active pas).
+                    # Il faut d'abord ACTIVER la fenetre (activateWindow +
+                    # raise_) pour qu'elle devienne la fenetre active, puis
+                    # donner le focus au champ. C'est ce que fait Windows
+                    # automatiquement quand on clique dans le champ ; ici on
+                    # le declenche programmatiquement.
+                    self._convo_in_field = True
+                    try:
+                        # Forcer l'overlay au premier plan Windows (focus
+                        # clavier systeme) pour que les frappes arrivent au
+                        # champ et non a SC. Puis focus Qt sur le champ.
+                        self._win32_force_foreground()
+                        self.activateWindow()
+                        self.raise_()
+                        self._convo_input.setFocus(Qt.OtherFocusReason)
+                        c = self._convo_input.textCursor()
+                        c.movePosition(QTextCursor.End)
+                        self._convo_input.setTextCursor(c)
+                    except Exception:
+                        pass
+            elif direction == "esc":
+                # Hors champ, Echap : on revient aux contacts (raccourci
+                # pratique). Optionnel mais coherent.
+                self.sig_back_contacts.emit()
+                return
+            self._apply_convo_nav_highlight()
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try: _core._dbg_log(f"[PHONE NAV] convo KO : {e}")
+                except Exception: pass
+
+    def _win32_force_foreground(self):
+        """Force l'overlay a devenir la fenetre active Windows (focus clavier
+        systeme), afin que le champ texte recoive reellement les frappes
+        meme quand Star Citizen est au premier plan.
+
+        SetForegroundWindow seul echoue souvent sur Windows moderne a cause
+        de la restriction anti-vol-de-focus : seul le thread du processus
+        deja au premier plan peut donner le focus librement. Le contournement
+        standard : on attache temporairement notre thread d'entree a celui de
+        la fenetre actuellement au premier plan (AttachThreadInput), ce qui
+        nous autorise a appeler SetForegroundWindow, puis on detache.
+
+        Approche A (cf. discussion) : SC perd le focus le temps de taper, ce
+        qui est acceptable car le joueur ne se deplace pas en ecrivant.
+        Retourne True si la sequence a pu s'executer, False sinon (non-Windows,
+        hwnd invalide, exception)."""
+        try:
+            import sys as _sys
+            if not _sys.platform.startswith("win"):
+                return False
+            import ctypes
+            from ctypes import wintypes
+            hwnd = int(self.winId())
+            if hwnd == 0:
+                return False
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+
+            # Fenetre actuellement au premier plan (typiquement SC).
+            fg = user32.GetForegroundWindow()
+
+            # Thread proprietaire de la fenetre fg, et notre thread courant.
+            fg_tid = user32.GetWindowThreadProcessId(fg, None)
+            cur_tid = kernel32.GetCurrentThreadId()
+
+            SW_SHOW = 5
+            attached = False
+            if fg_tid and fg_tid != cur_tid:
+                # Attache nos files d'entree -> autorise SetForegroundWindow.
+                attached = bool(
+                    user32.AttachThreadInput(cur_tid, fg_tid, True)
+                )
+            try:
+                user32.ShowWindow(ctypes.c_void_p(hwnd), SW_SHOW)
+                user32.BringWindowToTop(ctypes.c_void_p(hwnd))
+                user32.SetForegroundWindow(ctypes.c_void_p(hwnd))
+                user32.SetActiveWindow(ctypes.c_void_p(hwnd))
+                user32.SetFocus(ctypes.c_void_p(hwnd))
+            finally:
+                if attached:
+                    user32.AttachThreadInput(cur_tid, fg_tid, False)
+            if _CORE_AVAILABLE:
+                try: _core._dbg_log("[PHONE NAV] force foreground (champ)")
+                except Exception: pass
+            return True
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try: _core._dbg_log(f"[PHONE NAV] force foreground KO : {e}")
+                except Exception: pass
+            return False
+
+    def _apply_convo_nav_highlight(self):
+        """Applique la surbrillance sur la cible courante de l'ecran
+        conversation (Retour / champ / Envoyer). Si on est entre dans le
+        champ pour taper (_convo_in_field), on efface les surbrillances de
+        navigation (le focus Qt natif du champ prend le relais visuel)."""
+        on_convo = (self._stack.currentWidget() is self._page_convo)
+        sel = (-1 if (self._convo_in_field or not on_convo)
+               else self._convo_nav_index)
+        try:
+            self._convo_back.set_nav_selected(sel == 0)
+        except Exception:
+            pass
+        try:
+            self._convo_input.set_nav_selected(sel == 1)
+        except Exception:
+            pass
+        try:
+            self._btn_send.set_nav_selected(sel == 2)
+        except Exception:
+            pass
+
+    def _ensure_nav_visible(self):
+        """Scroll l'aire de contacts pour que la ligne selectionnee reste
+        visible (le scroll est dans self._contacts_scroll)."""
+        try:
+            if 0 <= self._nav_index < len(self._nav_rows):
+                row = self._nav_rows[self._nav_index]
+                self._contacts_scroll.ensureWidgetVisible(row)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Dessin du chassis (corps noir + bandeau "CircusPhone")
+    # ------------------------------------------------------------------
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        w, h = self._body_w, self._body_h
+
+        # Corps du telephone : rectangle arrondi noir.
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(_PHONE_BODY_COLOR))
+        p.drawRoundedRect(0, 0, w, h, self._radius, self._radius)
+
+        # Boutons lateraux (decoratifs, repris du mockup).
+        p.setBrush(QColor(_PHONE_BTN_COLOR))
+        bw = max(2, int(w * 0.015))
+        # Gauche : 3 boutons
+        p.drawRoundedRect(0, int(h * 0.25), bw, int(h * 0.05), 1, 1)
+        p.drawRoundedRect(0, int(h * 0.33), bw, int(h * 0.09), 1, 1)
+        p.drawRoundedRect(0, int(h * 0.44), bw, int(h * 0.09), 1, 1)
+        # Droite : 1 bouton
+        p.drawRoundedRect(w - bw, int(h * 0.36), bw, int(h * 0.14), 1, 1)
+
+        # Bandeau "CircusPhone" centre dans la zone haute.
+        cx = w / 2
+        cy = self._banner_h / 2 + int(self._banner_h * 0.08)
+        # "Circus" (petit, gris) + "Phone" (grand, blanc) cote a cote.
+        f_small = QFont("sans-serif")
+        f_small.setPixelSize(max(10, int(self._banner_h * 0.26)))
+        f_small.setWeight(QFont.Medium)
+        f_big = QFont("sans-serif")
+        f_big.setPixelSize(max(14, int(self._banner_h * 0.40)))
+        f_big.setWeight(QFont.DemiBold)
+        # Mesurer pour centrer l'ensemble.
+        from PySide6.QtGui import QFontMetrics
+        fm_s = QFontMetrics(f_small)
+        fm_b = QFontMetrics(f_big)
+        w_circus = fm_s.horizontalAdvance("Circus")
+        w_phone  = fm_b.horizontalAdvance("Phone")
+        total = w_circus + w_phone
+        x0 = cx - total / 2
+        baseline = cy + fm_b.ascent() / 2
+        p.setFont(f_small)
+        p.setPen(QColor(_PHONE_BANNER_GREY))
+        p.drawText(int(x0), int(baseline), "Circus")
+        p.setFont(f_big)
+        p.setPen(QColor(_PHONE_BANNER_WHITE))
+        p.drawText(int(x0 + w_circus), int(baseline), "Phone")
+        p.end()
+
+    # ------------------------------------------------------------------
+    # Positionnement + animation
+    # ------------------------------------------------------------------
+    def _final_pos(self) -> QPoint:
+        """Position finale de l'overlay : a 85% horizontal de l'ecran,
+        le bas du telephone a 3 pixels du bord bas de la zone utile
+        (availableGeometry exclut deja la barre des taches Windows,
+        donc 3px du "bord visible" reel).
+
+        Note : avant v0.2.0 dev, c'etait 75% mais retours utilisateurs
+        sur 1080p et 2K ultrawide trouvaient le telephone trop a gauche.
+        85% donne une marge a droite ~ 1/3 a 1/2 de la largeur du tel."""
+        screen = QGuiApplication.primaryScreen()
+        try:
+            geo = screen.availableGeometry()
+        except Exception:
+            return QPoint(100, 100)
+        # 85% horizontal : le centre du telephone est a 85% de la largeur.
+        cx = geo.x() + int(geo.width() * 0.85)
+        x = cx - self._body_w // 2
+        # Verticalement : colle en bas avec une marge de 3px.
+        margin_bottom = 3
+        y = geo.y() + geo.height() - self._body_h - margin_bottom
+        # Garde-fou : si le telephone est plus haut que l'ecran (cas
+        # tres improbable), on aligne sur le haut.
+        x = max(geo.x(), min(x, geo.x() + geo.width() - self._body_w))
+        y = max(geo.y(), y)
+        return QPoint(x, y)
+
+    def show_animated(self):
+        """Affiche l'overlay avec l'animation de montee depuis le bas
+        (400ms, easing doux). Si deja visible, ne fait rien."""
+        if self._visible_state:
+            return
+        self._visible_state = True
+        final = self._final_pos()
+        screen = QGuiApplication.primaryScreen()
+        try:
+            geo = screen.availableGeometry()
+            start_y = geo.y() + geo.height()    # juste sous le bord bas
+        except Exception:
+            start_y = final.y() + self._body_h
+        start = QPoint(final.x(), start_y)
+        self.move(start)
+        self.show()
+        self.raise_()
+        if self._anim is not None:
+            self._anim.stop()
+        self._anim = QPropertyAnimation(self, b"pos", self)
+        self._anim.setDuration(400)
+        self._anim.setStartValue(start)
+        self._anim.setEndValue(final)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._anim.start()
+        # Navigation clavier : on (re)part de la 1ere ligne, action Appeler,
+        # et on demarre le listener D-pad (arrete a la fermeture).
+        self._nav_index = 0
+        self._nav_action = 0
+        self._apply_nav_highlight()
+        try:
+            self._nav_listener.start()
+        except Exception:
+            pass
+
+    def hide_animated(self):
+        """Cache l'overlay. Pour D4 etape 1 : descente symetrique vers le
+        bas puis hide(). Toggle par re-appui du raccourci d'ouverture."""
+        if not self._visible_state:
+            return
+        self._visible_state = False
+        # Arreter le listener D-pad : on ne reserve plus les fleches une
+        # fois le telephone ferme.
+        try:
+            self._nav_listener.stop()
+        except Exception:
+            pass
+        final = self.pos()
+        screen = QGuiApplication.primaryScreen()
+        try:
+            geo = screen.availableGeometry()
+            end_y = geo.y() + geo.height()
+        except Exception:
+            end_y = final.y() + self._body_h
+        end = QPoint(final.x(), end_y)
+        if self._anim is not None:
+            self._anim.stop()
+        self._anim = QPropertyAnimation(self, b"pos", self)
+        self._anim.setDuration(300)
+        self._anim.setStartValue(final)
+        self._anim.setEndValue(end)
+        self._anim.setEasingCurve(QEasingCurve.InCubic)
+        self._anim.finished.connect(self.hide)
+        self._anim.start()
+
+    def is_open(self) -> bool:
+        """True si l'overlay est actuellement ouvert (ou en cours
+        d'animation d'ouverture)."""
+        return self._visible_state
+
+
 class MainWindow(QMainWindow):
     # Signal interne pour declencher run_connect dans le worker thread
     _sig_start_connect = Signal(str, str, str)
@@ -4259,6 +10322,12 @@ class MainWindow(QMainWindow):
     # QueuedConnection en cross-thread, ce qui est thread-safe ;
     # contrairement a QTimer.singleShot qui exige un thread Qt).
     _sig_hotkey = Signal(str)  # nom du hotkey (ex: "mute_mic", "mute_all"...)
+
+    # v0.2 alpha 055 : signal emis quand la machine d'etat clavier du masque
+    # DisplayInfo change d'etat (mobiglass/menu options ouvert ou ferme).
+    # Permet un rafraichissement immediat du masque sans attendre le tick
+    # 500ms du timer. Emis depuis le thread pynput, recu en main Qt thread.
+    _sig_mask_state_changed = Signal()
 
     # Signal emis par le worker de check MAJ (thread daemon -> main thread).
     # Le main thread met a jour le bouton et stocke le manifest distant.
@@ -4293,6 +10362,37 @@ class MainWindow(QMainWindow):
         # fois (avant on accumulait les connexions a chaque showEvent,
         # i.e. a chaque hide/show de calibration).
         self._screen_signal_connected: bool = False
+
+        # Soundboard (v0.2 alpha 029). Cache des samples audio charges
+        # depuis les fichiers .wav locaux (a cote du script). Chaque
+        # entree : sound_id -> np.ndarray float32 mono 48kHz pret a etre
+        # mixe par AudioIO.play_soundboard().
+        # Le cache est rempli au boot par _load_soundboard_sounds() pour
+        # eviter de relire le disque a chaque clic (latence + I/O).
+        # Si un fichier manque, l'entree est absente et le son sera
+        # silencieusement ignore (avec log).
+        self._soundboard_cache: dict = {}
+        # Fenetre flottante du soundboard (creee a la demande au 1er clic
+        # du bouton "Soundboard").
+        self._soundboard_window = None
+
+        # CircusPhone (D4) : overlay smartphone + annuaire local.
+        # _phone_overlay : instance PhoneOverlayWindow, creee a la demande
+        #                  a la 1re ouverture.
+        # _phone_annuaire : dict {"contacts": {...}} charge du fichier au
+        #                   boot, enrichi a chaque reception de la liste
+        #                   des joueurs, sauve apres chaque changement.
+        self._phone_overlay = None
+        self._phone_annuaire = _phone_load_annuaire()
+        # CircusPhone (D4 etape 3) : conversations privees + brouillons,
+        # charges du fichier au boot. Tout passe par les fonctions
+        # _phone_load_messages / _phone_save_messages / _phone_append_*.
+        self._phone_messages = _phone_load_messages()
+
+        # [D5] Manager photos profil (locale + cache des pairs). Singleton
+        # cote MainWindow. Cree apres le chargement annuaire/messages pour
+        # que les disques soient prets.
+        self._profile_photos = _ProfilePhotoManager(self)
 
         # Threads daemon
         self._ocr_thread = None
@@ -4361,6 +10461,25 @@ class MainWindow(QMainWindow):
         self._build_worker()
         self._apply_initial_geometry()
 
+        # Charge les sons du soundboard en cache. Cette etape lit les
+        # .wav du dossier du script et les decode en numpy float32 ;
+        # delaiee apres _build_ui pour que les eventuels logs soient
+        # rendus dans la console du client. Non bloquant : si un
+        # fichier manque, c'est juste logue.
+        self._load_soundboard_sounds()
+
+        # QTimer pour suivre l'etat de lecture du soundboard.
+        # Interroge audio_io.is_soundboard_playing() toutes les 100ms et
+        # met a jour la fenetre soundboard (grise les boutons pendant
+        # la lecture). Si la fenetre n'est pas creee ou pas visible, on
+        # ne fait rien (le timer reste actif mais sans effet UI).
+        self._soundboard_state_timer = QTimer(self)
+        self._soundboard_state_timer.setInterval(100)
+        self._soundboard_state_timer.timeout.connect(
+            self._on_soundboard_state_timer
+        )
+        self._soundboard_state_timer.start()
+
         # Shim UI pour les fonctions importees du client1
         if _CORE_AVAILABLE:
             self._core_shim = _CoreUIShim(self)
@@ -4405,12 +10524,63 @@ class MainWindow(QMainWindow):
             self._vu_timer.timeout.connect(self._vu_tick)
             self._vu_timer.start()
 
-        # Check des mises a jour en arriere-plan : DESACTIVE en release 0.1.
-        # Le serveur d'update n'est plus expose en prod, et le bouton MAJ
-        # est masque dans l'UI. On garde le worker _update_check_worker
-        # pour usage dev (debug, build interne) mais on ne le lance plus
-        # automatiquement au boot.
-        # Pour reactiver : decommenter le bloc ci-dessous.
+        # v0.2 feature 3 : timer de check du masque DisplayInfo.
+        # Tourne en permanence des le boot. Le toggle on/off se fait via
+        # la case dans Parametres (self._cfg["displayinfo_mask_enabled"]).
+        # Si la case n'est pas cochee, le timer tick mais ne fait rien
+        # (cout negligeable, ~1 hashmap lookup + 1 comparaison de float).
+        self._displayinfo_mask = None  # cree au premier show, cache sinon
+        # v0.2 alpha 058 : fenetre source pour OBS (cf. case
+        # "Activer la source OBS du masque" dans Parametres).
+        # Cree au premier show si la case est cochee, detruite sinon.
+        self._displayinfo_mask_obs = None
+
+        # v0.2 alpha 060 : service partage du worker masque.
+        # Centralise la gestion du QThread + _DisplayInfoMaskWorker, et
+        # mutualise entre la fenetre ecran et la fenetre OBS (qui peuvent
+        # tourner independamment l'une de l'autre desormais).
+        # Pas de cout au boot : le worker n'est demarre que quand un
+        # consommateur s'attache via service.attach().
+        self._displayinfo_mask_service = _DisplayInfoMaskWorkerService(self)
+
+        self._displayinfo_mask_timer = QTimer(self)
+        self._displayinfo_mask_timer.setInterval(DISPLAYINFO_MASK_CHECK_MS)
+        self._displayinfo_mask_timer.timeout.connect(
+            self._update_displayinfo_mask
+        )
+        self._displayinfo_mask_timer.start()
+
+        # v0.2 alpha 055 : machine d'etat clavier qui detecte la mobiglass
+        # (F1/F2/F11) et le menu options (Echap) pour cacher le masque
+        # quand le HUD DisplayInfo n'est plus visible. Le callback rebondit
+        # sur le thread Qt main via un signal pour appeler
+        # _update_displayinfo_mask immediatement, sans attendre le tick
+        # de 500ms.
+        try:
+            self._sig_mask_state_changed.connect(self._update_displayinfo_mask)
+        except Exception:
+            pass
+        self._mask_key_tracker = _DisplayInfoMaskKeyTracker(
+            on_state_changed=lambda: self._sig_mask_state_changed.emit()
+        )
+        try:
+            self._mask_key_tracker.start()
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        f"[MASK KEYS] start KO au boot : {e}"
+                    )
+                except Exception:
+                    pass
+
+        # Check des mises a jour en arriere-plan : DESACTIVE pour la release
+        # publique (le systeme de MAJ ne sert qu'au dev / tests joueurs).
+        # Le serveur d'update tourne sur le VPS port 8080. Le worker
+        # interroge en background 2s apres le boot, signale via
+        # _sig_update_available si une MAJ est dispo, et le bouton
+        # "Verifier les MAJ" (page Parametres) passe en orange.
+        # Pour reactiver (dev / tests joueurs) : decommenter le bloc ci-dessous.
         # threading.Thread(
         #     target=self._update_check_worker,
         #     daemon=True,
@@ -4589,6 +10759,15 @@ class MainWindow(QMainWindow):
         root.addWidget(self._main_header_box)
 
         # --- Stacked : page main / page settings ---
+        # Etat d'appel CircusPhone (anciennement init par _build_page_phone
+        # qui a ete supprimee : la page de debug n'a plus de raison d'etre
+        # car le vrai overlay CircusPhone D4 est utilise en prod). Ces 3
+        # attributs sont consommes par _phone_set_state, _phone_refresh_ui
+        # et tous les _phone_do_* qui restent indispensables au CircusPhone.
+        #   _phone_state : "idle" | "ringing_out" | "ringing_in" | "in_call"
+        self._phone_state   = "idle"
+        self._phone_call_id = None
+        self._phone_peer    = None
         self.stack = QStackedWidget()
         self._build_page_main()
         self._build_page_settings()
@@ -4683,6 +10862,32 @@ class MainWindow(QMainWindow):
         v_overlay.addWidget(self.btn_overlay_edit)
 
         v_left.addWidget(gb_overlay)
+
+        # Section SOUNDBOARD (v0.2 alpha 029). Separee de la section
+        # OVERLAY : conceptuellement c'est une fonctionnalite differente
+        # (overlay = positionnement des elements HUD, soundboard = sons
+        # vocaux RP). Une section propre rend ca plus lisible et permet
+        # d'ajouter plus tard d'autres controles (volume dedie, raccourcis).
+        self.gb_soundboard = QGroupBox("SOUNDBOARD")
+        v_soundboard = QVBoxLayout(self.gb_soundboard)
+        v_soundboard.setSpacing(6)
+        # Bouton "Soundboard" qui toggle la fenetre flottante des sons.
+        # Re-clic referme. Pas checkable pour rester simple (l'etat
+        # ouvert/ferme est gere par la fenetre elle-meme, pas par le bouton).
+        self.btn_soundboard = QPushButton("Soundboard")
+        self.btn_soundboard.setMinimumHeight(32)
+        self.btn_soundboard.setStyleSheet(
+            "padding: 6px 12px;"
+        )
+        self.btn_soundboard.clicked.connect(self._on_soundboard_button_clicked)
+        v_soundboard.addWidget(self.btn_soundboard)
+        v_left.addWidget(self.gb_soundboard)
+        # v0.2 alpha 035 : section cachee par defaut au boot. Sera
+        # affichee uniquement quand le serveur push my_profile avec
+        # soundboard_allowed=True. Si pas connecte ou pas de perm,
+        # l'utilisateur ne voit pas la section du tout (= regle Q3).
+        self.gb_soundboard.setVisible(False)
+
         v_left.addStretch(1)
 
         body.addWidget(left_panel)
@@ -4814,6 +11019,21 @@ class MainWindow(QMainWindow):
         self._players_layout = QVBoxLayout(self._players_container)
         self._players_layout.setContentsMargins(2, 2, 2, 2)
         self._players_layout.setSpacing(6)
+        # Label "Aucun autre joueur en ligne" affiche quand on est connecte
+        # mais qu'aucun autre joueur n'est dans _player_cards. Cache par
+        # defaut (visible=False) : devient visible via
+        # _refresh_no_other_players_label appele depuis _on_player_joined,
+        # _on_player_left, _on_players_reset et les events connect/disconnect.
+        # Style : gris italique centre, discret.
+        # Ajout 25/05/2026 Kainan.
+        self.lbl_no_other_players = QLabel("Aucun autre joueur en ligne")
+        self.lbl_no_other_players.setAlignment(Qt.AlignCenter)
+        self.lbl_no_other_players.setStyleSheet(
+            f"color: {THEME_MUTED}; font-style: italic; "
+            "padding: 20px; font-size: 10pt;"
+        )
+        self.lbl_no_other_players.setVisible(False)
+        self._players_layout.addWidget(self.lbl_no_other_players)
         self._players_layout.addStretch(1)  # pousse les cards vers le haut
         scroll_players.setWidget(self._players_container)
 
@@ -4883,17 +11103,41 @@ class MainWindow(QMainWindow):
         self.lbl_cycle_ch_key   = _make_key_row(v_radio, "Cycle canal radio :",      "cycle_channel")
 
         v_left.addWidget(gb_radio)
+
+        # ── CircusPhone (D4 etape 4) : raccourcis du telephone ──
+        gb_phone = QGroupBox("CircusPhone")
+        gb_phone.setStyleSheet(
+            "QGroupBox { font-weight: bold; padding-top: 14px; }"
+        )
+        v_phone = QVBoxLayout(gb_phone)
+        v_phone.setSpacing(6)
+        self.lbl_phone_open_key = _make_key_row(
+            v_phone, "Ouvrir / Fermer le telephone :", "phone_open"
+        )
+        self.lbl_phone_accept_key  = _make_key_row(
+            v_phone, "Decrocher :", "phone_accept"
+        )
+        self.lbl_phone_decline_key = _make_key_row(
+            v_phone, "Refuser / Raccrocher :", "phone_decline"
+        )
+        self.lbl_phone_mute_key    = _make_key_row(
+            v_phone, "Mute micro :", "phone_mute"
+        )
+        self.lbl_phone_speaker_key = _make_key_row(
+            v_phone, "Haut-parleur :", "phone_speaker"
+        )
+        v_left.addWidget(gb_phone)
+
         # Initialiser l'affichage des touches depuis state
         self._refresh_radio_key_labels()
 
-        # Section Mise a jour : MASQUEE en release 0.1 publique.
-        # On garde le QPushButton instancie parce qu'il est reference par
-        # plusieurs methodes (_on_check_update_clicked, _set_update_button_style,
-        # les callbacks de _check_for_updates, etc.) et le code derriere
-        # reste fonctionnel pour les builds dev (qui peuvent appeler la
-        # verification via menu cache, debug, ou raccourci).
-        # Pour reactiver l'UI : remettre les v_upd.addWidget(self.btn_check_update)
-        # et v_left.addWidget(gb_upd) ci-dessous.
+        # Section Mise a jour : DESACTIVEE pour la release publique (le
+        # systeme de MAJ ne sert qu'au dev / tests joueurs). Le QPushButton
+        # est tout de meme instancie et stylise (le reste du code le
+        # reference : _on_update_available, _set_update_button_style, etc.),
+        # mais il n'est PAS ajoute au layout, donc invisible.
+        # Pour reactiver (dev / tests joueurs) : decommenter les deux
+        # v_upd.addWidget / v_left.addWidget en bas du bloc.
         gb_upd = QGroupBox("Mise a jour")
         gb_upd.setStyleSheet("QGroupBox { font-weight: bold; padding-top: 14px; }")
         v_upd = QVBoxLayout(gb_upd)
@@ -4902,8 +11146,8 @@ class MainWindow(QMainWindow):
         self.btn_check_update.setMinimumHeight(28)
         self._set_update_button_style(False)
         self.btn_check_update.clicked.connect(self._on_check_update_clicked)
-        # v_upd.addWidget(self.btn_check_update)  # masque en release 0.1
-        # v_left.addWidget(gb_upd)                # masque en release 0.1
+        # v_upd.addWidget(self.btn_check_update)
+        # v_left.addWidget(gb_upd)
 
         v_left.addStretch(1)
         cols.addWidget(col_left, stretch=1)
@@ -4944,6 +11188,157 @@ class MainWindow(QMainWindow):
         self.lbl_ocr_mode_info.setWordWrap(True)
         self._refresh_ocr_mode_info()
         v_ocr.addWidget(self.lbl_ocr_mode_info)
+
+        # Separateur visuel avant le masque DisplayInfo : sujet different
+        # (rendu graphique a l'ecran, vs choix CPU/GPU pour le moteur OCR).
+        sep_ocr = QFrame()
+        sep_ocr.setFrameShape(QFrame.HLine)
+        sep_ocr.setFrameShadow(QFrame.Sunken)
+        sep_ocr.setStyleSheet("color: #444;")
+        v_ocr.addWidget(sep_ocr)
+
+        # Case masque DisplayInfo (v0.2, feature 3). Coche -> un rectangle
+        # noir opaque s'affiche sur la zone DisplayInfo SC quand l'OCR
+        # lit une position fraiche. Voir DisplayInfoMaskWindow.
+        self.cb_displayinfo_mask = QCheckBox(
+            "Masquer la zone DisplayInfo (HUD)"
+        )
+        mask_enabled = bool(self._cfg.get("displayinfo_mask_enabled", False))
+        self.cb_displayinfo_mask.setChecked(mask_enabled)
+        self.cb_displayinfo_mask.setToolTip(
+            "Affiche un rectangle noir opaque par-dessus la zone "
+            "DisplayInfo de Star Citizen (le HUD qui affiche le nom "
+            "de la zone / planete / station). Utile pour les streamers "
+            "qui veulent eviter de leak leur position, ou si le HUD "
+            "vous gene visuellement.\n\n"
+            "Le masque ne s'affiche que quand l'OCR lit une position "
+            "fraiche (vous etes en jeu, pas sur le bureau ou dans un "
+            "menu)."
+        )
+        self.cb_displayinfo_mask.toggled.connect(
+            self._on_displayinfo_mask_toggled
+        )
+        v_ocr.addWidget(self.cb_displayinfo_mask)
+
+        self.lbl_displayinfo_mask_info = QLabel(
+            "Le masque s'affiche automatiquement sur l'ecran ou tourne "
+            "l'OCR, et disparait si la position OCR n'est plus mise a "
+            "jour (alt-tab, menu, ecran de chargement)."
+        )
+        self.lbl_displayinfo_mask_info.setStyleSheet(
+            "color: #888; font-size: 9pt;"
+        )
+        self.lbl_displayinfo_mask_info.setWordWrap(True)
+        v_ocr.addWidget(self.lbl_displayinfo_mask_info)
+
+        # v0.2 alpha 058 : case "Activer la source OBS du masque". Quand
+        # cochee, une fenetre offscreen invisible a l'ecran est creee et
+        # affiche le meme masque que la fenetre ecran. Le streamer peut
+        # alors l'ajouter dans OBS comme source "Window Capture" pour
+        # diffuser le masque a ses viewers sans avoir le masque a l'ecran
+        # (les deux modes coexistent, ils sont independants).
+        self.cb_displayinfo_mask_obs = QCheckBox(
+            "Activer la source OBS du masque (pour streamers)"
+        )
+        mask_obs_enabled = bool(
+            self._cfg.get("displayinfo_mask_obs_enabled", False)
+        )
+        self.cb_displayinfo_mask_obs.setChecked(mask_obs_enabled)
+        self.cb_displayinfo_mask_obs.setToolTip(
+            "Cree une fenetre cachee, hors ecran, qui affiche le meme "
+            "masque que celui visible a l'ecran. Cette fenetre peut etre "
+            "ajoutee dans OBS comme source 'Window Capture' (en mode "
+            "Windows 10 Graphics Capture).\n\n"
+            "Titre de la fenetre dans OBS : "
+            f"\"{DisplayInfoMaskWindowOBS.OBS_WINDOW_TITLE}\".\n\n"
+            "Necessite que le masque DisplayInfo soit aussi active "
+            "(la fenetre OBS reutilise le rendu du masque ecran)."
+        )
+        self.cb_displayinfo_mask_obs.toggled.connect(
+            self._on_displayinfo_mask_obs_toggled
+        )
+        v_ocr.addWidget(self.cb_displayinfo_mask_obs)
+
+        self.lbl_displayinfo_mask_obs_info = QLabel(
+            "Dans OBS : Ajouter une source > Capture de fenetre > Choisir "
+            f"\"{DisplayInfoMaskWindowOBS.OBS_WINDOW_TITLE}\" > Mode de "
+            "capture \"Windows 10\". Positionner cette source par-dessus "
+            "votre Game Capture sur la zone du HUD."
+        )
+        self.lbl_displayinfo_mask_obs_info.setStyleSheet(
+            "color: #888; font-size: 9pt;"
+        )
+        self.lbl_displayinfo_mask_obs_info.setWordWrap(True)
+        v_ocr.addWidget(self.lbl_displayinfo_mask_obs_info)
+
+        # Cases de selection de la frequence du masque (v0.2 alpha 027).
+        # Comportement : une seule case peut etre cochee a la fois
+        # (gere manuellement, pas un QButtonGroup, parce que ce sont
+        # des QCheckBox et pas des QRadioButton).
+        lbl_mask_fps = QLabel("Frequence du masque :")
+        lbl_mask_fps.setStyleSheet("color: #ccc; padding-top: 6px;")
+        v_ocr.addWidget(lbl_mask_fps)
+        # Conteneur horizontal pour les 5 cases
+        h_fps = QHBoxLayout()
+        h_fps.setSpacing(8)
+        # Recupere la frequence courante depuis la config (defaut 5).
+        # v0.2.0 dev : defaut abaisse de 60 a 5 FPS pour reduire la charge
+        # CPU sur les PC modestes. L'utilisateur peut toujours choisir
+        # 10/20/30/60 dans l'UI selon ses besoins.
+        current_fps = int(self._cfg.get("displayinfo_mask_fps", 5))
+        self.cb_mask_fps = {}  # fps_val -> QCheckBox
+        # v0.2 alpha 052 : 120 FPS retire (le pipeline plafonne ~50 FPS
+        # effectifs cote calcul, donc demander 120 ne change rien).
+        for fps_val in (5, 10, 20, 30, 60):
+            cb = QCheckBox(f"{fps_val} FPS")
+            cb.setChecked(fps_val == current_fps)
+            # Lambda capture fps_val correctement (sinon late-binding).
+            cb.toggled.connect(
+                lambda checked, v=fps_val: self._on_mask_fps_toggled(v, checked)
+            )
+            self.cb_mask_fps[fps_val] = cb
+            h_fps.addWidget(cb)
+        h_fps.addStretch()
+        v_ocr.addLayout(h_fps)
+
+        # Dimensions du masque (v0.2 alpha 045) : hauteur (en multiples
+        # de la hauteur de la zone OCR, defaut 19 lignes) et largeur (en
+        # multiplicateur de la largeur de la zone OCR, defaut 1.0).
+        # Permet d'ajuster a la volee sans modifier le code.
+        h_mask_dim = QHBoxLayout()
+        h_mask_dim.setSpacing(8)
+        lbl_h = QLabel("Hauteur (× zone OCR) :")
+        lbl_h.setStyleSheet("color: #ccc;")
+        h_mask_dim.addWidget(lbl_h)
+        self.spn_mask_height = QSpinBox()
+        self.spn_mask_height.setRange(1, 50)
+        self.spn_mask_height.setSingleStep(1)
+        self.spn_mask_height.setValue(
+            int(self._cfg.get("displayinfo_mask_height_factor", 19))
+        )
+        self.spn_mask_height.setFixedWidth(80)
+        self.spn_mask_height.valueChanged.connect(
+            self._on_mask_height_changed
+        )
+        h_mask_dim.addWidget(self.spn_mask_height)
+        h_mask_dim.addSpacing(20)
+        lbl_w = QLabel("Largeur (× zone OCR) :")
+        lbl_w.setStyleSheet("color: #ccc;")
+        h_mask_dim.addWidget(lbl_w)
+        self.spn_mask_width = QDoubleSpinBox()
+        self.spn_mask_width.setRange(0.1, 5.0)
+        self.spn_mask_width.setSingleStep(0.1)
+        self.spn_mask_width.setDecimals(2)
+        self.spn_mask_width.setValue(
+            float(self._cfg.get("displayinfo_mask_width_factor", 1.0))
+        )
+        self.spn_mask_width.setFixedWidth(80)
+        self.spn_mask_width.valueChanged.connect(
+            self._on_mask_width_changed
+        )
+        h_mask_dim.addWidget(self.spn_mask_width)
+        h_mask_dim.addStretch()
+        v_ocr.addLayout(h_mask_dim)
 
         v_right.addWidget(gb_ocr)
 
@@ -4992,6 +11387,961 @@ class MainWindow(QMainWindow):
         # _page_settings est ce qu'on ajoute au QStackedWidget : c'est la
         # scroll area, pas le widget interne.
         self._page_settings = scroll
+
+    def _phone_log(self, msg: str):
+        """Stub : anciennement loggue dans txt_phone_log de la page Phone
+        Debug supprimee. On garde la methode car elle est invoquee par tous
+        les _phone_do_* (decroche, refuse, raccroche, etc.) qui restent
+        indispensables au vrai CircusPhone. Aucune action visible : si tu
+        veux retrouver ces logs, ils sont aussi dans le log debug global
+        via les exceptions et events serveur."""
+        pass
+
+    def _phone_refresh_ui(self):
+        """Stub : anciennement mettait a jour les widgets de la page Phone
+        Debug (lbl_phone_state, btn_phone_call, etc.) qui a ete supprimee.
+        On garde la methode car _phone_set_state l'appelle systematiquement,
+        mais elle est devenue un no-op. Le vrai overlay CircusPhone gere sa
+        propre UI via _phone_refresh_overlay_buttons et _phone_set_state."""
+        pass
+
+    def _phone_set_state(self, new_state: str, peer=None, call_id=None):
+        """Centralise les mutations d'etat d'appel + refresh UI.
+        Synchronise aussi l'etat d'appel cote core (state.phone_in_call /
+        state.phone_peer) : c'est ce que lisent _on_audio_captured (pour
+        emettre la voix avec le flag 0x03) et _audio_ws_loop (pour ne
+        jouer que les trames 0x03 venant du correspondant). D3."""
+        # D4b : retenir si on quitte un appel actif avec HP ON, pour
+        # envoyer une derniere liste vide au serveur (cleanup explicite,
+        # meme si le serveur fait deja le cleanup sur phone_call_ended).
+        was_hp_active = bool(getattr(self, "_phone_speaker_on", False)) and \
+                        self._phone_state == "in_call"
+
+        self._phone_state   = new_state
+        self._phone_peer    = peer
+        self._phone_call_id = call_id
+        self._phone_refresh_ui()
+        # --- Sync core (D3 : audio bidirectionnel) ---
+        # in_call uniquement quand l'appel est reellement decroche ;
+        # pendant la sonnerie (ringing_out / ringing_in) on n'emet pas
+        # encore de voix telephone.
+        if _CORE_AVAILABLE:
+            try:
+                in_call = (new_state == "in_call")
+                state.phone_in_call = in_call
+                state.phone_peer    = peer if in_call else None
+                # D4b : exposer le call_id au core pour qu'il puisse
+                # envoyer phone_speaker_state depuis la boucle OCR.
+                state.phone_call_id = call_id if in_call else None
+                # Cas limite : si la touche radio etait DEJA enfoncee au
+                # moment ou l'appel demarre, le press n'a pas ete bloque
+                # (il a eu lieu avant l'appel) et radio_active est reste
+                # True. Le release sera ignore pendant l'appel -> il
+                # resterait True a jamais. On force donc l'arret de la
+                # radio a l'entree en appel.
+                if in_call:
+                    state.radio_active = False
+                    state.profile_radio_active = False
+                # D4b : sortie d'appel -> reset complet HP. Le serveur
+                # sait deja nettoyer via phone_call_ended mais on envoie
+                # une derniere liste vide pour eviter tout coin de race
+                # (et pour reset proprement les flags locaux).
+                if not in_call:
+                    self._phone_speaker_on = False
+                    if was_hp_active:
+                        # Etat avait HP ON juste avant la transition.
+                        # Forcer l'envoi vide. state.phone_hp_active est
+                        # mis a False en interne par _phone_hp_send_state
+                        # quand phone_in_call=False.
+                        state.phone_hp_active = False
+                        try:
+                            _core._phone_hp_send_state(force=True)
+                        except Exception:
+                            pass
+                    state.phone_hp_active = False
+                    state.phone_hp_last_neighbors_sent = set()
+            except Exception:
+                pass
+
+    # --- Actions utilisateur (boutons de la page) ---
+
+    def _phone_do_accept(self):
+        """Bouton DECROCHER : envoie phone_call_accept."""
+        if self._phone_state != "ringing_in":
+            self._phone_log("[IGNORE] Aucun appel entrant a decrocher.")
+            return
+        cid = self._phone_call_id
+        try:
+            ok = _core._ws_send_safe({
+                "type": "phone_call_accept", "call_id": cid,
+            })
+        except Exception as e:
+            ok = False
+            self._phone_log(f"[ERREUR] _ws_send_safe : {e}")
+        if ok:
+            self._phone_log(f"→ phone_call_accept (call_id={cid})")
+        else:
+            self._phone_log("[ERREUR] Envoi phone_call_accept echoue.")
+
+    def _phone_do_decline(self):
+        """Bouton REFUSER : envoie phone_call_decline."""
+        if self._phone_state != "ringing_in":
+            self._phone_log("[IGNORE] Aucun appel entrant a refuser.")
+            return
+        cid = self._phone_call_id
+        try:
+            ok = _core._ws_send_safe({
+                "type": "phone_call_decline", "call_id": cid,
+            })
+        except Exception as e:
+            ok = False
+            self._phone_log(f"[ERREUR] _ws_send_safe : {e}")
+        if ok:
+            self._phone_log(f"→ phone_call_decline (call_id={cid})")
+            # Couper la sonnerie immediatement + retour repos (le serveur
+            # ne renotifie pas celui qui refuse).
+            self._phone_stop_ring()
+            self._phone_set_state("idle")
+            # Bascule l'overlay sur l'ecran Contacts (le serveur ne nous
+            # renotifie pas, donc c'est ici qu'on fait le retour visuel).
+            self._phone_back_to_contacts()
+        else:
+            self._phone_log("[ERREUR] Envoi phone_call_decline echoue.")
+
+    def _phone_do_hangup(self):
+        """Bouton RACCROCHER : annule un appel sortant ou raccroche un
+        appel en cours (meme message WS dans les deux cas)."""
+        if self._phone_state not in ("ringing_out", "in_call"):
+            self._phone_log("[IGNORE] Aucun appel a raccrocher.")
+            return
+        cid = self._phone_call_id
+        try:
+            ok = _core._ws_send_safe({
+                "type": "phone_call_hangup", "call_id": cid,
+            })
+        except Exception as e:
+            ok = False
+            self._phone_log(f"[ERREUR] _ws_send_safe : {e}")
+        if ok:
+            self._phone_log(f"→ phone_call_hangup (call_id={cid})")
+            # Couper le bip d'appel si on annulait une sonnerie sortante +
+            # retour repos (le serveur ne renotifie pas le raccrocheur).
+            self._phone_stop_ring()
+            self._phone_set_state("idle")
+            # Bascule l'overlay sur l'ecran Contacts (le serveur ne nous
+            # renotifie pas, donc c'est ici qu'on fait le retour visuel).
+            self._phone_back_to_contacts()
+        else:
+            self._phone_log("[ERREUR] Envoi phone_call_hangup echoue.")
+
+    # --- Slots : reception des signaux du NetWorker (thread Qt) ---
+
+    @Slot(str, str)
+    def _on_phone_ringing(self, call_id: str, target: str):
+        self._phone_set_state("ringing_out", peer=target, call_id=call_id)
+        self._phone_log(f"← phone_call_ringing : ça sonne chez {target} "
+                        f"(call_id={call_id})")
+        # Appelant : on lance le bip d'appel en boucle.
+        self._phone_play_ring("dial")
+        # D4 etape 2 : bascule l'overlay sur l'ecran 'Appel sortant' s'il
+        # est ouvert. Sinon : pas d'ouverture automatique (telephone "dans
+        # la poche") - juste le bip d'appel audible.
+        ov = self._phone_overlay
+        if ov is not None and ov.is_open():
+            ov.show_screen_outgoing(target or "")
+
+    @Slot(str, str)
+    def _on_phone_incoming(self, call_id: str, caller: str):
+        self._phone_set_state("ringing_in", peer=caller, call_id=call_id)
+        self._phone_log(f"← phone_call_incoming : {caller} vous appelle "
+                        f"(call_id={call_id})")
+        # Destinataire : on lance la sonnerie en boucle.
+        self._phone_play_ring("ring")
+        # D4 etape 2 : telephone "dans la poche". On NE bascule PAS
+        # automatiquement la page debug et on NE force PAS l'ouverture
+        # de l'overlay. Seul son : la sonnerie. Si l'overlay est deja
+        # ouvert, il bascule sur l'ecran appel entrant (priorite
+        # d'affichage de la spec).
+        ov = self._phone_overlay
+        if ov is not None and ov.is_open():
+            ov.show_screen_incoming(caller or "")
+
+    @Slot(str, str, str)
+    def _on_phone_accepted(self, call_id: str, caller: str, callee: str):
+        # Defense : on ignore les messages qui concerneraient un autre
+        # appel que celui qu'on connait. Cas tordu mais possible
+        # (message tardif apres reco rapide, ou serveur incoherent).
+        if call_id and self._phone_call_id and call_id != self._phone_call_id:
+            self._phone_log(
+                f"← phone_call_accepted IGNORE (call_id={call_id} "
+                f"!= courant={self._phone_call_id})"
+            )
+            return
+        # L'autre partie = celle qui n'est pas nous.
+        my = state.my_name if _CORE_AVAILABLE else None
+        peer = callee if caller == my else caller
+        self._phone_set_state("in_call", peer=peer, call_id=call_id)
+        self._phone_log(f"← phone_call_accepted : en appel avec {peer} "
+                        f"(call_id={call_id})")
+        # Appel decroche : la sonnerie / le bip s'arrete des deux cotes.
+        self._phone_stop_ring()
+        # D4 etape 2 : bascule sur l'ecran 'En appel' si l'overlay est
+        # ouvert.
+        ov = self._phone_overlay
+        if ov is not None and ov.is_open():
+            ov.show_screen_in_call(peer or "")
+
+    @Slot(str)
+    def _on_phone_declined(self, call_id: str):
+        if call_id and self._phone_call_id and call_id != self._phone_call_id:
+            self._phone_log(
+                f"← phone_call_declined IGNORE (call_id={call_id} "
+                f"!= courant={self._phone_call_id})"
+            )
+            return
+        self._phone_log(f"← phone_call_declined : appel refuse "
+                        f"(call_id={call_id})")
+        # Appelant : la cible a refuse, on coupe le bip d'appel.
+        self._phone_stop_ring()
+        self._phone_set_state("idle")
+        self._phone_back_to_contacts()
+
+    @Slot(str, str)
+    def _on_phone_busy(self, target: str, cause: str):
+        label = "hors ligne" if cause == "offline" else "deja en appel"
+        self._phone_log(f"← phone_call_busy : {target} est {label}")
+        # Par securite (aucun son ne devrait tourner a ce stade, mais
+        # idempotent).
+        self._phone_stop_ring()
+        self._phone_set_state("idle")
+        self._phone_back_to_contacts()
+
+    @Slot(str, str, str)
+    def _on_phone_missed(self, call_id: str, caller: str, callee: str):
+        if call_id and self._phone_call_id and call_id != self._phone_call_id:
+            self._phone_log(
+                f"← phone_call_missed IGNORE (call_id={call_id} "
+                f"!= courant={self._phone_call_id})"
+            )
+            return
+        my = state.my_name if _CORE_AVAILABLE else None
+        if caller == my:
+            self._phone_log(f"← phone_call_missed : appel non abouti "
+                            f"(call_id={call_id})")
+        else:
+            self._phone_log(f"← phone_call_missed : appel manque de "
+                            f"{caller} (call_id={call_id})")
+        # Timeout 45s : on coupe la sonnerie / le bip des deux cotes.
+        self._phone_stop_ring()
+        self._phone_set_state("idle")
+        self._phone_back_to_contacts()
+
+    @Slot(str, str)
+    def _on_phone_ended(self, call_id: str, reason: str):
+        if call_id and self._phone_call_id and call_id != self._phone_call_id:
+            self._phone_log(
+                f"← phone_call_ended IGNORE (call_id={call_id} "
+                f"!= courant={self._phone_call_id})"
+            )
+            return
+        reason_txt = {
+            "hangup":          "l'autre partie a raccroche",
+            "peer_disconnect": "l'autre partie s'est deconnectee",
+            "peer_timeout":    "l'autre partie a timeout",
+        }.get(reason, reason)
+        self._phone_log(f"← phone_call_ended : {reason_txt} "
+                        f"(call_id={call_id})")
+        # Fin d'appel : on coupe tout son en cours.
+        self._phone_stop_ring()
+        self._phone_set_state("idle")
+        self._phone_back_to_contacts()
+
+    def _phone_back_to_contacts(self):
+        """Retour a l'ecran Contacts apres un appel termine. No-op si
+        l'overlay n'existe pas ou n'est pas ouvert (auquel cas il n'a
+        rien a basculer)."""
+        ov = self._phone_overlay
+        if ov is not None and ov.is_open():
+            ov.show_screen_contacts()
+
+    def _phone_on_disconnect(self):
+        """Appele quand la connexion serveur tombe : tout appel en cours
+        est de facto termine (le serveur l'a deja purge). Retour repos."""
+        if getattr(self, "_phone_state", "idle") != "idle":
+            self._phone_set_state("idle")
+            self._phone_log("[NET] Deconnecte : appel termine.")
+        # Couper la sonnerie si elle tournait encore.
+        self._phone_stop_ring()
+
+    # --- Sonnerie telephone (Feature 4, D2) ---
+
+    def _phone_play_ring(self, kind: str):
+        """Demarre la sonnerie telephone en boucle via audio_io.
+          kind = "ring" -> sonnerie destinataire (appel entrant)
+          kind = "dial" -> bip d'appel appelant (en attente de reponse)
+        No-op silencieux si audio_io n'est pas disponible (audio pas
+        demarre = pas connecte) : le cycle d'appel D1 continue de
+        fonctionner sans le son."""
+        audio = getattr(state, "audio_io", None) if _CORE_AVAILABLE else None
+        if audio is None:
+            return
+        try:
+            audio.play_phone_ring(kind)
+        except Exception as e:
+            self._phone_log(f"[AUDIO] play_phone_ring KO : {e}")
+
+    def _phone_stop_ring(self):
+        """Coupe la sonnerie telephone immediatement (coupure nette).
+        Idempotent : sans danger si rien ne sonne ou si audio_io est
+        absent. Appele sur chaque transition d'appel."""
+        audio = getattr(state, "audio_io", None) if _CORE_AVAILABLE else None
+        if audio is None:
+            return
+        try:
+            audio.stop_phone_ring()
+        except Exception as e:
+            self._phone_log(f"[AUDIO] stop_phone_ring KO : {e}")
+
+    # ------------------------------------------------------------------
+    # CircusPhone (D4) : overlay smartphone + annuaire
+    # ------------------------------------------------------------------
+    def _phone_ensure_overlay(self):
+        """Cree l'overlay smartphone s'il n'existe pas encore (lazy init,
+        comme la fenetre soundboard). Branche ses signaux. Retourne
+        l'instance (ou None si la creation echoue)."""
+        if self._phone_overlay is not None:
+            return self._phone_overlay
+        try:
+            ov = PhoneOverlayWindow(self)
+            # Actions depuis l'ecran Contacts.
+            ov.sig_call.connect(self._on_phone_overlay_call)
+            ov.sig_message.connect(self._on_phone_overlay_message)
+            ov.sig_forget.connect(self._on_phone_overlay_forget)
+            # Actions depuis les ecrans d'appel (D4 etape 2).
+            ov.sig_accept_call.connect(self._phone_do_accept)
+            ov.sig_decline_call.connect(self._phone_do_decline)
+            ov.sig_hangup_call.connect(self._phone_do_hangup)
+            ov.sig_mute_toggled.connect(self._on_phone_overlay_mute)
+            ov.sig_speaker_toggled.connect(self._on_phone_overlay_speaker)
+            # Actions depuis l'ecran Conversation (D4 etape 3).
+            ov.sig_send_message.connect(self._on_phone_overlay_send_message)
+            ov.sig_back_contacts.connect(self._on_phone_overlay_back_contacts)
+            ov.sig_draft_changed.connect(self._on_phone_overlay_draft_changed)
+            # [D5+] Reglages profil : page interne du telephone. Engrenage
+            # bascule vers l'ecran Reglages. Chaque widget de l'ecran emet
+            # son signal, MainWindow relaye au manager des photos.
+            ov.sig_settings_clicked.connect(self._on_phone_overlay_settings)
+            ov.sig_settings_back.connect(self._on_phone_overlay_settings_back)
+            ov.sig_settings_choose.connect(self._on_phone_overlay_settings_choose)
+            ov.sig_settings_remove.connect(self._on_phone_overlay_settings_remove)
+            ov.sig_settings_zoom_in.connect(self._on_phone_overlay_settings_zoom_in)
+            ov.sig_settings_zoom_out.connect(self._on_phone_overlay_settings_zoom_out)
+            ov.sig_settings_move.connect(self._on_phone_overlay_settings_move)
+            ov.sig_settings_recenter.connect(self._on_phone_overlay_settings_recenter)
+            # [D5] Injecte le provider de photos pour l'affichage d'avatars
+            # dans l'overlay. Le manager retourne les bytes JPEG d'un pair
+            # si en cache, None sinon. L'overlay decide quoi faire (afficher
+            # ou rien selon la spec : pas de placeholder).
+            try:
+                ov.set_photo_provider(
+                    lambda pseudo: self._profile_photos.get_peer_photo_bytes(
+                        pseudo
+                    )
+                )
+            except Exception:
+                pass
+            self._phone_overlay = ov
+            # CircusPhone (D4 etape 4) : initialiser l'affichage des
+            # raccourcis sous les boutons d'appel a partir de state.
+            self._phone_refresh_overlay_shortcuts()
+        except Exception as e:
+            self._on_log(f"[PHONE] Echec creation overlay : {e}")
+            self._phone_overlay = None
+        return self._phone_overlay
+
+    def _phone_refresh_overlay_shortcuts(self):
+        """Met a jour les labels de raccourci sous les boutons de l'overlay
+        a partir des touches actuellement configurees dans state. Appele
+        a la creation de l'overlay et a chaque modification d'un raccourci
+        telephone dans les Parametres. No-op si l'overlay n'existe pas."""
+        ov = self._phone_overlay
+        if ov is None or not hasattr(ov, "update_shortcut_labels"):
+            return
+        try:
+            ov.update_shortcut_labels(
+                accept_key  = getattr(state, "phone_accept_key", None) or "",
+                decline_key = getattr(state, "phone_decline_key", None) or "",
+                mute_key    = getattr(state, "phone_mute_key", None) or "",
+                speaker_key = getattr(state, "phone_speaker_key", None) or "",
+            )
+        except Exception as e:
+            self._on_log(f"[PHONE] refresh shortcuts KO : {e}")
+
+    def _phone_toggle_overlay(self):
+        """Ouvre l'overlay smartphone, ou le referme s'il est deja ouvert
+        (toggle par re-appui, comme prevu dans la spec). A l'ouverture, la
+        liste des contacts est rafraichie depuis l'annuaire courant, et
+        l'overlay s'ouvre sur l'ecran adapte a l'etat d'appel courant
+        (Contacts par defaut, ou Appel entrant / sortant / en cours si
+        un appel est en cours)."""
+        ov = self._phone_ensure_overlay()
+        if ov is None:
+            return
+        if ov.is_open():
+            ov.hide_animated()
+        else:
+            self._phone_refresh_overlay_contacts()
+            # Choix de l'ecran initial selon l'etat d'appel.
+            st = getattr(self, "_phone_state", "idle")
+            peer = getattr(self, "_phone_peer", None) or ""
+            if st == "ringing_out":
+                ov.show_screen_outgoing(peer)
+            elif st == "ringing_in":
+                ov.show_screen_incoming(peer)
+            elif st == "in_call":
+                ov.show_screen_in_call(peer)
+            else:
+                ov.show_screen_contacts()
+            ov.show_animated()
+
+    def _phone_refresh_overlay_contacts(self):
+        """Rafraichit la liste des contacts affichee dans l'overlay a
+        partir de l'annuaire et des joueurs actuellement connectes.
+        No-op si l'overlay n'existe pas encore (rien a rafraichir)."""
+        ov = self._phone_overlay
+        if ov is None:
+            return
+        try:
+            online = set()
+            if _CORE_AVAILABLE:
+                online = set(state.players.keys())
+            my_name = state.my_name if _CORE_AVAILABLE else ""
+            # D4 etape 3 : ensemble des contacts avec MP non lus
+            # -> badge rouge sur leur enveloppe.
+            # Calcul du timestamp du dernier message (sent OU received) par
+            # contact pour le tri par recence (24/05/2026). Les contacts
+            # sans convo n'apparaissent pas dans ce dict -> tri alpha en
+            # fin de liste de leur groupe (connecte / deconnecte).
+            unread_set = set()
+            last_msg_ts_map = {}
+            convos = self._phone_messages.get("conversations", {})
+            for pseudo, c in convos.items():
+                if not isinstance(c, dict):
+                    continue
+                if int(c.get("unread", 0)) > 0:
+                    unread_set.add(pseudo)
+                # Dernier ts de la convo = max sur sent + received.
+                latest = 0.0
+                for m in c.get("sent", []):
+                    try:
+                        ts = float(m.get("ts", 0.0))
+                        if ts > latest:
+                            latest = ts
+                    except Exception:
+                        pass
+                for m in c.get("received", []):
+                    try:
+                        ts = float(m.get("ts", 0.0))
+                        if ts > latest:
+                            latest = ts
+                    except Exception:
+                        pass
+                if latest > 0:
+                    last_msg_ts_map[pseudo] = latest
+            ov.refresh_contacts(
+                self._phone_annuaire, online, my_name,
+                unread_set=unread_set,
+                # [D5] Provider de photos : bytes JPEG en cache ou None.
+                # Aussi, declenche une request asynchrone pour les pseudos
+                # qu'on n'a jamais vus (pour qu'ils s'affichent au refresh
+                # suivant).
+                photo_provider=self._photo_provider_for_contacts,
+                last_msg_ts_map=last_msg_ts_map,
+            )
+        except Exception as e:
+            self._on_log(f"[PHONE] refresh contacts KO : {e}")
+
+    def _photo_provider_for_contacts(self, pseudo: str):
+        """[D5] Wrapper du provider du manager qui declenche TOUJOURS une
+        request asynchrone, meme si on a deja la photo en cache. C'est
+        le seul moyen de detecter qu'un pair a change sa photo : on envoie
+        notre hash en if-none-match, le serveur repond 'unchanged' si rien
+        n'a bouge, ou 'ok' avec la nouvelle photo si elle a change. Le
+        cout d'une request est minime (un petit message JSON), et la
+        request est anti-double-shot (un seul en vol par pseudo)."""
+        try:
+            b = self._profile_photos.get_peer_photo_bytes(pseudo)
+        except Exception:
+            b = None
+        # Toujours demander, meme si on a deja une photo. Si le hash sur
+        # serveur est le meme, on recoit 'unchanged' et c'est tout. Si
+        # different, on recoit la nouvelle photo et update_avatar_for
+        # se chargera du refresh.
+        try:
+            self._profile_photos.request_peer_photo(pseudo)
+        except Exception:
+            pass
+        return b
+
+    def _phone_annuaire_enrich(self, pseudos):
+        """Enrichit l'annuaire avec une liste de pseudos vus connectes,
+        sauvegarde si quelque chose a change, et rafraichit l'overlay si
+        celui-ci est ouvert. Appele a la reception de la liste des joueurs
+        (welcome) et a chaque join."""
+        try:
+            my_name = state.my_name if _CORE_AVAILABLE else ""
+            changed = _phone_enrich_annuaire(
+                self._phone_annuaire, pseudos, my_name
+            )
+            if changed:
+                _phone_save_annuaire(self._phone_annuaire)
+            # Refresh live : meme si l'annuaire n'a pas change (pseudo
+            # deja connu), le statut connecte/deconnecte a pu bouger.
+            self._phone_refresh_overlay_contacts()
+        except Exception as e:
+            self._on_log(f"[PHONE] enrich annuaire KO : {e}")
+
+    @Slot(str)
+    def _on_phone_overlay_call(self, pseudo: str):
+        """Clic sur l'icone telephone d'un contact connecte : lance un
+        appel. Reutilise le chemin existant (phone_call_request) ; en D4
+        etape 1 on passe par le meme mecanisme que la page debug."""
+        if not pseudo:
+            return
+        if self._phone_state != "idle":
+            self._phone_log(f"[IGNORE] Deja en appel (clic sur {pseudo}).")
+            return
+        if not (_CORE_AVAILABLE and state.connected):
+            self._phone_log("[IGNORE] Pas connecte au serveur.")
+            return
+        try:
+            ok = _core._ws_send_safe({
+                "type": "phone_call_request", "target": pseudo,
+            })
+        except Exception as e:
+            ok = False
+            self._phone_log(f"[ERREUR] _ws_send_safe : {e}")
+        if ok:
+            self._phone_log(f"→ phone_call_request (target={pseudo}) [overlay]")
+        else:
+            self._phone_log("[ERREUR] Envoi phone_call_request echoue.")
+
+    @Slot(str)
+    def _on_phone_overlay_message(self, pseudo: str):
+        """Clic sur l'icone lettre d'un contact : ouvre l'ecran conversation
+        avec ce contact. Marque comme lu (vide le compteur unread) et
+        rafraichit la liste affichee."""
+        if not pseudo:
+            return
+        ov = self._phone_overlay
+        if ov is None:
+            return
+        try:
+            # Marquer comme lu + sauvegarder si changement.
+            if _phone_mark_read(self._phone_messages, pseudo):
+                _phone_save_messages(self._phone_messages)
+            # Construire la liste chronologique + recuperer le brouillon.
+            items = _phone_merge_messages(self._phone_messages, pseudo)
+            convo = self._phone_messages.get("conversations", {}).get(
+                pseudo, {}
+            )
+            draft = convo.get("draft", "") if isinstance(convo, dict) else ""
+            ov.show_screen_conversation(pseudo, items, draft)
+            # Rafraichir la liste Contacts (badge unread efface).
+            self._phone_refresh_overlay_contacts()
+        except Exception as e:
+            self._on_log(f"[PHONE] open conversation KO : {e}")
+
+    @Slot(str, str)
+    def _on_phone_overlay_send_message(self, target: str, body: str):
+        """Envoi d'un MP texte depuis l'ecran conversation. Stockage local
+        immediat + envoi WS au serveur (qui le routera au destinataire).
+        Si l'envoi WS echoue (deconnexion), le message reste stocke local
+        comme envoye (la spec ne prevoit pas de retry / dead letter)."""
+        if not target or not body:
+            return
+        body = body[:PHONE_MAX_BODY_LEN]
+        # 1) Envoi WS au serveur.
+        try:
+            ok = _core._ws_send_safe({
+                "type":   "phone_message_send",
+                "target": target,
+                "body":   body,
+            })
+        except Exception as e:
+            ok = False
+            self._on_log(f"[PHONE-MSG] _ws_send_safe KO : {e}")
+        if not ok:
+            self._phone_log("[PHONE-MSG] Envoi echoue (non connecte ?)")
+            # On stocke quand meme localement : le message a ete redige,
+            # autant que l'utilisateur le voie dans son historique.
+        # 2) Stockage local (envoye).
+        try:
+            ts = time.time()
+            _phone_append_sent(self._phone_messages, target, body, ts)
+            # Vider le brouillon en meme temps (la spec : "envoyer" = clear).
+            _phone_set_draft(self._phone_messages, target, "")
+            _phone_save_messages(self._phone_messages)
+        except Exception as e:
+            self._on_log(f"[PHONE-MSG] stockage local KO : {e}")
+        # 3) Si l'overlay affiche cette conversation, refresh.
+        ov = self._phone_overlay
+        if ov is not None and getattr(ov, "_convo_pseudo", "") == target:
+            try:
+                items = _phone_merge_messages(self._phone_messages, target)
+                ov.refresh_conversation(items)
+            except Exception:
+                pass
+        # 4) Refresh Contacts : le ts du dernier message a change donc le tri
+        #    par recence (24/05/2026) doit se reorganiser. En pratique l'ecran
+        #    contacts n'est pas visible au moment d'un envoi (l'utilisateur est
+        #    dans l'ecran convo), mais on rafraichit quand meme pour que la
+        #    liste soit a jour des le prochain affichage.
+        self._phone_refresh_overlay_contacts()
+
+    @Slot()
+    def _on_phone_overlay_back_contacts(self):
+        """Fleche retour depuis l'ecran conversation : sauvegarde le
+        brouillon courant + retour a l'ecran Contacts."""
+        ov = self._phone_overlay
+        if ov is None:
+            return
+        # Sauvegarde du draft (au cas ou le dernier sig_draft_changed
+        # n'aurait pas eu le temps d'arriver).
+        pseudo = getattr(ov, "_convo_pseudo", "")
+        if pseudo:
+            try:
+                draft = ov._convo_input.toPlainText()
+                _phone_set_draft(self._phone_messages, pseudo, draft)
+                _phone_save_messages(self._phone_messages)
+            except Exception:
+                pass
+        # Refresh Contacts (au cas ou des MP soient arrives pendant qu'on
+        # etait sur la conversation) + bascule.
+        self._phone_refresh_overlay_contacts()
+        ov.show_screen_contacts()
+
+    @Slot(str, str)
+    def _on_phone_overlay_draft_changed(self, pseudo: str, draft: str):
+        """Le texte du champ a change : on sauvegarde le brouillon (cas
+        'appel pendant redaction' de la spec). On debounce avec un timer
+        pour ne pas faire un I/O fichier a chaque touche."""
+        if not pseudo:
+            return
+        try:
+            _phone_set_draft(self._phone_messages, pseudo, draft)
+        except Exception:
+            return
+        # Debounce : reporte la sauvegarde reelle de 1s, et re-arme le
+        # timer a chaque frappe. Si l'utilisateur arrete de taper 1s,
+        # on ecrit.
+        if not hasattr(self, "_phone_draft_save_timer"):
+            self._phone_draft_save_timer = QTimer(self)
+            self._phone_draft_save_timer.setSingleShot(True)
+            self._phone_draft_save_timer.timeout.connect(
+                lambda: _phone_save_messages(self._phone_messages)
+            )
+        self._phone_draft_save_timer.start(1000)
+
+    @Slot(str, str, float)
+    def _on_phone_message_received(self, sender: str, body: str, ts: float):
+        """Reception d'un MP texte depuis le serveur. Stocke localement,
+        joue la notification audio, met a jour la pastille rouge sur
+        l'enveloppe du contact, et rafraichit la conversation si elle
+        est actuellement affichee."""
+        if not sender or not body:
+            return
+        try:
+            # 1) Stockage local (recu + increment unread).
+            _phone_append_received(self._phone_messages, sender, body, ts)
+            # Si l'expediteur n'est pas encore dans l'annuaire (cas rare :
+            # joueur deja connu sur le serveur mais croise pour la 1re fois
+            # via un MP), on l'ajoute aussi pour qu'il apparaisse dans la
+            # liste. _phone_enrich_annuaire est idempotent.
+            try:
+                my_name = state.my_name if _CORE_AVAILABLE else ""
+                if _phone_enrich_annuaire(
+                    self._phone_annuaire, [sender], my_name
+                ):
+                    _phone_save_annuaire(self._phone_annuaire)
+            except Exception:
+                pass
+            _phone_save_messages(self._phone_messages)
+            self._phone_log(
+                f"← phone_message_received de {sender} ({len(body)} char)"
+            )
+
+            # 2) Determiner si la conversation avec ce sender est deja
+            #    ouverte a l'ecran. Si oui, pas besoin de jouer la notif
+            #    (l'utilisateur voit le message arriver en direct dans les
+            #    bulles, jouer un son serait redondant et bruyant).
+            ov = self._phone_overlay
+            current_convo_open = False
+            if ov is not None:
+                current_convo_open = (
+                    ov.is_open()
+                    and ov._stack.currentWidget() is ov._page_convo
+                    and getattr(ov, "_convo_pseudo", "") == sender
+                )
+
+            # 3) Notification sonore (son 1s, slider 'Sonnerie tel.').
+            #    Skip si :
+            #    - la convo avec ce sender est deja ouverte (l'utilisateur
+            #      voit le message arriver en direct), OU
+            #    - ce sender a deja des MP non lus avant celui-ci (la notif
+            #      a deja sonne, evite le spam si plusieurs MP arrivent en
+            #      rafale d'un meme contact). Le compteur unread vient d'etre
+            #      incremente par _phone_append_received ; il vaut donc 1
+            #      pour le premier MP de la salve, 2+ pour les suivants.
+            convo_state = self._phone_messages.get(sender, {})
+            unread_count = int(convo_state.get("unread", 0))
+            already_notified = unread_count > 1
+
+            if not current_convo_open and not already_notified:
+                audio = getattr(state, "audio_io", None) if _CORE_AVAILABLE \
+                        else None
+                if audio is not None:
+                    try:
+                        audio.play_phone_notif()
+                    except Exception as e:
+                        self._phone_log(f"[AUDIO] play_phone_notif KO : {e}")
+
+            # 4) Refresh UI : pastille rouge sur l'enveloppe + conversation
+            #    si elle est ouverte avec ce contact.
+            if ov is not None:
+                if current_convo_open:
+                    if _phone_mark_read(self._phone_messages, sender):
+                        _phone_save_messages(self._phone_messages)
+                    try:
+                        items = _phone_merge_messages(
+                            self._phone_messages, sender
+                        )
+                        ov.refresh_conversation(items)
+                    except Exception:
+                        pass
+                # Refresh Contacts : badge unread + presence eventuelle
+                # du nouvel expediteur dans l'annuaire.
+                self._phone_refresh_overlay_contacts()
+        except Exception as e:
+            self._on_log(f"[PHONE-MSG] reception KO : {e}")
+
+    @Slot(str, str, str, str)
+    def _on_profile_photo_response(self, target: str, status: str,
+                                   new_hash: str, data_b64: str):
+        """[D5] Reponse a une demande de photo de profil. Si la photo est
+        mise a jour, on rafraichit les emplacements UI qui pourraient
+        afficher cette photo (header MP, header appel, item contacts)."""
+        try:
+            changed = self._profile_photos.handle_response(
+                target, status, new_hash, data_b64
+            )
+        except Exception as e:
+            self._on_log(f"[PROFILE] reponse KO : {e}")
+            return
+        if not changed:
+            return
+        # Refresh des emplacements potentiellement concernes par 'target'.
+        ov = self._phone_overlay
+        if ov is None:
+            return
+        try:
+            ov.update_avatar_for(target)
+        except Exception:
+            pass
+
+    @Slot(str)
+    def _on_phone_overlay_forget(self, pseudo: str):
+        """Clic sur la croix 'oublier' d'un contact deconnecte : le retire
+        de l'annuaire (fichier + affichage)."""
+        if not pseudo:
+            return
+        try:
+            removed = _phone_forget_contact(self._phone_annuaire, pseudo)
+            if removed:
+                _phone_save_annuaire(self._phone_annuaire)
+                self._phone_log(f"[ANNUAIRE] Contact oublie : {pseudo}")
+            self._phone_refresh_overlay_contacts()
+        except Exception as e:
+            self._on_log(f"[PHONE] forget contact KO : {e}")
+
+    @Slot(bool)
+    def _on_phone_overlay_mute(self, active: bool):
+        """Toggle mute micro depuis l'ecran 'En appel'. Coupe / restaure
+        la transmission du micro. Reutilise l'API audio existante : on
+        force le multiplicateur 'mon micro' a 0 ou 1.
+        active=True  -> micro coupe (transmission a 0)
+        active=False -> micro ouvert (transmission a 1)"""
+        self._phone_log(
+            f"[PHONE] Mute micro : {'ON' if active else 'OFF'}"
+        )
+        audio = getattr(state, "audio_io", None) if _CORE_AVAILABLE else None
+        if audio is None:
+            return
+        try:
+            # set_capture_muted est l'API exposee par audio_io pour
+            # couper la capture cote envoi (sans toucher au gate ni
+            # au PTT). Si l'API n'existe pas sur cette version d'audio_io,
+            # on log et on continue (echec gracieux).
+            if hasattr(audio, "set_capture_muted"):
+                audio.set_capture_muted(bool(active))
+            else:
+                self._phone_log(
+                    "[PHONE] audio_io.set_capture_muted absent "
+                    "(toggle visuel uniquement)"
+                )
+        except Exception as e:
+            self._phone_log(f"[PHONE] mute toggle KO : {e}")
+
+    @Slot(bool)
+    def _on_phone_overlay_speaker(self, active: bool):
+        """Toggle haut-parleur depuis l'ecran 'En appel'. D4b : envoi de
+        l'etat HP au serveur avec la liste actuelle des voisins ≤5m.
+        Le serveur diffusera les autorisations 'HP active' aux voisins
+        et 'neighbors_update' au peer."""
+        self._phone_log(
+            f"[PHONE] Haut-parleur : {'ON' if active else 'OFF'}"
+        )
+        # On garde la valeur locale pour cohérence UI / boutons.
+        self._phone_speaker_on = bool(active)
+        # Sync core + envoi serveur (D4b)
+        if _CORE_AVAILABLE:
+            try:
+                state.phone_hp_active = bool(active)
+                # Force=True : envoi immediat sans throttle (action utilisateur).
+                # Si active=True : envoie la liste actuelle des voisins ≤5m.
+                # Si active=False : envoie une liste vide (cleanup serveur).
+                ok = _core._phone_hp_send_state(force=True)
+                if not ok:
+                    self._phone_log(
+                        "[PHONE] HP : envoi phone_speaker_state echoue "
+                        "(pas connecte ou pas en appel)"
+                    )
+            except Exception as e:
+                self._phone_log(f"[PHONE] HP : erreur sync core : {e}")
+
+    def _on_phone_overlay_settings(self):
+        """[D5+] Bascule l'overlay vers l'ecran Reglages profil (page
+        interne du telephone). MainWindow refresh la preview a partir
+        du manager des photos."""
+        ov = self._phone_overlay
+        if ov is None:
+            return
+        try:
+            ov.show_screen_settings()
+            self._phone_refresh_settings_preview()
+        except Exception as e:
+            self._on_log(f"[PHONE] settings show KO : {e}")
+
+    def _phone_refresh_settings_preview(self):
+        """Recupere les bytes JPEG actuels + zoom du manager, et pousse
+        a l'overlay pour rafraichir l'ecran Reglages. Appele apres
+        chaque action utilisateur sur cet ecran."""
+        ov = self._phone_overlay
+        if ov is None:
+            return
+        b = None
+        try:
+            if self._profile_photos.has_local_photo():
+                with open(PHONE_PROFILE_PHOTO_FILE, "rb") as f:
+                    b = f.read()
+        except Exception:
+            b = None
+        try:
+            z = self._profile_photos.get_zoom()
+        except Exception:
+            z = 1.0
+        try:
+            ov.refresh_settings_preview(b, int(round(z * 100)))
+        except Exception:
+            pass
+
+    def _on_phone_overlay_settings_back(self):
+        """Fleche retour de l'ecran Reglages : revient a Contacts."""
+        ov = self._phone_overlay
+        if ov is None:
+            return
+        try:
+            ov.show_screen_contacts()
+            self._phone_refresh_overlay_contacts()
+        except Exception:
+            pass
+
+    def _on_phone_overlay_settings_choose(self):
+        """Bouton 'Choisir...' : ouvre un QFileDialog, applique la photo."""
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choisir une photo",
+            "",
+            "Images (*.jpg *.jpeg *.png *.webp *.bmp)",
+        )
+        if not path:
+            return
+        ok, msg = self._profile_photos.set_local_photo_from_file(path)
+        if not ok:
+            QMessageBox.warning(self, "Photo de profil", msg)
+        else:
+            self._phone_log("[PROFILE] Nouvelle photo enregistree.")
+        self._phone_refresh_settings_preview()
+
+    def _on_phone_overlay_settings_remove(self):
+        """Bouton 'Supprimer' : demande confirmation, puis efface."""
+        from PySide6.QtWidgets import QMessageBox
+        if not self._profile_photos.has_local_photo():
+            return
+        ret = QMessageBox.question(
+            self, "Supprimer la photo",
+            "Supprimer votre photo de profil ?\n\n"
+            "Note : la photo deja partagee avec d'autres joueurs reste "
+            "visible chez eux jusqu'a ce que vous en choisissiez une "
+            "nouvelle.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            return
+        self._profile_photos.clear_local_photo()
+        self._phone_log("[PROFILE] Photo locale supprimee.")
+        self._phone_refresh_settings_preview()
+
+    def _on_phone_overlay_settings_zoom_in(self):
+        """Bouton '+' : zoom IN = delta zoom negatif (factor diminue)."""
+        from PySide6.QtWidgets import QMessageBox
+        ok, msg = self._profile_photos.adjust_zoom(-PHONE_PROFILE_ZOOM_STEP)
+        if not ok and "source" in msg.lower():
+            QMessageBox.information(self, "Zoom",
+                "Choisissez d'abord une photo avant de zoomer.")
+        self._phone_refresh_settings_preview()
+
+    def _on_phone_overlay_settings_zoom_out(self):
+        """Bouton '-' : zoom OUT = delta zoom positif (factor augmente)."""
+        from PySide6.QtWidgets import QMessageBox
+        ok, msg = self._profile_photos.adjust_zoom(+PHONE_PROFILE_ZOOM_STEP)
+        if not ok and "source" in msg.lower():
+            QMessageBox.information(self, "Zoom",
+                "Choisissez d'abord une photo avant de zoomer.")
+        self._phone_refresh_settings_preview()
+
+    def _on_phone_overlay_settings_move(self, dx_sign: int, dy_sign: int):
+        """Flèches directionnelles : decale le cadrage selon le pas
+        conseille par le manager (proportionnel au zoom)."""
+        from PySide6.QtWidgets import QMessageBox
+        step = self._profile_photos.get_offset_step()
+        ok, msg = self._profile_photos.adjust_offset(
+            dx_sign * step, dy_sign * step
+        )
+        if not ok and "source" in msg.lower():
+            QMessageBox.information(self, "Cadrage",
+                "Choisissez d'abord une photo avant de cadrer.")
+        self._phone_refresh_settings_preview()
+
+    def _on_phone_overlay_settings_recenter(self):
+        """Bouton central du pad : recentre (offset 0,0)."""
+        from PySide6.QtWidgets import QMessageBox
+        ok, msg = self._profile_photos.reset_offset()
+        if not ok and "source" in msg.lower():
+            QMessageBox.information(self, "Cadrage",
+                "Choisissez d'abord une photo avant de cadrer.")
+        self._phone_refresh_settings_preview()
 
     # ------------------------------------------------------------------
     # Updater : check au boot + bouton + dialog + apply
@@ -5358,6 +12708,464 @@ class MainWindow(QMainWindow):
                 "color: #88dd88; font-size: 9pt;"
             )
 
+    # ------------------------------------------------------------
+    # Log audio RX detaille (diagnostic crackling, ajout 02/06/2026)
+    # ------------------------------------------------------------
+
+    @Slot(bool)
+    def _on_audio_rx_log_toggled(self, checked: bool):
+        """Toggle de la case 'Activer le log audio detaille'.
+
+        Activation a chaud : pas de redemarrage client necessaire.
+        - Sauve l'etat dans _cfg pour persistance entre sessions.
+        - Appelle state.audio_io.set_audio_rx_log_enabled() qui ouvre
+          ou ferme le fichier CSV dans circusvoip_debug/audio_rx/.
+        - Met a jour le label d'info sous la case.
+
+        Le module circusvoip_audio_rx_logger est autonome : si l'init
+        echoue (disque plein, perms), on remet la case decochee et on
+        previent l'utilisateur via le log debug.
+        """
+        self._cfg["audio_rx_log_enabled"] = bool(checked)
+        _save_cfg(self._cfg)
+
+        # Recuperer audio_io depuis le core (instance partagee)
+        audio_io = None
+        if _CORE_AVAILABLE:
+            try:
+                audio_io = _core.state.audio_io
+            except Exception:
+                audio_io = None
+
+        if audio_io is None:
+            self._on_log(
+                "[AUDIO RX LOG] audio_io non disponible, toggle ignore"
+            )
+            self._refresh_audio_rx_log_info()
+            return
+
+        # Pseudo (necessaire pour le nom de fichier)
+        try:
+            pseudo = _core.state.player_name or "Joueur"
+        except Exception:
+            pseudo = "Joueur"
+
+        # Dossier debug (ou ecrire le sous-dossier audio_rx/)
+        debug_dir = None
+        if _CORE_AVAILABLE:
+            try:
+                debug_dir = _core._DEBUG_DIR
+            except Exception:
+                debug_dir = None
+        if debug_dir is None:
+            from pathlib import Path
+            debug_dir = Path("circusvoip_debug")
+
+        # Appel a chaud (le module logger gere thread-safe l'ouverture
+        # ou fermeture du fichier CSV).
+        try:
+            ok = audio_io.set_audio_rx_log_enabled(
+                bool(checked), pseudo=pseudo, debug_dir=debug_dir
+            )
+            if checked and not ok:
+                self._on_log(
+                    "[AUDIO RX LOG] Echec activation : "
+                    "verifier perms / disque dispo / module present"
+                )
+            elif checked and ok:
+                self._on_log(
+                    f"[AUDIO RX LOG] Active. Fichier dans "
+                    f"{debug_dir / 'audio_rx'}/"
+                )
+            elif not checked:
+                self._on_log("[AUDIO RX LOG] Desactive")
+        except Exception as e:
+            self._on_log(f"[AUDIO RX LOG] Erreur toggle : {e}")
+
+        self._refresh_audio_rx_log_info()
+
+    def _refresh_audio_rx_log_info(self):
+        """Met a jour le texte d'info sous la case 'log audio detaille'."""
+        if not hasattr(self, "lbl_audio_rx_log_info"):
+            return
+        if self.cb_audio_rx_log.isChecked():
+            self.lbl_audio_rx_log_info.setText(
+                "Actif : trames audio recues + callbacks sounddevice + "
+                "stats 30s sont enregistres dans un CSV separe "
+                "(circusvoip_debug/audio_rx/). Volume eleve : "
+                "~80-160 MB par heure selon le nombre de senders. "
+                "Desactiver des que le diagnostic est fait."
+            )
+            self.lbl_audio_rx_log_info.setStyleSheet(
+                "color: #ffaa44; font-size: 9pt;"
+            )
+        else:
+            self.lbl_audio_rx_log_info.setText(
+                "Desactive : pas d'enregistrement detaille. Les logs "
+                "habituels [AUDIO STATS] toutes les 30s restent actifs "
+                "dans le log debug principal."
+            )
+            self.lbl_audio_rx_log_info.setStyleSheet(
+                "color: #888; font-size: 9pt;"
+            )
+
+    # ------------------------------------------------------------
+    # Masque DisplayInfo (v0.2, feature 3)
+    # ------------------------------------------------------------
+    # Voir la classe DisplayInfoMaskWindow et la constante
+    # DISPLAYINFO_MASK_REF_4K plus haut dans le fichier.
+
+    @Slot(bool)
+    def _on_displayinfo_mask_toggled(self, checked: bool):
+        """Toggle de la case 'Masquer la zone DisplayInfo'. Sauve dans
+        _cfg et applique immediatement (montre ou cache le mask, selon
+        l'etat OCR courant)."""
+        self._cfg["displayinfo_mask_enabled"] = bool(checked)
+        _save_cfg(self._cfg)
+        self._on_log(f"[MASK] DisplayInfo mask = {checked}")
+        # Application immediate via la routine de tick (qui decide
+        # show/hide selon toutes les conditions).
+        self._update_displayinfo_mask()
+
+    @Slot(bool)
+    def _on_displayinfo_mask_obs_toggled(self, checked: bool):
+        """Toggle de la case 'Activer la source OBS du masque'
+        (v0.2 alpha 058). Sauve dans _cfg et applique immediatement.
+
+        Quand active : une fenetre offscreen est creee a cote de la
+        fenetre masque ecran ; elle se branche sur le signal d'image du
+        meme worker et OBS peut la capturer comme source de fenetre.
+        Quand desactivee : la fenetre offscreen est detruite.
+
+        Pas d'effet visible a l'ecran (la fenetre est positionnee hors
+        ecran)."""
+        self._cfg["displayinfo_mask_obs_enabled"] = bool(checked)
+        _save_cfg(self._cfg)
+        self._on_log(f"[MASK OBS] source OBS = {checked}")
+        # Application immediate via la routine de tick.
+        self._update_displayinfo_mask()
+
+    @Slot(int, bool)
+    def _on_mask_fps_toggled(self, fps_val: int, checked: bool):
+        """Handler des cases FPS du masque (5/10/20/30/60).
+        Comportement radio : decocher les autres si on coche celle-ci.
+        Si on tente de decocher la case actuellement cochee, on re-coche
+        immediatement (au moins une case doit etre selectionnee)."""
+        # Eviter la recursion : pendant qu'on programme setChecked(False)
+        # sur les autres, le signal toggled se redeclenche -> on garde
+        # un flag.
+        if getattr(self, "_mask_fps_updating", False):
+            return
+        if not checked:
+            # Tentative de decocher la case courante : interdit, on
+            # re-coche silencieusement.
+            self._mask_fps_updating = True
+            try:
+                cb = self.cb_mask_fps.get(fps_val)
+                if cb is not None:
+                    cb.setChecked(True)
+            finally:
+                self._mask_fps_updating = False
+            return
+        # Une nouvelle case est cochee : on decoche toutes les autres.
+        self._mask_fps_updating = True
+        try:
+            for v, cb in self.cb_mask_fps.items():
+                if v != fps_val:
+                    cb.setChecked(False)
+        finally:
+            self._mask_fps_updating = False
+        # Sauve dans la config et applique a chaud.
+        self._cfg["displayinfo_mask_fps"] = int(fps_val)
+        _save_cfg(self._cfg)
+        self._on_log(f"[MASK] Frequence masque = {fps_val} FPS")
+        # Notifie le masque existant (s'il tourne) que sa frequence change.
+        try:
+            mask = getattr(self, "_displayinfo_mask", None)
+            if mask is not None:
+                mask.update_fps(int(fps_val))
+        except Exception as e:
+            self._on_log(f"[MASK] update_fps KO : {e}")
+
+    @Slot(int)
+    def _on_mask_height_changed(self, value: int):
+        """Handler du QSpinBox hauteur du masque (v0.2 alpha 045).
+        Multiplicateur de la hauteur de la zone OCR (defaut 19 lignes
+        du HUD DisplayInfo). Sauve dans la config et applique a chaud
+        au masque actif si present."""
+        try:
+            self._cfg["displayinfo_mask_height_factor"] = int(value)
+            _save_cfg(self._cfg)
+            self._on_log(f"[MASK] Hauteur masque = {value} (x zone OCR)")
+            # Applique au masque actif s'il existe : on appelle
+            # _apply_geometry() qui relira la config et recalculera.
+            mask = getattr(self, "_displayinfo_mask", None)
+            if mask is not None:
+                try:
+                    mask._apply_geometry()
+                except Exception as e:
+                    self._on_log(f"[MASK] _apply_geometry KO : {e}")
+        except Exception as e:
+            self._on_log(f"[MASK] _on_mask_height_changed KO : {e}")
+
+    @Slot(float)
+    def _on_mask_width_changed(self, value: float):
+        """Handler du QDoubleSpinBox largeur du masque (v0.2 alpha 045).
+        Multiplicateur de la largeur de la zone OCR (defaut 1.0). Sauve
+        dans la config et applique a chaud au masque actif si present."""
+        try:
+            self._cfg["displayinfo_mask_width_factor"] = float(value)
+            _save_cfg(self._cfg)
+            self._on_log(f"[MASK] Largeur masque = {value:.2f} (x zone OCR)")
+            mask = getattr(self, "_displayinfo_mask", None)
+            if mask is not None:
+                try:
+                    mask._apply_geometry()
+                except Exception as e:
+                    self._on_log(f"[MASK] _apply_geometry KO : {e}")
+        except Exception as e:
+            self._on_log(f"[MASK] _on_mask_width_changed KO : {e}")
+
+    def _resolve_ocr_screen(self):
+        """Retourne le QScreen qui contient la zone OCR (state.zone_coords),
+        ou None si aucune zone n'est definie ou aucun ecran ne contient
+        le centre de la zone.
+
+        zone_coords est en pixels PHYSIQUES (le client a active
+        SetProcessDpiAwareness(2)). QGuiApplication.screenAt() accepte
+        des coordonnees logiques, donc on convertit phys -> logique
+        en cherchant l'ecran qui contient la position et en divisant
+        par son devicePixelRatio."""
+        z = getattr(state, "zone_coords", None)
+        if not isinstance(z, dict):
+            return None
+        try:
+            cx_phys = int(z.get("left", 0)) + int(z.get("width", 0)) // 2
+            cy_phys = int(z.get("top",  0)) + int(z.get("height", 0)) // 2
+        except (TypeError, ValueError):
+            return None
+        # Parcourir les ecrans, trouver celui dont la geometrie physique
+        # contient le centre. Pour la conversion, on multiplie la
+        # geometrie logique par le DPR.
+        try:
+            screens = QGuiApplication.screens()
+        except Exception:
+            return None
+        for sc in screens:
+            try:
+                geo = sc.geometry()
+                dpr = sc.devicePixelRatio() or 1.0
+                # Geometrie physique de l'ecran
+                px_left   = int(round(geo.x()      * dpr))
+                px_top    = int(round(geo.y()      * dpr))
+                px_right  = int(round((geo.x() + geo.width())  * dpr))
+                px_bottom = int(round((geo.y() + geo.height()) * dpr))
+                if (px_left <= cx_phys < px_right
+                        and px_top <= cy_phys < px_bottom):
+                    return sc
+            except Exception:
+                continue
+        return None
+
+    def _update_displayinfo_mask(self):
+        """Decide montrer/cacher le mask DisplayInfo (fenetre ecran et/ou
+        fenetre source OBS) selon :
+          1. La case 'Activer le masque DisplayInfo' est cochee (ecran).
+          2. La case 'Activer la source OBS du masque' est cochee (OBS).
+          3. state.zone_coords est definie (on connait l'ecran cible).
+          4. state.my_pos_ts est recent (< DISPLAYINFO_MASK_STALE_S sec).
+          5. state.mask_force_hidden est False : la machine d'etat clavier
+             n'a pas detecte de mobiglass / menu options ouvert.
+
+        v0.2 alpha 060 : les conditions 3-5 sont communes aux deux
+        fenetres. Les conditions 1-2 sont independantes. Le worker
+        partage (self._displayinfo_mask_service) est demarre automatique-
+        ment des qu'au moins une des deux fenetres s'y attache, et arrete
+        quand la derniere se detache.
+
+        Appele :
+          - immediatement quand une case est toggle (handlers)
+          - immediatement quand la machine d'etat clavier change d'etat
+            (signal _sig_mask_state_changed)
+          - periodiquement par _displayinfo_mask_timer (tous les 500ms)
+        """
+        try:
+            existing     = getattr(self, "_displayinfo_mask", None)
+            obs_existing = getattr(self, "_displayinfo_mask_obs", None)
+
+            # ---- Conditions communes (peuvent invalider les deux) ----
+            cond_screen_cfg = bool(
+                self._cfg.get("displayinfo_mask_enabled", False)
+            )
+            cond_obs_cfg = bool(
+                self._cfg.get("displayinfo_mask_obs_enabled", False)
+            )
+
+            # Au moins une des deux doit etre cochee pour eviter le
+            # calcul des conditions communes.
+            any_enabled = cond_screen_cfg or cond_obs_cfg
+
+            cond_common = True
+            if any_enabled and not DEBUG_MASK_BYPASS_OCR_CHECK:
+                # Verifier la fraicheur de l'OCR (sauf flag debug bypass)
+                pos_ts = getattr(state, "my_pos_ts", 0.0) or 0.0
+                if state.my_pos is None or pos_ts <= 0.0:
+                    cond_common = False
+                else:
+                    age = time.monotonic() - pos_ts
+                    if age > DISPLAYINFO_MASK_STALE_S:
+                        cond_common = False
+
+            # Consulter la machine d'etat clavier (mobiglass / menu).
+            tracker = getattr(self, "_mask_key_tracker", None)
+            if tracker is not None and cond_common and any_enabled:
+                try:
+                    tracker.check_position_change(getattr(state, "my_pos", None))
+                except Exception:
+                    pass
+            if getattr(state, "mask_force_hidden", False):
+                cond_common = False
+
+            # ---- Resolution de l'ecran cible (utilise par les deux) ----
+            screen = None
+            if any_enabled and cond_common:
+                screen = self._resolve_ocr_screen()
+                if screen is None:
+                    if DEBUG_MASK_BYPASS_OCR_CHECK:
+                        try:
+                            screen = QGuiApplication.primaryScreen()
+                        except Exception:
+                            screen = None
+                    if screen is None:
+                        cond_common = False
+
+            # ---- Booleens finaux : fenetre par fenetre ----
+            want_show_screen = cond_screen_cfg and cond_common
+            want_show_obs    = cond_obs_cfg    and cond_common
+
+            # ---- Fenetre ECRAN ----
+            # v0.2 alpha 060 : la fenetre ecran est instanciee des qu'au
+            # moins une des deux fenetres (ecran ou OBS) est demandee.
+            # Raison : c'est la fenetre ecran qui sait calculer la region
+            # de capture (via _apply_geometry qui prend en compte zone OCR,
+            # DPR, et facteurs config) et la pousser au service. Si seule
+            # la fenetre OBS etait demandee, on n'aurait personne pour
+            # pousser la region -> worker dort.
+            # Si want_show_screen est False, on cree quand meme la fenetre
+            # mais on ne la show() pas : elle reste invisible a l'utilisateur,
+            # ne s'attache pas au service (donc pas de larsen), mais peut
+            # quand meme calculer et pousser la region.
+            need_screen_window = want_show_screen or want_show_obs
+
+            if need_screen_window:
+                if existing is None:
+                    # Defaut 5 FPS pour limiter la conso CPU (cf. note sur
+                    # la 1ere occurrence ligne ~10692).
+                    cfg_fps = int(self._cfg.get("displayinfo_mask_fps", 5))
+                    existing = DisplayInfoMaskWindow(
+                        screen,
+                        fps=cfg_fps,
+                        service=self._displayinfo_mask_service,
+                    )
+                    self._displayinfo_mask = existing
+                else:
+                    existing.update_for_screen(screen)
+
+                # show() ou hide() selon want_show_screen.
+                if want_show_screen:
+                    if not existing.isVisible():
+                        existing.show()
+                else:
+                    # Mode "fenetre ecran fantome" : on a besoin de la fenetre
+                    # pour pousser la region au service (cas fenetre OBS
+                    # seule), mais l'utilisateur ne doit rien voir.
+                    if existing.isVisible():
+                        existing.hide()
+                    # Note : on N'appelle PAS _stop_worker() ici : la
+                    # fenetre ecran reste "attachee" au service tant qu'elle
+                    # existe, ce qui maintient le worker en vie. C'est OK
+                    # parce que la fenetre OBS est attachee aussi, donc le
+                    # worker doit tourner de toute facon. Si l'utilisateur
+                    # decoche les deux cases, want_show_obs deviendra False
+                    # aussi et on tombera dans la branche else ci-dessous,
+                    # qui detruira la fenetre proprement.
+            else:
+                if existing is not None:
+                    try:
+                        existing.close()
+                    except Exception:
+                        pass
+                    try:
+                        existing.deleteLater()
+                    except Exception:
+                        pass
+                    self._displayinfo_mask = None
+
+            # ---- Fenetre source OBS ----
+            # v0.2 alpha 060 : la fenetre OBS est independante de la fenetre
+            # ecran. Elle s'attache au meme service partage que la fenetre
+            # ecran, et reciproquement le service auto-demarre le worker
+            # si elle est seule attachee.
+            if want_show_obs:
+                if obs_existing is None:
+                    obs_existing = DisplayInfoMaskWindowOBS(
+                        screen,
+                        service=self._displayinfo_mask_service,
+                    )
+                    # Si la fenetre ecran existe, on s'aligne sur sa
+                    # geometrie pour avoir la meme taille de capture.
+                    # Sinon on fait un best-effort depuis l'ecran cible.
+                    try:
+                        if self._displayinfo_mask is not None:
+                            ref_geo = self._displayinfo_mask.geometry()
+                            obs_existing._refresh_geometry(ref_geometry=ref_geo)
+                    except Exception:
+                        pass
+                    self._displayinfo_mask_obs = obs_existing
+                    if _CORE_AVAILABLE:
+                        try:
+                            _core._dbg_log(
+                                "[MASK OBS] fenetre OBS creee "
+                                f"(titre : '{DisplayInfoMaskWindowOBS.OBS_WINDOW_TITLE}')"
+                            )
+                        except Exception:
+                            pass
+                else:
+                    # Re-application geometrie si la fenetre ecran existe.
+                    try:
+                        obs_existing._screen = screen
+                        if self._displayinfo_mask is not None:
+                            ref_geo = self._displayinfo_mask.geometry()
+                            obs_existing._refresh_geometry(ref_geometry=ref_geo)
+                    except Exception:
+                        pass
+                if not obs_existing.isVisible():
+                    obs_existing.show()
+            else:
+                if obs_existing is not None:
+                    try:
+                        obs_existing.close()
+                    except Exception:
+                        pass
+                    try:
+                        obs_existing.deleteLater()
+                    except Exception:
+                        pass
+                    self._displayinfo_mask_obs = None
+                    if _CORE_AVAILABLE:
+                        try:
+                            _core._dbg_log("[MASK OBS] fenetre OBS detruite")
+                        except Exception:
+                            pass
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        f"[MASK] _update_displayinfo_mask KO : {e}"
+                    )
+                except Exception:
+                    pass
+
     def _refresh_zone_info(self):
         """Met a jour le label d'info zone OCR avec la zone actuelle."""
         if not hasattr(self, "lbl_zone_info"):
@@ -5533,6 +13341,12 @@ class MainWindow(QMainWindow):
             ("lbl_mute_all_key",   "mute_all_key"),
             ("lbl_prox_short_key", "proximity_short_key"),
             ("lbl_cycle_ch_key",   "cycle_channel_key"),
+            # CircusPhone (D4 etape 4)
+            ("lbl_phone_open_key",    "phone_open_key"),
+            ("lbl_phone_accept_key",  "phone_accept_key"),
+            ("lbl_phone_decline_key", "phone_decline_key"),
+            ("lbl_phone_mute_key",    "phone_mute_key"),
+            ("lbl_phone_speaker_key", "phone_speaker_key"),
         ]
         for lbl_attr, state_attr in rows:
             lbl = getattr(self, lbl_attr, None)
@@ -5592,6 +13406,85 @@ class MainWindow(QMainWindow):
         try: state.profile_radio_active = False
         except Exception: pass
 
+    # CircusPhone (D4 etape 4) : 5 callbacks hotkey, thread pynput -> Qt
+    # via _sig_hotkey (queued connection). Le slot _on_hotkey_dispatch
+    # appelle ensuite la bonne action dans le thread main Qt.
+    def _on_hotkey_phone_open(self):
+        try: _core._dbg_log("[HOTKEY] phone_open (thread pynput)")
+        except Exception: pass
+        self._sig_hotkey.emit("phone_open")
+
+    def _on_hotkey_phone_accept(self):
+        self._sig_hotkey.emit("phone_accept")
+
+    def _on_hotkey_phone_decline(self):
+        self._sig_hotkey.emit("phone_decline")
+
+    def _on_hotkey_phone_mute(self):
+        self._sig_hotkey.emit("phone_mute")
+
+    def _on_hotkey_phone_speaker(self):
+        self._sig_hotkey.emit("phone_speaker")
+
+    # Actions executees dans le thread Qt apres dispatch.
+    def _do_phone_open(self):
+        """Raccourci 'ouvrir telephone' : actif partout. Toggle l'overlay."""
+        try:
+            self._phone_toggle_overlay()
+        except Exception as e:
+            self._on_log(f"[PHONE] hotkey open KO : {e}")
+
+    def _do_phone_accept(self):
+        """Raccourci 'decrocher' : actif uniquement en appel entrant."""
+        try:
+            if getattr(self, "_phone_state", "idle") == "ringing_in":
+                self._phone_do_accept()
+        except Exception as e:
+            self._on_log(f"[PHONE] hotkey accept KO : {e}")
+
+    def _do_phone_decline(self):
+        """Raccourci 'refuser/raccrocher' : refuse en sonnerie entrante,
+        raccroche pendant un appel sortant ou en cours. Pareil que le
+        bouton rouge des ecrans correspondants."""
+        try:
+            st = getattr(self, "_phone_state", "idle")
+            if st == "ringing_in":
+                self._phone_do_decline()
+            elif st in ("ringing_out", "in_call"):
+                self._phone_do_hangup()
+        except Exception as e:
+            self._on_log(f"[PHONE] hotkey decline/hangup KO : {e}")
+
+    def _do_phone_mute(self):
+        """Raccourci 'mute micro' : actif uniquement pendant un appel."""
+        try:
+            if getattr(self, "_phone_state", "idle") != "in_call":
+                return
+            ov = self._phone_overlay
+            if ov is None:
+                return
+            # Toggle visuel + audio (le set_active emet sig_mute_toggled,
+            # qui appelle audio_io.set_capture_muted via _on_phone_overlay_mute).
+            new_state = not ov._btn_mute.is_active()
+            ov._btn_mute.set_active(new_state, emit=True)
+        except Exception as e:
+            self._on_log(f"[PHONE] hotkey mute KO : {e}")
+
+    def _do_phone_speaker(self):
+        """Raccourci 'haut-parleur' : actif uniquement pendant un appel.
+        Pour l'instant, toggle visuel + log (le routage audio reel viendra
+        avec D4b)."""
+        try:
+            if getattr(self, "_phone_state", "idle") != "in_call":
+                return
+            ov = self._phone_overlay
+            if ov is None:
+                return
+            new_state = not ov._btn_speaker.is_active()
+            ov._btn_speaker.set_active(new_state, emit=True)
+        except Exception as e:
+            self._on_log(f"[PHONE] hotkey speaker KO : {e}")
+
     @Slot(str)
     def _on_hotkey_dispatch(self, name: str):
         """Recoit un evenement hotkey emis depuis un thread pynput. Appelle
@@ -5605,6 +13498,12 @@ class MainWindow(QMainWindow):
             "mute_all":      self._do_toggle_mute_all,
             "prox_short":    self._do_toggle_prox_short,
             "cycle_channel": self._do_cycle_channel,
+            # CircusPhone (D4 etape 4)
+            "phone_open":    self._do_phone_open,
+            "phone_accept":  self._do_phone_accept,
+            "phone_decline": self._do_phone_decline,
+            "phone_mute":    self._do_phone_mute,
+            "phone_speaker": self._do_phone_speaker,
         }
         action = actions.get(name)
         if action is not None:
@@ -5735,6 +13634,12 @@ class MainWindow(QMainWindow):
             "mute_all":      ("Mute tout",              "mute_all_key",        "mute_all_key"),
             "prox_short":    ("Proximite 30m / 5m",    "proximity_short_key", "proximity_short_key"),
             "cycle_channel": ("Cycle canal radio",     "cycle_channel_key",   "cycle_channel_key"),
+            # CircusPhone (D4 etape 4)
+            "phone_open":    ("Ouvrir / Fermer telephone", "phone_open_key",   "phone_open_key"),
+            "phone_accept":  ("Decrocher",                 "phone_accept_key", "phone_accept_key"),
+            "phone_decline": ("Refuser / Raccrocher",      "phone_decline_key","phone_decline_key"),
+            "phone_mute":    ("Mute micro (telephone)",    "phone_mute_key",   "phone_mute_key"),
+            "phone_speaker": ("Haut-parleur",              "phone_speaker_key","phone_speaker_key"),
         }
         if kind not in kinds:
             return
@@ -5764,6 +13669,11 @@ class MainWindow(QMainWindow):
                 self._on_log(f"[CONFIG] Echec ecriture : {e}")
             self._refresh_radio_key_labels()
             self._on_log(f"[RADIO] {cfg_key} = {new_key!r}")
+            # CircusPhone (D4 etape 4) : si le raccourci modifie concerne
+            # le telephone, mettre a jour aussi les labels sous les boutons
+            # de l'overlay.
+            if cfg_key.startswith("phone_"):
+                self._phone_refresh_overlay_shortcuts()
 
     @Slot(bool)
     def _on_rp_mode_toggled(self, checked: bool):
@@ -6177,6 +14087,136 @@ class MainWindow(QMainWindow):
         )
         v.addWidget(self.cb_noise_suppression)
 
+        # ----- Sliders volume (v0.2) ----------------------------------
+        # 3 sliders 0..200 % (defaut 100 %) qui controlent les sons
+        # generes par le client :
+        #   - Bip radio   : son PTT (press + release). Cable immediatement
+        #                   sur audio_io.set_radio_beep_volume().
+        #   - Soundboard  : reserve a la feature 1 (sons fixes embarques).
+        #                   Le setter audio_io existe mais aucun son joue
+        #                   tant que la feature n'est pas branchee -> le
+        #                   slider est fonctionnel mais inaudible pour
+        #                   l'instant.
+        #   - Sonnerie    : reserve a la feature 4 (telephone). Memes
+        #                   conditions que Soundboard.
+        # Les 3 sliders persistent dans _cfg sous radio_beep_volume,
+        # soundboard_volume, phone_ring_volume (sauve au closeEvent comme
+        # mic_gain et gate_threshold_x2).
+        #
+        # Separateur visuel : un QFrame fin pour bien marquer la rupture
+        # avec les controles micro au-dessus.
+        sep_vol = QFrame()
+        sep_vol.setFrameShape(QFrame.HLine)
+        sep_vol.setFrameShadow(QFrame.Sunken)
+        sep_vol.setStyleSheet("color: #444;")
+        v.addWidget(sep_vol)
+
+        def _add_volume_slider(label_text: str, cfg_key: str,
+                               default: int, on_change_attr: str,
+                               val_label_attr: str, slider_attr: str):
+            """Helper : construit une ligne <label> <slider 0..200> <valeur>
+            et la branche sur self.<on_change_attr>. Le slider est expose
+            sous self.<slider_attr> et le label valeur sous
+            self.<val_label_attr>. La valeur initiale vient de
+            self._cfg[cfg_key] (clampee a 0..200) ou de `default`."""
+            h = QHBoxLayout()
+            h.setSpacing(8)
+            lbl = QLabel(label_text)
+            # Largeur FIXE (pas minimum) pour que les 3 sliders volume
+            # demarrent tous a la meme abscisse. _audio_lbl_w=50 est un
+            # minimum qui laissait "Soundboard :" / "Sonnerie tel. :"
+            # s'etendre a leur largeur naturelle alors que "Bip radio :"
+            # restait plus court -> sliders desalignes. 95px couvre le
+            # label le plus long.
+            lbl.setFixedWidth(95)
+            h.addWidget(lbl)
+            sl = QSlider(Qt.Horizontal)
+            sl.setRange(0, 200)
+            # Lecture config avec clamp 0..200 et fallback default.
+            try:
+                v_init = int(self._cfg.get(cfg_key, default))
+            except (TypeError, ValueError):
+                v_init = default
+            v_init = max(0, min(200, v_init))
+            sl.setValue(v_init)
+            sl.setTickPosition(QSlider.TicksBelow)
+            sl.setTickInterval(50)
+            sl.valueChanged.connect(getattr(self, on_change_attr))
+            h.addWidget(sl, stretch=1)
+            lbl_val = QLabel(f"{v_init}%")
+            lbl_val.setMinimumWidth(45)
+            h.addWidget(lbl_val)
+            v.addLayout(h)
+            setattr(self, slider_attr, sl)
+            setattr(self, val_label_attr, lbl_val)
+
+        _add_volume_slider(
+            "Bip radio :",
+            "radio_beep_volume",
+            100,
+            "_on_radio_beep_volume_changed",
+            "lbl_radio_beep_vol",
+            "sl_radio_beep_vol",
+        )
+        _add_volume_slider(
+            "Soundboard :",
+            "soundboard_volume",
+            100,
+            "_on_soundboard_volume_changed",
+            "lbl_soundboard_vol",
+            "sl_soundboard_vol",
+        )
+        _add_volume_slider(
+            "Sonnerie tel. :",
+            "phone_ring_volume",
+            100,
+            "_on_phone_ring_volume_changed",
+            "lbl_phone_ring_vol",
+            "sl_phone_ring_vol",
+        )
+
+        # ──────────────────────────────────────────────────────────────
+        # Diagnostic crackling : log audio RX detaille (ajout 02/06/2026)
+        # ──────────────────────────────────────────────────────────────
+        # Active un log CSV separe (circusvoip_debug/audio_rx/) qui trace
+        # chaque trame audio recue + chaque callback sounddevice + des
+        # stats agregees 30s. Volume eleve (~80-160 MB/h) donc desactive
+        # par defaut. A activer ponctuellement pour diagnostiquer un
+        # probleme de crackling/pop.
+        sep_audio_diag = QFrame()
+        sep_audio_diag.setFrameShape(QFrame.HLine)
+        sep_audio_diag.setFrameShadow(QFrame.Sunken)
+        sep_audio_diag.setStyleSheet("color: #444;")
+        v.addWidget(sep_audio_diag)
+
+        self.cb_audio_rx_log = QCheckBox(
+            "Activer le log audio detaille (diagnostic crackling)"
+        )
+        audio_rx_log_enabled = bool(
+            self._cfg.get("audio_rx_log_enabled", False)
+        )
+        self.cb_audio_rx_log.setChecked(audio_rx_log_enabled)
+        self.cb_audio_rx_log.setToolTip(
+            "Enregistre dans un fichier CSV separe "
+            "(circusvoip_debug/audio_rx/) chaque trame audio recue, "
+            "chaque callback sounddevice, et des stats agregees toutes "
+            "les 30s. Permet de diagnostiquer un probleme de crackling "
+            "ou de pop audio.\n\n"
+            "ATTENTION : volume eleve (~80-160 MB/h). Ne laisser actif "
+            "que le temps du diagnostic, puis decocher.\n\n"
+            "Activation a chaud : pas besoin de redemarrer le client."
+        )
+        self.cb_audio_rx_log.toggled.connect(self._on_audio_rx_log_toggled)
+        v.addWidget(self.cb_audio_rx_log)
+
+        self.lbl_audio_rx_log_info = QLabel("")
+        self.lbl_audio_rx_log_info.setStyleSheet(
+            "color: #888; font-size: 9pt;"
+        )
+        self.lbl_audio_rx_log_info.setWordWrap(True)
+        self._refresh_audio_rx_log_info()
+        v.addWidget(self.lbl_audio_rx_log_info)
+
         parent_layout.addWidget(box)
 
     def _apply_vu_style(self, level_0_100: int):
@@ -6219,10 +14259,10 @@ class MainWindow(QMainWindow):
                 self.cb_mic.setCurrentIndex(idx)
         else:
             # Defaut : device par defaut systeme
+            matched = False
             try:
                 default_id = default_input_device()
                 if default_id is not None:
-                    matched = False
                     for i in range(self.cb_mic.count()):
                         if self.cb_mic.itemData(i) == default_id:
                             self.cb_mic.setCurrentIndex(i)
@@ -6256,15 +14296,36 @@ class MainWindow(QMainWindow):
                         )
                     except Exception:
                         pass
+
+            # Fallback : si le default Windows n'est pas trouvable (None
+            # ou absent de l'enumeration), prendre le 1er micro valide
+            # de la liste pour eviter que le client demarre sans micro
+            # et bloque l'utilisateur. Cas typique : nouvelle install
+            # sur un PC ou le casque par defaut Windows est eteint /
+            # absent au moment du lancement, ou ou WASAPI filtre le
+            # device par defaut.
+            if not matched:
+                for i in range(self.cb_mic.count()):
+                    if self.cb_mic.itemData(i) is not None and self.cb_mic.itemData(i) >= 0:
+                        self.cb_mic.setCurrentIndex(i)
+                        if _CORE_AVAILABLE:
+                            try:
+                                _core._dbg_log(
+                                    f"[AUDIO] fallback mic : {self.cb_mic.itemText(i)} "
+                                    f"(id={self.cb_mic.itemData(i)})"
+                                )
+                            except Exception:
+                                pass
+                        break
         if saved_out:
             idx = self.cb_out.findText(saved_out)
             if idx >= 0:
                 self.cb_out.setCurrentIndex(idx)
         else:
+            matched = False
             try:
                 default_id = default_output_device()
                 if default_id is not None:
-                    matched = False
                     for i in range(self.cb_out.count()):
                         if self.cb_out.itemData(i) == default_id:
                             self.cb_out.setCurrentIndex(i)
@@ -6293,6 +14354,22 @@ class MainWindow(QMainWindow):
                         )
                     except Exception:
                         pass
+
+            # Fallback : meme principe que pour le micro. Si le default
+            # Windows n'est pas trouvable, prendre la 1ere sortie valide.
+            if not matched:
+                for i in range(self.cb_out.count()):
+                    if self.cb_out.itemData(i) is not None and self.cb_out.itemData(i) >= 0:
+                        self.cb_out.setCurrentIndex(i)
+                        if _CORE_AVAILABLE:
+                            try:
+                                _core._dbg_log(
+                                    f"[AUDIO] fallback out : {self.cb_out.itemText(i)} "
+                                    f"(id={self.cb_out.itemData(i)})"
+                                )
+                            except Exception:
+                                pass
+                        break
 
         # Connecter les signaux APRES restauration (eviter callbacks inutiles
         # pendant le populate). Au premier appel, currentIndexChanged n'est
@@ -6483,6 +14560,36 @@ class MainWindow(QMainWindow):
                     state.audio_io.set_noise_suppression(
                         self.cb_noise_suppression.isChecked()
                     )
+                # Volumes v0.2 : appliquer les 3 sliders (bip radio,
+                # soundboard, sonnerie telephone). Slider 0..200 % ->
+                # ratio 0.0..2.0. Si les sliders ne sont pas encore
+                # construits (cas theorique : audio cree avant l'UI),
+                # on saute silencieusement.
+                if hasattr(self, "sl_radio_beep_vol"):
+                    state.audio_io.set_radio_beep_volume(
+                        self.sl_radio_beep_vol.value() / 100.0
+                    )
+                if hasattr(self, "sl_soundboard_vol"):
+                    state.audio_io.set_soundboard_volume(
+                        self.sl_soundboard_vol.value() / 100.0
+                    )
+                if hasattr(self, "sl_phone_ring_vol"):
+                    state.audio_io.set_phone_ring_volume(
+                        self.sl_phone_ring_vol.value() / 100.0
+                    )
+                # Reactivation du log audio RX detaille si l'utilisateur
+                # l'avait coche dans une session precedente (audit
+                # 02/06/2026). La case est deja dans son etat coche grace
+                # a _build_audio_panel + audio_rx_log_enabled lu de _cfg ;
+                # on declenche maintenant le handler pour reellement
+                # ouvrir le fichier CSV.
+                if hasattr(self, "cb_audio_rx_log") and self.cb_audio_rx_log.isChecked():
+                    try:
+                        self._on_audio_rx_log_toggled(True)
+                    except Exception as e:
+                        self._on_log(
+                            f"[AUDIO RX LOG] Echec reactivation au boot : {e}"
+                        )
             except Exception as e:
                 self._on_log(f"[AUDIO] set_mic_gain/gate KO : {e}")
 
@@ -6575,6 +14682,72 @@ class MainWindow(QMainWindow):
                     f"[AUDIO] set_noise_suppression KO : {e}"
                 )
         self._cfg["noise_suppression_enabled"] = bool(checked)
+
+    # ------------------------------------------------------------
+    # Handlers sliders volume (v0.2)
+    # ------------------------------------------------------------
+    # Chaque slider est en 0..200 (% du volume nominal). On convertit
+    # en ratio float (slider/100.0, donc 0.0..2.0) avant de l'envoyer a
+    # audio_io. Pas de save immediat : la valeur est ecrite dans _cfg et
+    # persistera au closeEvent (cf. _on_gain_changed pour le rationale).
+
+    @Slot(int)
+    def _on_radio_beep_volume_changed(self, value: int):
+        """Slider 'Bip radio' : volume du bip PTT local."""
+        if hasattr(self, "lbl_radio_beep_vol"):
+            self.lbl_radio_beep_vol.setText(f"{value}%")
+        if state.audio_io is not None:
+            try:
+                state.audio_io.set_radio_beep_volume(value / 100.0)
+            except Exception as e:
+                if _CORE_AVAILABLE:
+                    try:
+                        _core._dbg_log(
+                            f"[AUDIO] set_radio_beep_volume KO : {e}"
+                        )
+                    except Exception:
+                        pass
+        self._cfg["radio_beep_volume"] = value
+
+    @Slot(int)
+    def _on_soundboard_volume_changed(self, value: int):
+        """Slider 'Soundboard' : volume des sons soundboard (feature 1
+        v0.2, pas encore branchee). Le setter audio_io existe mais aucun
+        son audible tant que la feature n'est pas implementee."""
+        if hasattr(self, "lbl_soundboard_vol"):
+            self.lbl_soundboard_vol.setText(f"{value}%")
+        if state.audio_io is not None:
+            try:
+                state.audio_io.set_soundboard_volume(value / 100.0)
+            except Exception as e:
+                if _CORE_AVAILABLE:
+                    try:
+                        _core._dbg_log(
+                            f"[AUDIO] set_soundboard_volume KO : {e}"
+                        )
+                    except Exception:
+                        pass
+        self._cfg["soundboard_volume"] = value
+
+    @Slot(int)
+    def _on_phone_ring_volume_changed(self, value: int):
+        """Slider 'Sonnerie tel.' : volume de la sonnerie d'appel entrant
+        et du bip d'appel sortant (CircusPhone, branche en D2). Couvrira
+        aussi la notif MP en D4. Applique via audio_io.set_phone_ring_volume."""
+        if hasattr(self, "lbl_phone_ring_vol"):
+            self.lbl_phone_ring_vol.setText(f"{value}%")
+        if state.audio_io is not None:
+            try:
+                state.audio_io.set_phone_ring_volume(value / 100.0)
+            except Exception as e:
+                if _CORE_AVAILABLE:
+                    try:
+                        _core._dbg_log(
+                            f"[AUDIO] set_phone_ring_volume KO : {e}"
+                        )
+                    except Exception:
+                        pass
+        self._cfg["phone_ring_volume"] = value
 
     @Slot(bool)
     def _on_mute_toggled(self, checked: bool):
@@ -6687,6 +14860,32 @@ class MainWindow(QMainWindow):
         self._worker.sig_invalid_token.connect(self._on_invalid_token)
         self._worker.sig_anonymous_mode.connect(self._on_anonymous_mode)
         self._worker.sig_channels_changed.connect(self._refresh_channels_combo)
+        # v0.2 alpha 029/031 : signal soundboard depuis le thread reseau.
+        # QueuedConnection (par defaut cross-thread) -> _play_soundboard_local
+        # tourne dans le thread Qt main, peut appeler audio_io.play_soundboard
+        # et accede au cache de sons sans souci de thread-safety.
+        self._worker.sig_soundboard_play.connect(self._play_soundboard_local)
+        # v0.2 alpha 035 : signal de changement de permission profil
+        # (push serveur). Le slot adapte l'UI (cache/montre soundboard).
+        self._worker.sig_my_perm_changed.connect(self._on_my_perm_changed)
+        # CircusPhone (Feature 4, D1) : signaux du cycle de vie d'appel.
+        # Cross-thread (NetWorker -> thread Qt main) en QueuedConnection
+        # par defaut : les slots _on_phone_* touchent l'UI sans souci.
+        self._worker.sig_phone_ringing.connect(self._on_phone_ringing)
+        self._worker.sig_phone_incoming.connect(self._on_phone_incoming)
+        self._worker.sig_phone_accepted.connect(self._on_phone_accepted)
+        self._worker.sig_phone_declined.connect(self._on_phone_declined)
+        self._worker.sig_phone_busy.connect(self._on_phone_busy)
+        self._worker.sig_phone_missed.connect(self._on_phone_missed)
+        self._worker.sig_phone_ended.connect(self._on_phone_ended)
+        # CircusPhone (D4 etape 3) : reception d'un MP texte.
+        self._worker.sig_phone_message_received.connect(
+            self._on_phone_message_received
+        )
+        # [D5] Reponse a une demande de photo de profil.
+        self._worker.sig_profile_photo_response.connect(
+            self._on_profile_photo_response
+        )
 
         # Signal main -> worker (queued vers le thread worker)
         self._sig_start_connect.connect(self._worker.run_connect)
@@ -6777,6 +14976,22 @@ class MainWindow(QMainWindow):
             self.btn_toggle.setText("DECONNECTER")
             # Demarrer les threads OCR + WS audio + heartbeat
             self._start_core_threads_if_needed(message)
+            # [D5] Si la photo locale n'est pas synchronisee avec le
+            # serveur (changement hors-ligne ou jamais uploadee), on la
+            # repousse maintenant. Best-effort, no-op si pas de photo.
+            # Delai 500ms pour laisser le welcome se traiter d'abord
+            # (state.my_name doit etre prete, et le serveur a fini
+            # d'envoyer la liste joueurs).
+            try:
+                QTimer.singleShot(
+                    500, lambda: self._profile_photos.try_upload_local()
+                )
+            except Exception:
+                pass
+            # Connexion etablie : afficher tout de suite "Aucun autre joueur
+            # en ligne" si on est seul (le welcome avec la liste viendra
+            # rapidement, _on_players_reset rafraichira aussi).
+            self._refresh_no_other_players_label()
         else:
             txt = "Deconnecte"
             if message:
@@ -6784,11 +14999,19 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText(txt)
             self._set_status_style(False)
             self.btn_toggle.setText("CONNECTER")
+            # CircusPhone (D1) : connexion perdue -> tout appel en cours
+            # est termine cote serveur, on remet l'etat phone au repos.
+            try:
+                self._phone_on_disconnect()
+            except Exception:
+                pass
             # Vider les cards joueurs
             for name in list(self._player_cards.keys()):
                 card = self._player_cards.pop(name)
                 self._players_layout.removeWidget(card)
                 card.deleteLater()
+            # Cards videes + plus connecte -> cacher le label "aucun".
+            self._refresh_no_other_players_label()
             # Reset du statut audio : pas de connexion -> pas d'audio
             if hasattr(self, "lbl_audio_status"):
                 self.lbl_audio_status.setText("Audio : —")
@@ -6826,6 +15049,20 @@ class MainWindow(QMainWindow):
                 pass
         self.btn_toggle.setEnabled(True)
 
+    def _refresh_no_other_players_label(self):
+        """Affiche / masque le label 'Aucun autre joueur en ligne'.
+        Visible UNIQUEMENT si on est connecte au serveur ET qu'il n'y a
+        aucune card joueur. Hors connexion la zone reste vide (pas de
+        message trompeur). Ajout 25/05/2026 Kainan."""
+        try:
+            if not hasattr(self, "lbl_no_other_players"):
+                return
+            is_connected = bool(_CORE_AVAILABLE and state.connected)
+            no_others = (len(self._player_cards) == 0)
+            self.lbl_no_other_players.setVisible(is_connected and no_others)
+        except Exception:
+            pass
+
     @Slot(str)
     def _on_player_joined(self, name: str):
         """Cree une nouvelle PlayerCard si pas deja presente."""
@@ -6842,6 +15079,13 @@ class MainWindow(QMainWindow):
         self._refresh_player_card(name)
         # Appliquer immediatement le volume sauvegarde (s'il existe).
         self._apply_saved_volume(name)
+        # CircusPhone (D4) : un joueur rejoint -> enrichir l'annuaire
+        # (ajout ou maj last_seen) + refresh live de l'overlay. _on_players_reset
+        # appelle aussi _on_player_joined en boucle puis enrichit en masse ;
+        # ce double enrichissement est sans effet de bord (idempotent).
+        self._phone_annuaire_enrich([name])
+        # Au moins 1 joueur dans la liste -> cacher le label "aucun".
+        self._refresh_no_other_players_label()
 
     def _refresh_player_card(self, name: str):
         """Met a jour les badges Canal/Profil de la card du joueur.
@@ -6887,6 +15131,27 @@ class MainWindow(QMainWindow):
         if card is not None:
             self._players_layout.removeWidget(card)
             card.deleteLater()
+        # v0.2 (optim perf) : liberer aussi les structures cote audio_io
+        # (queue + volume + multiplier + flags is_radio/is_phone/force_radio,
+        # ainsi que l'etat du filtre radio qui contient un buffer reverb
+        # 1440 floats par joueur). Avant ce fix, remove_user existait mais
+        # n'etait jamais appelee -> fuite memoire permanente quand des
+        # joueurs rejoignent puis quittent sur une session longue.
+        try:
+            if state.audio_io is not None:
+                state.audio_io.remove_user(name)
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(f"[AUDIO] remove_user({name}) KO : {e}")
+                except Exception:
+                    pass
+        # CircusPhone (D4) : un joueur quitte -> son statut passe a
+        # "deconnecte" dans l'overlay. On ne touche pas a l'annuaire
+        # (le contact reste enregistre), juste un refresh d'affichage.
+        self._phone_refresh_overlay_contacts()
+        # Si c'etait le dernier joueur autre -> afficher le label "aucun".
+        self._refresh_no_other_players_label()
 
     @Slot(str, dict, float)
     def _on_player_pos(self, name: str, pos: dict, dist: float):
@@ -7007,6 +15272,13 @@ class MainWindow(QMainWindow):
             pos = info.get("pos")
             if pos:
                 self._on_player_pos(name, pos, 0.0)
+        # CircusPhone (D4) : enrichir l'annuaire avec tous les joueurs vus
+        # connectes dans ce welcome, puis rafraichir l'overlay.
+        self._phone_annuaire_enrich(names)
+        # Welcome avec liste vide ou non-vide -> refresh du label "aucun".
+        # (Chaque _on_player_joined le fait deja en boucle, mais on appelle
+        # une derniere fois au cas ou la boucle a ete vide -> label visible.)
+        self._refresh_no_other_players_label()
 
     @Slot(str)
     def _on_log(self, line: str):
@@ -7023,6 +15295,258 @@ class MainWindow(QMainWindow):
                 pass
         # Fallback : print stdout
         print(line, flush=True)
+
+    # ------------------------------------------------------------
+    # Soundboard (v0.2 alpha 029)
+    # ------------------------------------------------------------
+    # Architecture :
+    #   1. Au boot, _load_soundboard_sounds() lit les .wav locaux et les
+    #      cache en numpy float32 mono 48kHz dans self._soundboard_cache.
+    #   2. Clic sur un bouton du soundboard : envoie un message WS
+    #      soundboard_play au serveur.
+    #   3. Le serveur broadcast au canal vocal courant.
+    #   4. Tous les clients du canal (y compris l'emetteur) recoivent
+    #      le message et appellent _play_soundboard_local(sound_id).
+    #   5. _play_soundboard_local fait jouer le sample cache via
+    #      AudioIO.play_soundboard(samples).
+    #
+    # Le slider "Son A" agit sur le facteur de volume cote
+    # AudioIO._soundboard_volume_factor (applique au mix).
+
+    # Mapping sound_id -> nom de fichier wav (sans extension du dossier).
+    # Pour ajouter un son : creer le wav a cote, ajouter l'entree ici.
+    SOUNDBOARD_FILES = {
+        "alarme": "alarm.wav",
+    }
+
+    def _load_soundboard_sounds(self):
+        """Charge tous les .wav du soundboard en memoire (float32 mono 48kHz).
+        Appele au boot par __init__ (apres que tous les modules sont
+        importes). Les fichiers absents sont logues mais non bloquants
+        (le clic sur ce son sera silencieusement ignore avec un log)."""
+        try:
+            import wave
+            import numpy as np_local
+        except Exception as e:
+            self._on_log(f"[SOUNDBOARD] Import wave/numpy KO : {e}")
+            return
+        base_dir = Path(__file__).resolve().parent
+        sounds_dir = base_dir / "sounds"
+        for sound_id, fname in self.SOUNDBOARD_FILES.items():
+            # v0.2.0 dev : les fichiers audio sont regroupes dans sounds/
+            # (cf. sonneries telephone dial/ring/notif dans le meme dossier).
+            # Avant, les .wav de la soundboard etaient a la racine de app/.
+            # Migration : deplacer alarm.wav dans app/sounds/.
+            # (Anciennement nomme ENVP_Alarms-0160-event.wav.)
+            path = sounds_dir / fname
+            if not path.exists():
+                self._on_log(
+                    f"[SOUNDBOARD] Fichier absent : {path}. Son '{sound_id}' "
+                    "indisponible (les autres clients ne pourront pas le "
+                    "jouer non plus s'ils n'ont pas le fichier)."
+                )
+                continue
+            try:
+                with wave.open(str(path), "rb") as wf:
+                    n_ch     = wf.getnchannels()
+                    samp_w   = wf.getsampwidth()
+                    rate     = wf.getframerate()
+                    n_frames = wf.getnframes()
+                    raw      = wf.readframes(n_frames)
+                # Conversion en np.float32 normalisee a [-1, 1].
+                # samp_w = 2 (16 bits, le plus courant pour les wav).
+                if samp_w == 2:
+                    arr = np_local.frombuffer(raw, dtype=np_local.int16).astype(np_local.float32) / 32768.0
+                elif samp_w == 1:
+                    # 8 bits unsigned : [-128, 127] apres centrage.
+                    arr = (np_local.frombuffer(raw, dtype=np_local.uint8).astype(np_local.float32) - 128.0) / 128.0
+                elif samp_w == 4:
+                    # 32 bits int.
+                    arr = np_local.frombuffer(raw, dtype=np_local.int32).astype(np_local.float32) / 2147483648.0
+                else:
+                    self._on_log(
+                        f"[SOUNDBOARD] Largeur sample non supportee "
+                        f"({samp_w} octets) pour '{sound_id}'. Ignore."
+                    )
+                    continue
+                # Stereo -> mono (moyenne des canaux).
+                if n_ch == 2:
+                    arr = arr.reshape(-1, 2).mean(axis=1)
+                elif n_ch != 1:
+                    # 5.1, 7.1, etc. : on prend la 1ere voie.
+                    arr = arr.reshape(-1, n_ch)[:, 0]
+                # Resample si necessaire vers 48 kHz (= SAMPLE_RATE).
+                # Resample lineaire simple ; pour de la qualite "vraie"
+                # on utiliserait scipy.signal.resample mais c'est lourd.
+                # Le lineaire suffit pour des sons courts du soundboard.
+                target_rate = 48000
+                if rate != target_rate:
+                    n_in  = len(arr)
+                    n_out = int(round(n_in * target_rate / rate))
+                    if n_out > 0:
+                        xp = np_local.arange(n_in)
+                        x  = np_local.linspace(0, n_in - 1, n_out)
+                        arr = np_local.interp(x, xp, arr).astype(np_local.float32)
+                self._soundboard_cache[sound_id] = arr
+                duration_s = len(arr) / target_rate
+                self._on_log(
+                    f"[SOUNDBOARD] Charge '{sound_id}' depuis {fname} "
+                    f"({duration_s:.2f}s a {target_rate}Hz, "
+                    f"{rate}Hz orig, {n_ch}ch)"
+                )
+            except Exception as e:
+                self._on_log(
+                    f"[SOUNDBOARD] Lecture KO pour '{sound_id}' ({fname}) : {e}"
+                )
+
+    @Slot(str, str)
+    def _play_soundboard_local(self, sound_id: str, sender: str = ""):
+        """Joue un son du soundboard sur la sortie locale via AudioIO.
+        Appele :
+          - par le handler du bouton du soundboard (= moi qui declenche).
+          - par le dispatch WS soundboard_play (= un autre joueur ou moi
+            recu en echo via le serveur, via sig_soundboard_play emit
+            depuis NetWorker)."""
+        if not isinstance(sound_id, str) or not sound_id:
+            return
+        samples = self._soundboard_cache.get(sound_id)
+        if samples is None:
+            self._on_log(
+                f"[SOUNDBOARD] Son '{sound_id}' non charge (fichier "
+                f"absent ?). Lecture ignoree."
+            )
+            return
+        audio = getattr(state, "audio_io", None)
+        if audio is None:
+            self._on_log(
+                "[SOUNDBOARD] audio_io indisponible (audio pas demarre ?). "
+                "Lecture ignoree."
+            )
+            return
+        try:
+            audio.play_soundboard(samples)
+            who = sender or "(local)"
+            self._on_log(f"[SOUNDBOARD] Play '{sound_id}' par {who}")
+        except Exception as e:
+            self._on_log(f"[SOUNDBOARD] play_soundboard KO : {e}")
+
+    @Slot()
+    def _on_soundboard_state_timer(self):
+        """Tic du timer 100ms : interroge audio_io pour savoir si un son
+        joue actuellement, et met a jour la fenetre soundboard (grise
+        les boutons pendant la lecture). Si la fenetre n'existe pas
+        encore ou n'est pas visible, on ignore (pas de calcul inutile)."""
+        sw = self._soundboard_window
+        if sw is None:
+            return
+        audio = getattr(state, "audio_io", None) if _CORE_AVAILABLE else None
+        if audio is None:
+            playing = False
+        else:
+            try:
+                playing = audio.is_soundboard_playing()
+            except Exception:
+                playing = False
+        try:
+            sw.set_playing_state(playing)
+        except Exception:
+            pass
+
+    @Slot(str, bool)
+    def _on_my_perm_changed(self, perm_key: str, value: bool):
+        """Slot appele quand le serveur push une nouvelle permission sur
+        mon profil. Met a jour l'UI : actuellement, gere la section
+        soundboard (visible ssi soundboard_allowed=True).
+
+        v0.2 alpha 035. Si plus tard d'autres permissions apparaissent
+        (phone_allowed, etc.), on ajoutera des elif ici."""
+        try:
+            if perm_key == "soundboard_allowed":
+                # Affiche/cache toute la section SOUNDBOARD du panneau
+                # gauche. Si la fenetre flottante etait ouverte au moment
+                # de la revocation, on la ferme aussi (sinon les boutons
+                # restent visibles independamment de la section).
+                if hasattr(self, "gb_soundboard"):
+                    self.gb_soundboard.setVisible(bool(value))
+                if not value and self._soundboard_window is not None:
+                    try:
+                        self._soundboard_window.hide()
+                    except Exception:
+                        pass
+        except Exception as e:
+            self._on_log(f"[PERM] _on_my_perm_changed KO : {e}")
+
+    @Slot()
+    def _on_soundboard_button_clicked(self):
+        """Toggle de la fenetre flottante du soundboard. Au 1er clic,
+        cree la fenetre. Clics suivants : show/hide selon etat courant.
+
+        v0.2 alpha 037 : avec Qt.Popup, un clic en dehors de la popup
+        la ferme automatiquement. Si l'utilisateur clique sur le bouton
+        Soundboard alors que la popup est visible, le clic ferme la
+        popup -> puis le bouton recoit le clic -> on rouvre. Pas le
+        comportement voulu. On debounce : si la popup s'est fermee dans
+        les 200ms qui precedent, on ignore ce clic (= la popup s'est
+        deja fermee toute seule, l'utilisateur a juste cliquer pour
+        fermer, pas pour rouvrir)."""
+        now = time.monotonic()
+        last_hide = getattr(self, "_soundboard_window_last_hide_ts", 0.0)
+        if now - last_hide < 0.2:
+            # Popup vient de se fermer toute seule (Qt.Popup), pas la
+            # peine de rouvrir.
+            return
+        if self._soundboard_window is None:
+            self._soundboard_window = SoundboardWindow(parent=self)
+            # Hook sur le hide pour memoriser le ts de fermeture (sert
+            # au debounce du bouton). On wrap hide pour ajouter notre
+            # logique. closeEvent pourrait aussi marcher mais hide est
+            # plus direct (Qt.Popup appelle hide quand on clique
+            # ailleurs).
+            orig_hide_event = self._soundboard_window.hideEvent
+            def _patched_hide_event(event, _orig=orig_hide_event):
+                try:
+                    self._soundboard_window_last_hide_ts = time.monotonic()
+                except Exception:
+                    pass
+                return _orig(event)
+            self._soundboard_window.hideEvent = _patched_hide_event
+        if self._soundboard_window.isVisible():
+            self._soundboard_window.hide()
+        else:
+            # Positionner la fenetre juste sous le bouton "Soundboard"
+            # pour effet de panneau deroulant.
+            try:
+                btn = self.btn_soundboard
+                pt_btn = btn.mapToGlobal(QPoint(0, btn.height()))
+                self._soundboard_window.move(pt_btn)
+            except Exception:
+                pass
+            self._soundboard_window.show()
+            self._soundboard_window.raise_()
+            self._soundboard_window.activateWindow()
+
+    def _on_soundboard_sound_clicked(self, sound_id: str):
+        """Handler des boutons dans SoundboardWindow. Envoie le message
+        WS soundboard_play au serveur. Le serveur broadcast au canal,
+        et on recevra l'echo qui declenchera la lecture locale (cf.
+        dispatch soundboard_play dans _handle_ws_message)."""
+        if not _CORE_AVAILABLE:
+            self._on_log("[SOUNDBOARD] Module core indispo, envoi ignore.")
+            return
+        try:
+            ok = _core._ws_send_safe({
+                "type":     "soundboard_play",
+                "sound_id": sound_id,
+            })
+            if ok:
+                self._on_log(f"[SOUNDBOARD] Envoye '{sound_id}' au serveur")
+            else:
+                self._on_log(
+                    "[SOUNDBOARD] WS non connectee, envoi ignore. "
+                    "Connecte-toi a un serveur d'abord."
+                )
+        except Exception as e:
+            self._on_log(f"[SOUNDBOARD] _ws_send_safe KO : {e}")
 
     @Slot()
     def _on_invalid_token(self):
@@ -7292,6 +15816,11 @@ class MainWindow(QMainWindow):
             # Reset position pour ne pas spammer la position fantome aux
             # autres joueurs (la VOIP positionnelle utilise state.my_pos).
             state.my_pos = None
+            # v0.2 : invalider aussi le timestamp pour que le masque
+            # DisplayInfo se cache immediatement (sinon il resterait
+            # visible pendant DISPLAYINFO_MASK_STALE_S secondes apres
+            # la fermeture de SC, ce qui est confus pour l'utilisateur).
+            state.my_pos_ts = 0.0
         # Rafraichir l'affichage local immediatement (sinon on attendrait
         # la prochaine position OCR qui n'arrivera pas si SC est ferme).
         try:
@@ -7510,6 +16039,12 @@ class MainWindow(QMainWindow):
             state.mute_all_key         = _canon(core_cfg.get("mute_all_key"))
             state.proximity_short_key  = _canon(core_cfg.get("proximity_short_key"))
             state.cycle_channel_key    = _canon(core_cfg.get("cycle_channel_key"))
+            # CircusPhone (D4 etape 4) : 5 raccourcis telephone.
+            state.phone_open_key     = _canon(core_cfg.get("phone_open_key"))
+            state.phone_accept_key   = _canon(core_cfg.get("phone_accept_key"))
+            state.phone_decline_key  = _canon(core_cfg.get("phone_decline_key"))
+            state.phone_mute_key     = _canon(core_cfg.get("phone_mute_key"))
+            state.phone_speaker_key  = _canon(core_cfg.get("phone_speaker_key"))
             state.rp_mode              = bool(core_cfg.get("rp_mode", False))
             self._on_log(
                 f"[CONFIG] Chargee : radio_key={state.radio_key!r} "
@@ -7520,7 +16055,7 @@ class MainWindow(QMainWindow):
             self._on_log(f"[CONFIG] Erreur chargement : {e}")
 
         # Brancher les callbacks de toggle (mute mic/prox/radio/all,
-        # cycle canal, prox short, profile radio PTT).
+        # cycle canal, prox short, profile radio PTT, CircusPhone D4).
         try:
             _core._radio_listener.set_toggle_callbacks(
                 on_mic           = self._on_hotkey_mute_mic,
@@ -7531,6 +16066,12 @@ class MainWindow(QMainWindow):
                 on_cycle_channel = self._on_hotkey_cycle_channel,
                 on_profile_radio_pressed  = self._on_hotkey_profile_pressed,
                 on_profile_radio_released = self._on_hotkey_profile_released,
+                # CircusPhone (D4 etape 4) : 5 raccourcis telephone.
+                on_phone_open    = self._on_hotkey_phone_open,
+                on_phone_accept  = self._on_hotkey_phone_accept,
+                on_phone_decline = self._on_hotkey_phone_decline,
+                on_phone_mute    = self._on_hotkey_phone_mute,
+                on_phone_speaker = self._on_hotkey_phone_speaker,
             )
             self._on_log("[RADIO] set_toggle_callbacks OK")
         except Exception as e:
@@ -7560,22 +16101,39 @@ class MainWindow(QMainWindow):
             )
             t.start()
             self._ocr_thread = t
-        _spawn_ocr_thread()
 
-        # Thread watchdog OCR : detecte les freezes silencieux de la boucle
-        # OCR (segfault torch/CUDA, deadlock GPU, etc.). Si l'OCR ne tick
-        # plus depuis 15s, log un warning. Si plus de 30s, demande au
-        # client de respawner le thread OCR via le callback.
-        # Quand l'OCR repart, declenche aussi un redemarrage des streams
-        # audio (les freezes CUDA bloquent aussi les callbacks sounddevice).
-        self._ocr_watchdog_thread = threading.Thread(
-            target=_core._ocr_watchdog_loop,
-            args=(self._core_shim,),
-            kwargs={"restart_callback": _spawn_ocr_thread},
-            daemon=True,
-            name="c2-ocr-watchdog",
-        )
-        self._ocr_watchdog_thread.start()
+        # FLAG DEBUG (v0.2 alpha 016) : si False, on NE DEMARRE PAS l'OCR.
+        # Permet de tester si le masque clignote a cause d'une interaction
+        # OCR <-> masque. Effets de bord : state.my_pos reste a None, les
+        # overlays proximite ne marchent pas, mais on s'en fiche pour le
+        # debug du masque.
+        if DEBUG_ENABLE_OCR:
+            _spawn_ocr_thread()
+
+            # Thread watchdog OCR : detecte les freezes silencieux de la
+            # boucle OCR (segfault torch/CUDA, deadlock GPU, etc.). Si l'OCR
+            # ne tick plus depuis 15s, log un warning. Si plus de 30s, demande
+            # au client de respawner le thread OCR via le callback.
+            # Quand l'OCR repart, declenche aussi un redemarrage des streams
+            # audio (les freezes CUDA bloquent aussi les callbacks sounddevice).
+            self._ocr_watchdog_thread = threading.Thread(
+                target=_core._ocr_watchdog_loop,
+                args=(self._core_shim,),
+                kwargs={"restart_callback": _spawn_ocr_thread},
+                daemon=True,
+                name="c2-ocr-watchdog",
+            )
+            self._ocr_watchdog_thread.start()
+        else:
+            # Mode debug : OCR coupe entierement. Pas de watchdog non plus.
+            try:
+                if _CORE_AVAILABLE:
+                    _core._dbg_log(
+                        "[DEBUG] OCR desactive (DEBUG_ENABLE_OCR=False). "
+                        "Mode debug masque uniquement."
+                    )
+            except Exception:
+                pass
 
         # Thread volume safety : tourne toutes les secondes et force volume=0
         # pour les joueurs sc_offline / sans position / position perimee.
@@ -7948,6 +16506,36 @@ class MainWindow(QMainWindow):
             self._last_pos = cur_pos
 
     def closeEvent(self, event):
+        # 0a. Confirmation utilisateur. Si on est dans une fermeture
+        # automatique (relance pour MAJ, crash recovery, ...), on bypass :
+        # un flag self._skip_close_confirm est mis par le caller dans ces
+        # cas-la. Sinon, popup "Quitter CircusVOIP ?" et on annule la
+        # fermeture si l'utilisateur clique sur Annuler.
+        # NB : on utilise addButton pour forcer les libellés français
+        # ("Quitter" / "Annuler") au lieu des "Yes"/"No" par defaut de Qt
+        # (qui ne sont traduits que si on charge un QTranslator global).
+        if not getattr(self, "_skip_close_confirm", False):
+            try:
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Question)
+                box.setWindowTitle("Quitter CircusVOIP ?")
+                box.setText("Voulez-vous vraiment fermer CircusVOIP ?")
+                btn_quit = box.addButton("Quitter",
+                                         QMessageBox.AcceptRole)
+                btn_cancel = box.addButton("Annuler",
+                                           QMessageBox.RejectRole)
+                box.setDefaultButton(btn_cancel)
+                box.exec()
+                if box.clickedButton() is not btn_quit:
+                    event.ignore()
+                    return
+            except Exception as e:
+                # En cas de souci avec la popup (ex. Qt non dispo dans
+                # certains contextes de shutdown), on continue la fermeture
+                # plutot que de bloquer l'app.
+                print(f"[CLOSE] Popup confirmation KO : {e}",
+                      file=sys.stderr)
+
         # 0. Signaler aux threads daemon (OCR, watchdog, audio_ws,
         # heartbeat, gamelog, helmet_scan, volume_safety) qu'on demande
         # un arret. Ils peuvent verifier state.shutdown_requested dans
@@ -7993,6 +16581,11 @@ class MainWindow(QMainWindow):
                             "mute_all_key",
                             "proximity_short_key",
                             "cycle_channel_key",
+                            "phone_open_key",
+                            "phone_accept_key",
+                            "phone_decline_key",
+                            "phone_mute_key",
+                            "phone_speaker_key",
                             "player_volumes",
                             "rp_mode",
                         ):
@@ -8020,6 +16613,15 @@ class MainWindow(QMainWindow):
                 self._cfg["mic_gain"] = self.sl_gain.value()
             if hasattr(self, "sl_gate"):
                 self._cfg["gate_threshold_x2"] = self.sl_gate.value()
+            # v0.2 : sauvegarder les 3 nouveaux sliders de volume.
+            # Redondant avec les handlers (qui ecrivent deja dans _cfg a
+            # chaque move) mais coherent avec mic_gain/gate ci-dessus.
+            if hasattr(self, "sl_radio_beep_vol"):
+                self._cfg["radio_beep_volume"] = self.sl_radio_beep_vol.value()
+            if hasattr(self, "sl_soundboard_vol"):
+                self._cfg["soundboard_volume"] = self.sl_soundboard_vol.value()
+            if hasattr(self, "sl_phone_ring_vol"):
+                self._cfg["phone_ring_volume"] = self.sl_phone_ring_vol.value()
             _save_cfg(self._cfg)
         except Exception as e:
             print(f"[CLOSE] Erreur sauvegarde config : {e}", file=sys.stderr)
@@ -8040,6 +16642,48 @@ class MainWindow(QMainWindow):
         try:
             if hasattr(self, "_overlay_manager"):
                 self._overlay_manager.close_all()
+        except Exception:
+            pass
+        # v0.2 : fermer le masque DisplayInfo et stopper son timer
+        try:
+            if hasattr(self, "_displayinfo_mask_timer"):
+                self._displayinfo_mask_timer.stop()
+            mask = getattr(self, "_displayinfo_mask", None)
+            if mask is not None:
+                try:
+                    # close() declenche closeEvent qui detach du service.
+                    mask.close()
+                    mask.deleteLater()
+                except Exception:
+                    pass
+                self._displayinfo_mask = None
+            # v0.2 alpha 058 : fermer aussi la fenetre source OBS.
+            mask_obs = getattr(self, "_displayinfo_mask_obs", None)
+            if mask_obs is not None:
+                try:
+                    # close() declenche closeEvent qui detach du service.
+                    mask_obs.close()
+                    mask_obs.deleteLater()
+                except Exception:
+                    pass
+                self._displayinfo_mask_obs = None
+            # v0.2 alpha 060 : shutdown du service partage (arrete le
+            # worker s'il tourne encore, detache tout consommateur restant).
+            svc = getattr(self, "_displayinfo_mask_service", None)
+            if svc is not None:
+                try:
+                    svc.shutdown()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # v0.2 alpha 055 : stopper le listener clavier de la machine d'etat
+        # masque (F1/F2/F11/Echap).
+        try:
+            tracker = getattr(self, "_mask_key_tracker", None)
+            if tracker is not None:
+                tracker.stop()
+                self._mask_key_tracker = None
         except Exception:
             pass
         try:

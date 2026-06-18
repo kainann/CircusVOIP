@@ -2570,13 +2570,13 @@ class ServerUI:
         try:
             import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "CircusVOIP.Server.0.1"
+                "CircusVOIP.Server.0.2"
             )
         except Exception:
             pass
 
         self.root = tk.Tk()
-        self.root.title("CircusVOIP — Serveur 0.1")
+        self.root.title("CircusVOIP — Serveur 0.2")
         self.root.configure(bg=BG)
         # Icone de la fenetre + barre des taches : StarCircus_Server.ico
         # qui est dans le meme dossier que le script. Fallback silencieux

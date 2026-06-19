@@ -191,6 +191,14 @@ redimensionner et activer les fenêtres souhaitées.
 Indispensable en fullscreen pour avoir l'info sans alt-tab. Position et
 taille sont sauvegardées entre les sessions.
 
+### Bips PTT personnalisables
+Vous pouvez remplacer les bips synthétiques par défaut (press / release)
+par vos propres fichiers **WAV** et régler leur volume global depuis
+l'onglet Audio des paramètres du client. Les fichiers sont copiés dans
+`<dossier_client>/sounds/ptt_press.wav` et `ptt_release.wav` pour
+survivre aux redémarrages. Format accepté : WAV PCM mono ou stéréo (le
+client convertit automatiquement en mono 48 kHz), durée maximale 5 s.
+
 ### Mode anonyme (Écran serveur ou Admin)
 Permet de masquer son pseudo aux autres joueurs (utile pour des
 événements RP).

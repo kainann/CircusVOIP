@@ -8,11 +8,15 @@ calculée à partir de la position lue par OCR sur l'écran du joueur.
 
 La plupart des joueurs ont uniquement besoin de l'installeur **client** :
 
-➡️ **[Télécharger CircusVOIP_Client_Setup_v0.1.2.exe](https://github.com/kainann/CircusVOIP/releases/tag/client-v0.1.2)**
+➡️ **[Télécharger CircusVOIP_Client_Setup_v0.2.0.exe](https://github.com/kainann/CircusVOIP/releases/tag/client-v0.2.0)**
 
 Lancez l'installeur, configurez votre micro, configurez la zone OCR,
 définissez les raccourcis radio et profil, connectez-vous au serveur de
 votre groupe et c'est parti.
+
+⚠️ **Le serveur de votre groupe doit être en v0.2** pour profiter des
+nouveautés du client v0.2 (CircusPhone, soundboard, photos de profil).
+Mettez à jour le serveur en même temps que le client.
 
 ## Pour le serveur
 
@@ -20,7 +24,7 @@ Un groupe a besoin d'**un seul serveur**, hébergé soit :
 
 ### Sur le PC d'un joueur (le plus simple)
 
-➡️ **[Télécharger CircusVOIP_Server_Setup_v0.1.1.exe](https://github.com/kainann/CircusVOIP/releases/tag/server-v0.1.1)**
+➡️ **[Télécharger CircusVOIP_Server_Setup_v0.2.0.exe](https://github.com/kainann/CircusVOIP/releases/tag/server-v0.2.0)**
 
 Lancez l'installeur, le serveur démarre et génère un mot de passe
 automatiquement. Communiquez l'IP de la machine + le mot de passe aux
@@ -113,6 +117,34 @@ Vous entendez les autres joueurs en fonction de leur distance dans Star
 Citizen : proche = fort, lointain = faible, inaudible au-delà d'une
 portée réglable. La position est lue par OCR sur le HUD du jeu.
 
+### CircusPhone — messagerie et appels intégrés
+Un téléphone virtuel s'ouvre en surimpression par-dessus Star Citizen.
+Il permet d'**appeler** et d'**envoyer des messages écrits** aux autres
+joueurs, directement depuis le jeu.
+
+- **Navigation entièrement au clavier** (flèches directionnelles +
+  Entrée) : la souris reste captée par Star Citizen quand l'overlay est
+  ouvert, vous gardez donc le contrôle de votre personnage. Les flèches
+  naviguent dans les contacts et les conversations, Entrée valide, Échap
+  revient en arrière.
+- **Conversations privées** avec historique horodaté.
+- **Tri intelligent des contacts** : les conversations les plus récentes
+  remontent en haut de la liste.
+- **Annuaire automatique** : les joueurs connectés au serveur en même
+  temps que vous sont ajoutés à vos contacts.
+- **Sonneries** lors des appels et notification sonore à la réception
+  d'un message.
+
+### Photos de profil
+Vous pouvez associer une photo à votre profil. Elle s'affiche en face de
+votre pseudo pour les autres joueurs, qui la reçoivent automatiquement.
+
+### Soundboard
+Une planche de sons permet de déclencher un effet audio diffusé aux
+autres joueurs. **Un seul son est disponible pour le moment** (alarme) ;
+d'autres pourront être ajoutés par la suite. L'admin peut autoriser ou
+non chaque profil à utiliser le soundboard.
+
 ### Radio par canaux
 Communication longue distance par-dessus la proximité.
 L'admin du serveur crée des canaux (ex : « Combat », « Marchand »,
@@ -140,6 +172,11 @@ La détection du casque se fait par OCR du HUD et lecture du gamelog.
 
 Mode RP OFF : filtre radio seulement sur les communications radio et
 profil.
+
+### Masque OCR intelligent
+Le client détecte désormais quand votre mobiGlas ou le menu options est
+ouvert et adapte la capture en conséquence, ce qui évite les faux
+relevés de position pendant ces moments.
 
 ### Overlays
 Petites fenêtres flottantes par-dessus Star Citizen pour donner des
@@ -210,7 +247,8 @@ Le serveur expose deux services WebSocket distincts :
 
 - **Port 8888** : serveur de positions. Chaque client envoie sa
   position (lue par OCR) et reçoit celles des autres joueurs. Gère
-  aussi les canaux radio, les profils joueurs et la console admin.
+  aussi les canaux radio, les profils joueurs, le CircusPhone (appels et
+  messages), les photos de profil et la console admin.
 - **Port 8889** : serveur audio. Relais des trames audio PCM (48 kHz,
   mono, float32) entre clients. Le volume de chaque pair est calculé
   localement par chaque client en fonction de la distance.

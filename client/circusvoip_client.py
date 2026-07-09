@@ -239,11 +239,13 @@ _boot_log("apres _bootstrap_dependencies()")
 
 from PySide6.QtCore import (
     Qt, QTimer, QObject, Signal, Slot, QThread, QPoint, QRect,
+    QRectF, QPointF,
     QMetaObject, QPropertyAnimation, QEasingCurve,
 )
 from PySide6.QtGui import (
     QGuiApplication, QScreen, QCursor, QPainter, QPainterPath, QColor, QPen,
     QFont, QKeyEvent, QMouseEvent, QIcon, QPixmap, QImage, QTextCursor,
+    QImageReader,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -560,6 +562,21 @@ QToolTip {{
 
 _BASE_DIR = Path(__file__).resolve().parent
 
+
+def _load_oriented_pixmap(path):
+    """Charge une image en APPLIQUANT son orientation EXIF (sinon une photo
+    portrait stockee en paysage + tag EXIF, comme certaines captures SC,
+    s'affiche couchee)."""
+    try:
+        rd = QImageReader(str(path))
+        rd.setAutoTransform(True)
+        img = rd.read()
+        if not img.isNull():
+            return QPixmap.fromImage(img)
+    except Exception:
+        pass
+    return QPixmap(str(path))
+
 # Fichier de configuration unique. Centralise toutes les preferences :
 # audio (mic_gain, gate_threshold, devices), connexion (name, server_ip,
 # token), OCR (zone_coords, ocr_force_cpu), radio PTT (radio_key,
@@ -594,6 +611,10 @@ PHONE_ANNUAIRE_FILE = _BASE_DIR / "circusphone_annuaire.json"
 # stockes dans le meme fichier pour pouvoir etre repris a l'ouverture
 # suivante de la conversation.
 PHONE_MESSAGES_FILE = _BASE_DIR / "circusphone_messages.json"
+# --- Images dans les MP (screenshots) ---
+PHONE_IMAGES_DIR   = _BASE_DIR / "circusphone_images"   # cache local
+PHONE_IMG_PREFIX   = "[img]"     # body special : "[img]<fichier>" = bulle image
+PHONE_MAX_IMG_B64  = 900_000     # taille max du base64 (frame WS < 1 Mo)
 # Limites de la messagerie (cf spec D4).
 PHONE_MAX_BODY_LEN  = 500   # taille max d'un message texte
 # Cap GLOBAL : envoyes + recus fusionnes, trie par ts, on garde les N plus
@@ -1754,6 +1775,10 @@ _CORE_MANAGED_CFG_KEYS = frozenset({
     "proximity_short_key", "cycle_channel_key",
     "phone_open_key", "phone_accept_key", "phone_decline_key",
     "phone_mute_key", "phone_speaker_key",
+    # Fond d'ecran du CircusPhone (ecrit en cours de session par l'app
+    # Parametres via _core._save_client_cfg ; sans ca, _save_cfg(self._cfg)
+    # reecraserait au close avec la valeur du boot -> fond non sauvegarde).
+    "phone_wallpaper", "phone_wallpaper_key",
 })
 
 
@@ -2326,6 +2351,8 @@ class NetWorker(QObject):
     # CircusPhone (D4 etape 3) : reception d'un MP texte. Relaye au thread
     # Qt via slot _on_phone_message_received dans MainWindow.
     sig_phone_message_received = Signal(str, str, float)  # sender, body, ts
+    sig_phone_image_received = Signal(str, str, float)    # sender, b64, ts
+    sig_phone_server_msg = Signal(dict)   # message mp_* (multijoueur) -> overlay
     # [D5] Reponse a un profile_photo_request. Champs : target, status,
     # hash, data_b64. status est l'un de : "ok", "unchanged", "none".
     sig_profile_photo_response = Signal(str, str, str, str)
@@ -2491,6 +2518,13 @@ class NetWorker(QObject):
 
     def _handle_message(self, data: dict, my_name: str):
         msg_type = data.get("type")
+
+        # Multijoueur (mp_*) et scores partages (hs_*) : vers l'overlay
+        # (app courante, qui expose handle_server_msg).
+        if isinstance(msg_type, str) and (msg_type.startswith("mp_")
+                                          or msg_type.startswith("hs_")):
+            self.sig_phone_server_msg.emit(data)
+            return
 
         if msg_type == "error":
             reason = data.get("reason", "")
@@ -2935,6 +2969,17 @@ class NetWorker(QObject):
             except Exception:
                 ts = 0.0
             self.sig_phone_message_received.emit(sender, body, ts)
+            return
+
+        # Screenshots dans les MP : une image (base64) est arrivee.
+        if msg_type == "phone_image_received":
+            sender = data.get("sender") or ""
+            b64    = data.get("data") or ""
+            try:
+                ts = float(data.get("ts") or 0.0)
+            except Exception:
+                ts = 0.0
+            self.sig_phone_image_received.emit(sender, b64, ts)
             return
 
         # [D5] Reponse a une demande de photo de profil.
@@ -8179,6 +8224,54 @@ class _PhoneIconLabel(QLabel):
                 QPoint(int(s * 0.30), int(s * 0.50)),
             ])
             p.drawPolygon(poly)
+        elif self._kind == "clip":
+            # Trombone (piece jointe). Dessin en primitives simples
+            # (drawLine/drawArc), incline a -45°. En cas de pepin, repli
+            # texte "📎" + log pour diagnostiquer.
+            try:
+                pen = QPen(col, max(2.0, s * 0.10))
+                pen.setCapStyle(Qt.RoundCap)
+                p.setPen(pen)
+                p.setBrush(Qt.NoBrush)
+                p.save()
+                p.translate(s / 2.0, s / 2.0)
+                p.rotate(-45)
+                p.translate(-s / 2.0, -s / 2.0)
+                xL, xR = s * 0.34, s * 0.66
+                yT, cB = s * 0.30, s * 0.58
+                R1 = (xR - xL) / 2.0
+                # cote gauche
+                p.drawLine(QPointF(xL, yT), QPointF(xL, cB))
+                # arc bas exterieur (de gauche a droite par le bas)
+                p.drawArc(QRectF(xL, cB - R1, 2 * R1, 2 * R1),
+                          180 * 16, 180 * 16)
+                # cote droit
+                yT2 = s * 0.26
+                p.drawLine(QPointF(xR, cB), QPointF(xR, yT2))
+                # arc haut (de droite vers l'interieur par le haut)
+                R2 = s * 0.105
+                p.drawArc(QRectF(xR - 2 * R2, yT2 - R2, 2 * R2, 2 * R2),
+                          0, 180 * 16)
+                # descente interieure
+                xI = xR - 2 * R2
+                cI = s * 0.53
+                p.drawLine(QPointF(xI, yT2), QPointF(xI, cI))
+                # petit arc bas interieur
+                R3 = s * 0.05
+                p.drawArc(QRectF(xI, cI - R3, 2 * R3, 2 * R3),
+                          180 * 16, 180 * 16)
+                p.restore()
+            except Exception as e:
+                try:
+                    p.restore()
+                except Exception:
+                    pass
+                print(f"[PHONE ICON] clip paint KO : {e}")
+                f = QFont()
+                f.setPixelSize(int(s * 0.7))
+                p.setFont(f)
+                p.setPen(col)
+                p.drawText(QRectF(0, 0, s, s), Qt.AlignCenter, "📎")
         elif self._kind == "gear":
             # Engrenage (D5 a venir : reglages profil). 8 dents
             # rectangulaires reparties tous les 45° autour d'un anneau
@@ -8247,10 +8340,16 @@ class _PhoneContactRow(QWidget):
     sig_forget  = Signal(str)   # pseudo : clic sur la croix "oublier"
 
     def __init__(self, pseudo: str, online: bool, row_h: int,
-                 unread: bool = False, photo_bytes=None, parent=None):
+                 unread: bool = False, photo_bytes=None, parent=None,
+                 mode: str = "full"):
         super().__init__(parent)
+        # Sans cet attribut, un QWidget simple NE PEINT PAS le 'background'
+        # defini en stylesheet (la surbrillance de navigation resterait
+        # invisible). Indispensable pour le halo de selection en mode message.
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self._pseudo = pseudo
         self._online = online
+        self._mode = mode          # "full" (tel+lettre) ou "message" (ligne)
         self.setFixedHeight(row_h)
         icon_sz = max(14, int(row_h * 0.55))
         dot_sz  = max(7, int(row_h * 0.28))
@@ -8298,7 +8397,34 @@ class _PhoneContactRow(QWidget):
         # d'icones phone/letter).
         self._ic_phone = None
         self._ic_letter = None
-        if online:
+        if self._mode == "message":
+            # Mode MESSAGERIE : aucune icone d'action. La LIGNE entiere est
+            # cliquable et ouvre la conversation avec ce contact (sig_message).
+            # On signale les non-lus par une pastille rouge en bout de ligne.
+            if unread:
+                badge = QLabel()
+                bsz = max(8, int(row_h * 0.26))
+                badge.setFixedSize(bsz, bsz)
+                badge.setStyleSheet(
+                    f"background:#e5484d; border-radius:{bsz // 2}px;")
+                lay.addWidget(badge)
+            self.setCursor(Qt.PointingHandCursor)
+        elif self._mode == "call":
+            # Onglet Appels > Menu : la LIGNE entiere appelle le contact (si
+            # connecte). Hors-ligne -> croix "oublier" (non appelable).
+            if online:
+                ic_phone = _PhoneIconLabel("phone", icon_sz, True, self)
+                ic_phone.sig_clicked.connect(
+                    lambda: self.sig_call.emit(self._pseudo))
+                lay.addWidget(ic_phone)
+                self._ic_phone = ic_phone
+                self.setCursor(Qt.PointingHandCursor)
+            else:
+                ic_forget = _PhoneIconLabel("forget", icon_sz, True, self)
+                ic_forget.sig_clicked.connect(
+                    lambda: self.sig_forget.emit(self._pseudo))
+                lay.addWidget(ic_forget)
+        elif online:
             # Connecte : telephone + lettre, tous deux cliquables.
             ic_phone = _PhoneIconLabel("phone", icon_sz, True, self)
             ic_phone.sig_clicked.connect(
@@ -8321,6 +8447,25 @@ class _PhoneContactRow(QWidget):
             )
             lay.addWidget(ic_forget)
 
+    def mousePressEvent(self, ev):
+        # Clic sur la ligne : ouvre la conversation (message) ou lance l'appel
+        # (call, si le contact est connecte).
+        if self._mode == "message":
+            try:
+                self.sig_message.emit(self._pseudo)
+            except Exception:
+                pass
+            ev.accept()
+            return
+        if self._mode == "call" and self._online:
+            try:
+                self.sig_call.emit(self._pseudo)
+            except Exception:
+                pass
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
     def pseudo(self) -> str:
         """Pseudo du contact de cette ligne."""
         return self._pseudo
@@ -8334,13 +8479,170 @@ class _PhoneContactRow(QWidget):
           selected : True si cette ligne est la ligne courante du D-pad.
           action   : 0 = Appeler (phone), 1 = Message (letter). Ignore si
                      la ligne n'est pas selectionnee.
-        Dessine un halo sur l'icone de l'action ciblee. Sur une ligne
-        deconnectee (pas d'icones), rien (ces lignes ne sont pas navigables
-        dans le scope actuel : appel + message uniquement)."""
+        En mode messagerie (pas d'icones), on surligne le FOND de la ligne.
+        Sinon halo sur l'icone de l'action ciblee. Ligne deconnectee : rien."""
+        if self._mode in ("message", "call"):
+            self.setStyleSheet(
+                "background:rgba(63,185,80,0.22); border-radius:8px;"
+                if selected else "background:transparent;")
+            return
         if self._ic_phone is not None:
             self._ic_phone.set_nav_selected(selected and action == 0)
         if self._ic_letter is not None:
             self._ic_letter.set_nav_selected(selected and action == 1)
+
+
+class _CallHistoryRow(QWidget):
+    """Une ligne du journal d'appels (onglet Appels > Historique) : fleche de
+    sens (sortant/entrant), nom du pair, issue + heure. Cliquable / navigable
+    pour rappeler le contact."""
+
+    sig_call = Signal(str)
+
+    def __init__(self, peer: str, direction: str, outcome: str, ts: float,
+                 row_h: int, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self._peer = peer
+        self.setFixedHeight(row_h)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 0, 8, 0)
+        lay.setSpacing(8)
+
+        missed = outcome in ("missed", "declined", "busy", "offline")
+        arrow = "\u2197" if direction == "out" else "\u2199"  # ↗ sortant ↙ entrant
+        col = "#e5484d" if missed else "#3fb950"
+        ic = QLabel(arrow)
+        ic.setStyleSheet(
+            f"color:{col}; font-size:13pt; font-weight:700; "
+            "background:transparent;")
+        lay.addWidget(ic)
+
+        name = QLabel(peer or "?")
+        name.setStyleSheet(
+            f"color:{_PHONE_NAME_ONLINE}; font-size:10pt; font-weight:600; "
+            "background:transparent;")
+        lay.addWidget(name, stretch=1)
+
+        sub = QLabel(self._fmt(direction, outcome, ts))
+        sub.setStyleSheet(
+            "color:#9aa0a6; font-size:8pt; background:transparent;")
+        lay.addWidget(sub)
+        self.setCursor(Qt.PointingHandCursor)
+
+    @staticmethod
+    def _fmt(direction: str, outcome: str, ts: float) -> str:
+        lbl = {
+            "answered": "répondu",
+            "missed":   "sans réponse" if direction == "out" else "manqué",
+            "declined": "refusé",
+            "busy":     "occupé",
+            "offline":  "hors ligne",
+        }.get(outcome, outcome)
+        when = ""
+        try:
+            t = time.localtime(float(ts))
+            now = time.localtime()
+            hm = time.strftime("%H:%M", t)
+            if (t.tm_year, t.tm_yday) == (now.tm_year, now.tm_yday):
+                when = hm
+            else:
+                when = time.strftime("%d/%m", t) + " " + hm
+        except Exception:
+            pass
+        return f"{lbl} · {when}" if when else lbl
+
+    def pseudo(self) -> str:
+        return self._peer
+
+    def is_online(self) -> bool:
+        return True
+
+    def set_nav_highlight(self, selected: bool, action: int = 0):
+        self.setStyleSheet(
+            "background:rgba(63,185,80,0.22); border-radius:8px;"
+            if selected else "background:transparent;")
+
+    def mousePressEvent(self, ev):
+        try:
+            self.sig_call.emit(self._peer)
+        except Exception:
+            pass
+        ev.accept()
+
+
+class _ScreenshotRow(QWidget):
+    """Une capture dans la page Screenshots : vignette (ratio conserve) +
+    nom de fichier + date. Cliquer = choisir cette image a envoyer."""
+
+    sig_pick = Signal(str)
+
+    def __init__(self, path: str, row_h: float, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self._path = path
+        self.setFixedHeight(int(row_h))
+        self.setCursor(Qt.PointingHandCursor)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(6, 3, 6, 3)
+        lay.setSpacing(8)
+
+        thumb = QLabel()
+        th = int(row_h - 10)
+        tw = int(th * 16 / 9)
+        thumb.setFixedSize(tw, th)
+        thumb.setStyleSheet(
+            "background:#e8eaed; border-radius:6px;")
+        thumb.setAlignment(Qt.AlignCenter)
+        try:
+            pix = QPixmap(path)
+            if not pix.isNull():
+                thumb.setPixmap(pix.scaled(
+                    tw, th, Qt.KeepAspectRatioByExpanding,
+                    Qt.SmoothTransformation))
+                thumb.setScaledContents(False)
+        except Exception:
+            pass
+        lay.addWidget(thumb)
+
+        col = QVBoxLayout()
+        col.setSpacing(1)
+        name = QLabel(os.path.basename(path))
+        name.setStyleSheet(
+            f"color:{_PHONE_NAME_ONLINE}; font-size:8pt; font-weight:600; "
+            "background:transparent;")
+        try:
+            name.setText(name.fontMetrics().elidedText(
+                os.path.basename(path), Qt.ElideMiddle, 140))
+        except Exception:
+            pass
+        col.addWidget(name)
+        date = QLabel()
+        try:
+            mt = os.path.getmtime(path)
+            date.setText(time.strftime("%d/%m/%y %H:%M", time.localtime(mt)))
+        except Exception:
+            pass
+        date.setStyleSheet(
+            "color:#9aa0a6; font-size:7pt; background:transparent;")
+        col.addWidget(date)
+        col.addStretch(1)
+        lay.addLayout(col, stretch=1)
+
+    def mousePressEvent(self, ev):
+        try:
+            self.sig_pick.emit(self._path)
+        except Exception:
+            pass
+        ev.accept()
+
+    def path(self) -> str:
+        return self._path
+
+    def set_nav_highlight(self, selected: bool):
+        self.setStyleSheet(
+            "background:rgba(63,185,80,0.22); border-radius:8px;"
+            if selected else "background:transparent;")
 
 
 class _PhoneMessageInput(QTextEdit):
@@ -8441,9 +8743,12 @@ class _PhoneMessageBubble(QFrame):
     messagerie type WhatsApp). Format "JJ/MM HH:MM" (ajout 23/05/2026)."""
 
     def __init__(self, body: str, is_me: bool, screen_w: int,
-                 ts: float = 0.0, parent=None):
+                 ts: float = 0.0, parent=None, screen_h: int = 0):
         super().__init__(parent)
         self.setFrameShape(QFrame.NoFrame)
+        self._img_path = None        # chemin absolu si bulle image (sinon None)
+        self._bubble_frame = None    # QFrame stylise (pour la surbrillance nav)
+        self._bubble_base_qss = ""   # style de base (restaure a la deselection)
         # On utilise un QHBoxLayout exterieur pour pousser la bulle a
         # gauche ou a droite via un stretch sur l'autre cote.
         outer = QHBoxLayout(self)
@@ -8455,10 +8760,46 @@ class _PhoneMessageBubble(QFrame):
         inner = QVBoxLayout(bubble)
         inner.setContentsMargins(10, 6, 10, 4)
         inner.setSpacing(2)
-        # Body
-        lbl_body = QLabel(body or "")
-        lbl_body.setWordWrap(True)
-        lbl_body.setStyleSheet("background:transparent; font-size:12pt;")
+        # Body : texte, OU image si body = "[img]<fichier>" (screenshot
+        # envoye/recu, fichier dans le cache PHONE_IMAGES_DIR).
+        lbl_body = QLabel()
+        is_img = isinstance(body, str) and body.startswith(PHONE_IMG_PREFIX)
+        if is_img:
+            fname = body[len(PHONE_IMG_PREFIX):]
+            pix = QPixmap()
+            try:
+                fpath = PHONE_IMAGES_DIR / fname
+                if fpath.exists():
+                    pix = QPixmap(str(fpath))
+                    self._img_path = str(fpath)   # pour l'ouverture plein ecran
+            except Exception:
+                pass
+            if not pix.isNull():
+                # Vignette bornee en largeur ET en hauteur (sinon une photo
+                # VERTICALE, limitee seulement en largeur, devient enorme).
+                # On conserve les proportions et on ne fait que REDUIRE.
+                maxw = int(screen_w * 0.62)
+                maxh = int(screen_h * 0.42) if screen_h else maxw
+                pw, ph = pix.width(), pix.height()
+                if pw > 0 and ph > 0:
+                    f = min(maxw / pw, maxh / ph, 1.0)
+                    if f < 1.0:
+                        pix = pix.scaled(max(1, int(pw * f)),
+                                         max(1, int(ph * f)),
+                                         Qt.KeepAspectRatio,
+                                         Qt.SmoothTransformation)
+                lbl_body.setPixmap(pix)
+                lbl_body.setStyleSheet(
+                    "background:transparent; border-radius:6px;")
+            else:
+                lbl_body.setText("📷 image indisponible")
+                lbl_body.setStyleSheet(
+                    "background:transparent; font-size:10pt; "
+                    "font-style:italic;")
+        else:
+            lbl_body.setText(body or "")
+            lbl_body.setWordWrap(True)
+            lbl_body.setStyleSheet("background:transparent; font-size:12pt;")
         inner.addWidget(lbl_body)
         # Timestamp : format "JJ/MM HH:MM" (ex: "23/05 12:34"). Si ts=0
         # (vieux message sans ts dans le JSON, ou bug), on n'affiche rien
@@ -8510,6 +8851,32 @@ class _PhoneMessageBubble(QFrame):
                 )
             outer.addWidget(bubble)
             outer.addStretch(1)
+
+        # Reference + style de base pour la surbrillance de navigation.
+        self._bubble_frame = bubble
+        self._bubble_base_qss = bubble.styleSheet()
+
+    def image_path(self):
+        """Chemin absolu de l'image si la bulle en est une (et fichier
+        present), sinon None."""
+        return self._img_path
+
+    def set_nav_selected(self, sel: bool):
+        """Surbrillance de navigation : liseré bleu autour de la bulle."""
+        if self._bubble_frame is None:
+            return
+        if sel:
+            base = self._bubble_base_qss.rstrip().rstrip("}")
+            # Injecte une bordure dans le bloc QFrame existant.
+            if "border-radius" in base:
+                self._bubble_frame.setStyleSheet(
+                    base + " border:2px solid #2f6fed; }")
+            else:
+                self._bubble_frame.setStyleSheet(
+                    self._bubble_base_qss
+                    + " QFrame { border:2px solid #2f6fed; }")
+        else:
+            self._bubble_frame.setStyleSheet(self._bubble_base_qss)
 
 
 class _PhoneCircleButton(QLabel):
@@ -8728,13 +9095,57 @@ class _PhoneNavKeyListener:
 
     NB : ZQSD gere le deplacement dans Star Citizen, donc capter les
     fleches pendant que le telephone est ouvert ne gene pas le mouvement
-    du joueur. Le listener ne consomme pas l'evenement (pynput on_press ne
-    bloque pas la touche cote jeu), il ne fait qu'observer."""
+    du joueur. Le listener n'observe que (sans les consommer) les fleches /
+    enter ; l'action RETOUR est la touche Retour arriere (remplace Echap,
+    qui ouvrait le menu Options de SC). Hors champ de saisie, Retour arriere
+    est SUPPRIMEE au niveau du hook Windows tant que le telephone est ouvert,
+    pour qu'elle revienne au home sans atteindre SC (cf. win32_event_filter) ;
+    dans un champ de saisie, elle reste disponible pour effacer du texte."""
 
     _NAV_KEYS = {"up", "down", "left", "right", "enter", "esc"}
+    # Touches utilisees par les JEUX (apres suppression de ZQSD). Quand un jeu
+    # capture-clavier est actif, ces touches lui sont injectees en evenements
+    # synthetiques (sans voler le focus a SC) ET supprimees au hook pour ne
+    # pas perturber le perso dans SC. NB : on N'inclut PAS backspace/esc ici
+    # (geres a part : retour).
+    # NB : ni Espace (saut) ni C (s'allonger) ne sont interceptes : ce sont
+    # des touches de deplacement SC. V remplace C dans les jeux.
+    _GAME_KEYS = {"up", "down", "left", "right", "enter",
+                  "p", "r", "f", "t", "v"}
+    # norm -> code virtuel Windows, pour la suppression au hook.
+    # NB : Espace (0x20) n'est PLUS une touche de jeu/action : c'est la touche
+    # de SAUT de SC. Elle n'est jamais interceptee ni avalee -> Entree la
+    # remplace partout comme touche de validation.
+    _GAME_VKS = {
+        "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
+        "enter": 0x0D,
+        "p": 0x50, "r": 0x52, "f": 0x46, "t": 0x54,
+        "v": 0x56,
+    }
 
-    def __init__(self, on_nav):
+    def __init__(self, on_nav, is_text_field=None,
+                 on_game_key=None, is_game_active=None,
+                 on_camera_key=None, is_camera_active=None,
+                 is_viewer_active=None, on_viewer_close=None):
         self._on_nav = on_nav
+        # Predicat thread-safe (lecture d'un bool) : True quand un champ de
+        # saisie texte du telephone a le focus (composeur de message). Sert a
+        # NE PAS detourner Retour arriere (edition) ni le supprimer cote OS.
+        self._is_text_field = is_text_field or (lambda: False)
+        # on_game_key(norm) : appele (thread pynput) quand un jeu est actif et
+        # qu'une touche de jeu est pressee. L'overlay injecte alors un
+        # evenement clavier synthetique dans le jeu (cf. _on_game_key).
+        self._on_game_key = on_game_key or (lambda _k: None)
+        # is_game_active() : True quand l'app courante est un jeu capture-clavier.
+        self._is_game_active = is_game_active or (lambda: False)
+        # Camera : fenetre SEPAREE qui n'a pas le focus clavier en jeu (SC le
+        # garde). On route donc SES touches (R/Entree/Espace/Retour) via CE
+        # listener global, comme pour les jeux.
+        self._on_camera_key = on_camera_key or (lambda _k: None)
+        self._is_camera_active = is_camera_active or (lambda: False)
+        # Visionneuse photo plein ecran (moniteur) : Retour arriere la ferme.
+        self._is_viewer_active = is_viewer_active or (lambda: False)
+        self._on_viewer_close = on_viewer_close or (lambda: None)
         self._kb_listener = None
 
     def start(self) -> None:
@@ -8755,6 +9166,47 @@ class _PhoneNavKeyListener:
                 else:
                     norm = getattr(key, "name", None)
                     if norm: norm = norm.lower()
+                # VISIONNEUSE photo plein ecran ouverte : Retour arriere/Echap
+                # la ferme (priorite absolue). Les autres touches passent
+                # normalement (SC garde Espace pour sauter, etc.).
+                if self._is_viewer_active():
+                    if norm in ("backspace", "esc"):
+                        self._on_viewer_close()
+                        return
+                # CAMERA ouverte : elle n'a pas le focus clavier en jeu, donc on
+                # lui route ses touches ici (avant tout le reste). R = pivoter,
+                # Entree = photo, Retour arriere/Echap = fermer. NB : Espace
+                # n'est PLUS une action (c'est la touche de SAUT de SC) : on la
+                # laisse filer vers SC.
+                if self._is_camera_active():
+                    if norm in ("r", "enter"):
+                        self._on_camera_key(norm)
+                        return
+                    if norm in ("backspace", "esc"):
+                        self._on_camera_key("esc")
+                        return
+                # RETOUR ARRIERE = action "retour" du telephone (remplace
+                # Echap, qui ouvrait le menu Options de Star Citizen). On
+                # reutilise le token interne "esc" pour ne pas toucher les
+                # handlers en aval. Dans un champ de saisie, on laisse le
+                # QTextEdit effacer (ne pas detourner).
+                if norm == "backspace":
+                    if self._is_text_field():
+                        return
+                    norm = "esc"
+                elif norm == "esc":
+                    # Echap n'est plus le retour general. On ne la conserve
+                    # que pour RESSORTIR du champ de saisie (la, l'overlay est
+                    # au premier plan -> n'atteint pas SC). Hors champ : ignore.
+                    if not self._is_text_field():
+                        return
+                # JEU actif : router TOUTES ses touches vers le jeu via un
+                # evenement synthetique (cf. _on_game_key), SANS voler le
+                # premier plan -> SC reste actif (vrai overlay). "esc" (=retour
+                # arriere) n'est pas une touche de jeu : il file au handle_back.
+                if norm in self._GAME_VKS and self._is_game_active():
+                    self._on_game_key(norm)
+                    return
                 if norm in self._NAV_KEYS:
                     self._on_nav(norm)
             except Exception as e:
@@ -8762,8 +9214,48 @@ class _PhoneNavKeyListener:
                     try: _core._dbg_log(f"[PHONE NAV] on_press KO : {e}")
                     except Exception: pass
 
+        # Sur Windows : filtre bas-niveau pour SUPPRIMER cote OS la touche de
+        # RETOUR (Retour arriere) tant que le telephone est ouvert et qu'on
+        # n'est PAS dans un champ de saisie, afin qu'elle n'atteigne pas Star
+        # Citizen ni un jeu au focus Qt. On supprime aussi Echap (best-effort :
+        # empeche le menu Options de SC ; NB SC en raw-input peut tout de meme
+        # la recevoir, d'ou le passage a Retour arriere pour le "retour").
+        # suppress_event() bloque la touche cote OS mais laisse _on_press
+        # s'executer (-> navigation). Dans un champ, Retour arriere n'est PAS
+        # supprimee : le QTextEdit doit pouvoir effacer.
+        listener_kwargs = {"on_press": _on_press}
         try:
-            self._kb_listener = kb.Listener(on_press=_on_press)
+            import sys as _sys
+            if _sys.platform.startswith("win"):
+                _VK_ESCAPE = 0x1B
+                _VK_BACK = 0x08
+                _GAME_VK_SET = set(self._GAME_VKS.values())
+                def _win32_filter(msg, data):
+                    try:
+                        vk = getattr(data, "vkCode", None)
+                        lst = self._kb_listener
+                        if lst is None:
+                            return
+                        if vk == _VK_ESCAPE:
+                            lst.suppress_event()
+                        elif vk == _VK_BACK and not self._is_text_field():
+                            lst.suppress_event()
+                        elif vk in _GAME_VK_SET and (self._is_game_active()
+                                                     or self._is_camera_active()):
+                            # Jeu OU camera actif : on AVALE ces touches cote OS
+                            # (routees via _on_game_key / _on_camera_key) pour
+                            # que SC ne les recoive pas. Espace (0x20) ne fait
+                            # PAS partie du set -> il file toujours vers SC
+                            # (touche de saut), Entree assurant la validation.
+                            lst.suppress_event()
+                    except Exception:
+                        pass
+                listener_kwargs["win32_event_filter"] = _win32_filter
+        except Exception:
+            pass
+
+        try:
+            self._kb_listener = kb.Listener(**listener_kwargs)
             self._kb_listener.daemon = True
             self._kb_listener.start()
             if _CORE_AVAILABLE:
@@ -8818,6 +9310,7 @@ class PhoneOverlayWindow(QWidget):
     # Signaux de la messagerie (D4 etape 3, ecran conversation).
     sig_send_message    = Signal(str, str)  # target, body : clic envoyer
     sig_back_contacts   = Signal()          # fleche retour : revenir a Contacts
+    sig_send_image      = Signal(str, str)  # (pseudo, chemin) : envoyer un screenshot
     sig_draft_changed   = Signal(str, str)  # target, draft : texte en cours
     # Reglages profil (D5+) : ecran dedie dans l'overlay. L'engrenage du
     # header Contacts emet sig_settings_clicked, qui bascule sur l'ecran.
@@ -8835,10 +9328,18 @@ class PhoneOverlayWindow(QWidget):
     # Navigation clavier D-pad (thread pynput -> Qt). Emis depuis le thread
     # du listener, recu en main thread Qt (queued connection auto).
     sig_nav_key = Signal(str)   # 'up'|'down'|'left'|'right'|'enter'
+    sig_game_key = Signal(str)  # touche de jeu -> injection synthetique au jeu
+    sig_camera_key = Signal(str)  # touche camera -> action sur la fenetre photo
+    sig_viewer_close = Signal()   # Retour -> fermer la photo plein ecran
 
     def __init__(self, main_window):
+        # Fenetre INDEPENDANTE (parent=None) volontairement : si l'overlay
+        # est enfant de la fenetre principale, forcer son premier plan (pour
+        # capter le clavier d'un jeu) REACTIVE son proprietaire -> le client
+        # remonte par-dessus Star Citizen. En top-level non-possede, seul
+        # l'overlay passe au premier plan. On garde self._mw pour le reste.
         super().__init__(
-            main_window,
+            None,
             Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
             | Qt.NoDropShadowWindowHint | Qt.Tool,
         )
@@ -8901,16 +9402,57 @@ class PhoneOverlayWindow(QWidget):
         self._nav_index = 0
         self._nav_action = 0
         self._nav_rows = []
+        # Mode de l'ecran contacts selon l'icone d'accueil qui l'a ouvert :
+        #   "full"    = ecran Appels (lignes avec tel + lettre)  [defaut]
+        #   "message" = ecran Messagerie (ligne entiere -> conversation)
+        self._contacts_mode = "full"
+        self._last_contacts_args = None
+        # Onglet Appels courant ("menu" | "historique"), cache de l'historique
+        # d'appels recu de MainWindow, et lignes navigables de l'historique.
+        self._appels_tab = "menu"
+        self._call_history_cache = []
+        self._history_rows = []
         # Navigation D-pad ecran conversation : 3 cibles cyclables.
-        #   _convo_nav_index : 0 = fleche Retour, 1 = champ texte, 2 = Envoyer
+        #   _convo_nav_index : 0 = fleche Retour, 1 = champ texte,
+        #     2 = Trombone (screenshots), 3 = Envoyer
         #   _convo_in_field  : True quand on a donne le focus au champ pour
         #     taper (les fleches deplacent alors le curseur ; Echap ressort).
         self._convo_nav_index = 0
+        self._convo_bubbles = []   # bulles navigables de la conversation
         self._convo_in_field = False
         self._nav_listener = _PhoneNavKeyListener(
-            on_nav=lambda d: self.sig_nav_key.emit(d)
+            on_nav=lambda d: self.sig_nav_key.emit(d),
+            is_text_field=lambda: self._convo_in_field,
+            on_game_key=lambda k: self.sig_game_key.emit(k),
+            is_game_active=self._is_game_active,
+            on_camera_key=lambda k: self.sig_camera_key.emit(k),
+            is_camera_active=self._is_camera_active,
+            is_viewer_active=self._is_photo_viewer_active,
+            on_viewer_close=lambda: self.sig_viewer_close.emit(),
         )
         self.sig_nav_key.connect(self._on_nav_key)
+        self.sig_game_key.connect(self._on_game_key)
+        self.sig_camera_key.connect(self._on_camera_key)
+        self.sig_viewer_close.connect(self._close_photo_viewer)
+
+        # [v0.3] Etat des apps CircusPhone : home + lazy-load + app courante.
+        self._page_home = None        # PhoneHome (None = repli v0.2 sans home)
+        self._current_app = None      # PhoneApp affichee (None = ecran natif)
+        self._app_cache = {}          # APP_ID -> instance (lazy-load)
+        # D'ou a-t-on ouvert l'ecran Reglages profil ? "contacts" (roue dentee
+        # de l'en-tete Contacts) ou "settings" (app Parametres). Le retour de
+        # cet ecran revient a l'origine.
+        self._settings_origin = "contacts"
+        # D'ou a-t-on ouvert l'app/jeu courant ? None = depuis le home racine
+        # (le retour revient au home) ; "games" = depuis le dossier Jeux (le
+        # retour revient DANS le dossier, facon iOS).
+        self._app_origin = None
+        # APP_ID -> classe de jeu, pour resoudre sig_open_app du dossier Jeux.
+        # Rempli dans _build_phone_home depuis le registre PHONE_GAMES.
+        self._games_by_id = {}
+        self._phone_services = None   # PhoneServices, construit dans _build_screen
+        self._photo_window = None     # CameraWindow (cas special, fenetre separee)
+        self._photo_viewer = None     # PhotoViewerWindow (photo en grand, moniteur)
 
         self._build_screen()
 
@@ -8954,14 +9496,716 @@ class PhoneOverlayWindow(QWidget):
         self._page_in_call  = self._build_screen_in_call()
         self._page_convo    = self._build_screen_conversation()
         self._page_settings = self._build_screen_settings()
+        self._page_shots    = self._build_screen_screenshots()
         self._stack.addWidget(self._page_contacts)   # idx 0
         self._stack.addWidget(self._page_outgoing)   # idx 1
         self._stack.addWidget(self._page_incoming)   # idx 2
         self._stack.addWidget(self._page_in_call)    # idx 3
         self._stack.addWidget(self._page_convo)      # idx 4
         self._stack.addWidget(self._page_settings)   # idx 5
-        # Demarrage : ecran Contacts.
+        self._stack.addWidget(self._page_shots)      # idx 6
+
+        # [v0.3] Ecran d'accueil (home) : grille d'apps sur fond d'ecran.
+        # Ajoute APRES les ecrans natifs (le switch se fait par widget, donc
+        # l'ordre d'index ne compte pas). Devient l'ecran par defaut.
+        self._build_phone_home()
+        if self._page_home is not None:
+            self._stack.setCurrentWidget(self._page_home)
+        else:
+            # Repli : modules phone_apps absents -> comportement v0.2
+            # (demarrage direct sur Contacts).
+            self._stack.setCurrentWidget(self._page_contacts)
+
+    # ------------------------------------------------------------------
+    # [v0.3] Home (grille d'apps) + lazy-load + cycle de vie des apps
+    # ------------------------------------------------------------------
+    def _build_phone_home(self):
+        """Construit l'ecran d'accueil + le bundle de services injecte aux
+        apps. Tolerant : si les modules phone_apps / registre sont absents,
+        laisse _page_home a None (repli v0.2, demarrage sur Contacts)."""
+        try:
+            from circusvoip_phone_apps import (
+                PhoneHome, HomeEntry, PhoneServices, build_app_entries,
+            )
+            from circusvoip_phone_registry import PHONE_APPS
+            try:
+                from circusvoip_phone_registry import (
+                    PHOTOS_APP, SETTINGS_APP,
+                )
+            except Exception:
+                PHOTOS_APP = SETTINGS_APP = None
+            try:
+                from circusvoip_phone_registry import PHONE_GAMES
+            except Exception:
+                PHONE_GAMES = []
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try: _core._dbg_log(f"[PHONE HOME] modules absents : {e}")
+                except Exception: pass
+            self._page_home = None
+            return
+
+        # Bundle de services : decouple les apps de MainWindow. photo_of est
+        # une lambda (resolution differee : le provider peut etre injecte
+        # APRES la construction du home).
+        feed = getattr(self._mw, "_gamelog_feed", None)
+        self._phone_services = PhoneServices(
+            log=getattr(self._mw, "_on_log", None),
+            send_ws=(_core._ws_send_safe if _CORE_AVAILABLE else None),
+            gamelog=feed,
+            photo_of=(lambda p: self._photo_provider(p)
+                      if self._photo_provider else None),
+        )
+        # Pseudo local pousse APRES construction (setattr), pour rester
+        # compatible avec un circusvoip_phone_apps.py qui n'aurait pas encore
+        # le champ my_name (evite une TypeError qui casserait tout le tel).
+        try:
+            self._phone_services.my_name = (state.my_name if _CORE_AVAILABLE
+                                            else None)
+        except Exception:
+            pass
+        # Fournisseur de position live (OCR) pour les apps a proximite
+        # physique (ex. tables de billard). Callable -> dict {zone,x,y,z}.
+        try:
+            self._phone_services.pos_provider = (
+                (lambda: state.my_pos) if _CORE_AVAILABLE else None)
+        except Exception:
+            pass
+        # Hook d'affichage d'une photo EN GRAND sur l'ecran de jeu (fenetre
+        # separee), fourni a la galerie Photos. setattr defensif (compat avec
+        # un circusvoip_phone_apps.py sans le champ view_photo).
+        try:
+            self._phone_services.view_photo = self._open_photo_viewer
+        except Exception:
+            pass
+
+        try:
+            self._games_by_id = {
+                getattr(C, "APP_ID", ""): C for C in PHONE_GAMES
+            }
+        except Exception:
+            self._games_by_id = {}
+
+        # 2 icones ecrans natifs : Appels et Messagerie pointent sur l'ecran
+        # contacts unifie, avec l'action D-pad par defaut pre-reglee.
+        entries = [
+            HomeEntry("calls", "Appels", "\u260E",
+                      lambda: self._open_native_contacts(action=0)),
+            HomeEntry("msg", "Messagerie", "\u2709",
+                      lambda: self._open_native_contacts(action=1)),
+        ]
+        # Apps v0.3 (lazy-load via la fabrique _launch_app).
+        entries += build_app_entries(
+            PHONE_APPS, lambda C: (lambda: self._launch_app(C))
+        )
+        # Camera : cas special (fenetre separee couchee, hors stack/registre).
+        entries.append(HomeEntry("photo", "Caméra", "\U0001F4F7",
+                                 lambda: self._launch_photo()))
+        # Photos : galerie des cliches (app normale du stack). On lit l'icone
+        # (polaroids) et le libelle DEPUIS la classe, pas en dur.
+        if PHOTOS_APP is not None:
+            entries.append(HomeEntry(
+                PHOTOS_APP.APP_ID, PHOTOS_APP.APP_NAME, PHOTOS_APP.APP_ICON,
+                (lambda C: (lambda: self._launch_app(C)))(PHOTOS_APP)))
+        # Parametres : TOUJOURS en dernier.
+        if SETTINGS_APP is not None:
+            entries.append(HomeEntry(
+                SETTINGS_APP.APP_ID, SETTINGS_APP.APP_NAME,
+                SETTINGS_APP.APP_ICON,
+                (lambda C: (lambda: self._launch_app(C)))(SETTINGS_APP)))
+
+        self._page_home = PhoneHome(
+            self._screen_w, self._screen_h, self._screen_rad, entries,
+            self._load_phone_wallpaper(),
+        )
+        self._stack.addWidget(self._page_home)
+
+    def _default_phone_wallpaper_path(self):
+        """Chemin du fond d'ecran PAR DEFAUT (image embarquee), ou None.
+        'hugolisoir.png' est cherchee D'ABORD dans le dossier des fonds
+        (circusvoip_phone_wallpapers/), puis a la racine du client (repli
+        historique). Sinon le home retombe sur son degrade genere."""
+        try:
+            for p in (_BASE_DIR / "circusvoip_phone_wallpapers" / "hugolisoir.png",
+                      _BASE_DIR / "hugolisoir.png"):
+                if p.exists():
+                    return str(p)
+        except Exception:
+            pass
+        return None
+
+    def _default_phone_wallpaper(self):
+        """QPixmap du fond par defaut (hugolisoir.png) ou None (-> degrade)."""
+        path = self._default_phone_wallpaper_path()
+        if path:
+            try:
+                pm = _load_oriented_pixmap(path)
+                if not pm.isNull():
+                    return pm
+            except Exception:
+                pass
+        return None
+
+    def _load_phone_wallpaper(self):
+        """Charge le fond d'ecran : clé config 'phone_wallpaper' si definie,
+        sinon le fond PAR DEFAUT (hugolisoir.png), sinon None (degrade du
+        home). Best-effort."""
+        try:
+            cfg = _core._load_client_cfg() if _CORE_AVAILABLE else {}
+            path = (cfg or {}).get("phone_wallpaper")
+            if path and Path(path).exists():
+                pm = _load_oriented_pixmap(path)
+                if not pm.isNull():
+                    return pm
+        except Exception:
+            pass
+        return self._default_phone_wallpaper()
+
+    def _phone_wallpaper_dir(self):
+        """Dossier des fonds d'ecran utilisateur (cree au besoin)."""
+        d = _BASE_DIR / "circusvoip_phone_wallpapers"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return d
+
+    def _choose_phone_wallpaper(self):
+        """[v0.3] Tuile « + » : importe une image perso. On la COPIE dans le
+        dossier des fonds (pour qu'elle devienne une tuile permanente), on
+        l'applique, et on demande a l'app Parametres de rescanner + cocher."""
+        from PySide6.QtWidgets import QFileDialog
+        try:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Ajouter un fond d'écran", "",
+                "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
+        except Exception:
+            return
+        if not path:
+            return
+        pm = _load_oriented_pixmap(path)
+        if pm.isNull():
+            return
+        dest = path
+        try:
+            import shutil
+            wdir = self._phone_wallpaper_dir()
+            src = Path(path)
+            cand = wdir / src.name
+            n = 1
+            while cand.exists() and str(cand) != str(src):
+                cand = wdir / (src.stem + f"_{n}" + src.suffix)
+                n += 1
+            if str(cand) != str(src):
+                shutil.copyfile(path, cand)
+            dest = str(cand)
+        except Exception:
+            dest = path
+        self._store_and_apply_wallpaper(pm, key=dest, stored_path=dest)
+        # Rescanner la grille de l'app Parametres + cocher le nouveau fond.
+        try:
+            app = self._current_app
+            if app is not None and hasattr(app, "rescan"):
+                app.rescan(select_key=dest)
+        except Exception:
+            pass
+
+    def _apply_phone_wallpaper(self, pixmap, key="", path=""):
+        """[v0.3] Applique un fond choisi dans l'app Parametres.
+          - path != "" : image fichier -> on pointe directement dessus.
+          - path == "" : fond propose genere -> on l'enregistre en PNG.
+        'key' identifie le fond (nom de preset ou chemin) pour la coche."""
+        if pixmap is None:
+            return
+        try:
+            if pixmap.isNull():
+                return
+        except Exception:
+            return
+        stored = path
+        if not stored:
+            try:
+                dest = _BASE_DIR / "circusvoip_phone_wallpaper.png"
+                if pixmap.save(str(dest), "PNG"):
+                    stored = str(dest)
+            except Exception:
+                stored = None
+        if not stored:
+            return
+        self._store_and_apply_wallpaper(pixmap, key=key, stored_path=stored)
+
+    def _reset_phone_wallpaper(self):
+        """[v0.3] Tuile « Défaut » : retire le fond configure -> le home
+        revient a son degrade par defaut."""
+        try:
+            if _CORE_AVAILABLE:
+                cfg = _core._load_client_cfg() or {}
+                cfg.pop("phone_wallpaper", None)
+                cfg.pop("phone_wallpaper_key", None)
+                _core._save_client_cfg(cfg)
+        except Exception:
+            pass
+        try:
+            if self._page_home is not None:
+                self._page_home.set_wallpaper(self._default_phone_wallpaper())
+                self._page_home.update()
+        except Exception:
+            pass
+        self._propagate_wallpaper(self._default_phone_wallpaper())
+
+    def _store_and_apply_wallpaper(self, pixmap, key="", stored_path=""):
+        """Memorise le fond (chemin + cle pour la coche) et l'applique au home."""
+        try:
+            if _CORE_AVAILABLE and stored_path:
+                cfg = _core._load_client_cfg() or {}
+                cfg["phone_wallpaper"] = stored_path
+                cfg["phone_wallpaper_key"] = key or stored_path
+                _core._save_client_cfg(cfg)
+        except Exception:
+            pass
+        try:
+            if self._page_home is not None and pixmap is not None:
+                self._page_home.set_wallpaper(pixmap)
+                self._page_home.update()
+        except Exception:
+            pass
+        self._propagate_wallpaper(pixmap)
+
+    def _propagate_wallpaper(self, pixmap):
+        """Applique le fond aux apps qui hebergent leur propre grille/fond
+        (ex. dossier Jeux), pour que le changement soit visible partout, pas
+        seulement sur l'accueil."""
+        try:
+            for inst in self._app_cache.values():
+                fn = getattr(inst, "set_wallpaper", None)
+                if callable(fn):
+                    try:
+                        fn(pixmap)
+                        inst.update()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _open_native_contacts(self, action: int = 0):
+        """Ouvre l'ecran contacts depuis le home.
+          action 0 = icone Appels    -> mode "call" + onglets Menu/Historique
+          action 1 = icone Messagerie -> mode "message" (ligne -> conversation)."""
+        self._current_app = None
+        is_msg = (action == 1)
+        self._contacts_mode = "message" if is_msg else "call"
+        self._nav_action = 0
+        self._nav_index = 0
+        try:
+            self._contacts_title.setText("Messages" if is_msg else "Appels")
+        except Exception:
+            pass
+        # Barre d'onglets uniquement en mode Appels.
+        self._appels_tabbar.setVisible(not is_msg)
+        if is_msg:
+            self._history_scroll.setVisible(False)
+            self._lbl_history_empty.setVisible(False)
+            self._rebuild_contacts()
+        else:
+            self._appels_tab = "menu"
+            self._rebuild_contacts()
+            self._set_appels_tab("menu")
         self._stack.setCurrentWidget(self._page_contacts)
+        try:
+            self._apply_nav_highlight()
+        except Exception:
+            pass
+
+    def _rebuild_contacts(self):
+        """Reconstruit la liste des contacts avec les derniers arguments connus
+        (utilise quand on bascule Appels <-> Messagerie sans nouvelle donnee)."""
+        args = self._last_contacts_args
+        if not args:
+            return
+        try:
+            self.refresh_contacts(**args)
+        except Exception:
+            pass
+
+    def _set_appels_tab(self, tab: str):
+        """Bascule l'onglet Appels (Menu / Historique). On garde TOUJOURS une
+        zone scrollable visible (stretch=1) pour que la barre d'onglets reste
+        en haut (sinon le layout se recentre)."""
+        self._appels_tab = "historique" if tab == "historique" else "menu"
+        is_hist = (self._appels_tab == "historique")
+        self._contacts_scroll.setVisible(not is_hist)
+        self._history_scroll.setVisible(is_hist)
+        self._lbl_history_empty.setVisible(False)   # message gere DANS le scroll
+        if is_hist:
+            self._lbl_empty.setVisible(False)
+            self._rebuild_call_history()
+            self._nav_rows = list(self._history_rows)
+        else:
+            self._rebuild_contacts()      # repose _nav_rows = contacts
+        self._nav_index = 0
+        self._update_tab_styles()
+        try:
+            self._apply_nav_highlight()
+        except Exception:
+            pass
+
+    def _update_tab_styles(self):
+        for btn, key in ((self._tab_menu_btn, "menu"),
+                         (self._tab_hist_btn, "historique")):
+            active = (self._appels_tab == key)
+            color = _PHONE_DOT_ONLINE if active else "#9aa0a6"
+            border = (f"border-bottom:2px solid {_PHONE_DOT_ONLINE};"
+                      if active else "border-bottom:2px solid transparent;")
+            btn.setStyleSheet(
+                "QPushButton { border:none; padding:5px 0; font-size:10pt; "
+                f"font-weight:700; background:transparent; color:{color}; "
+                f"{border} }}")
+
+    def refresh_call_history(self, history):
+        """Recoit l'historique d'appels de MainWindow ; met a jour le cache et
+        rafraichit l'onglet Historique s'il est affiche."""
+        self._call_history_cache = list(history or [])
+        if self._contacts_mode == "call" and self._appels_tab == "historique":
+            self._rebuild_call_history()
+            self._history_scroll.setVisible(True)
+            self._lbl_history_empty.setVisible(False)
+            self._nav_rows = list(self._history_rows)
+            if self._nav_rows:
+                self._nav_index = max(
+                    0, min(self._nav_index, len(self._nav_rows) - 1))
+            try:
+                self._apply_nav_highlight()
+            except Exception:
+                pass
+
+    def _rebuild_call_history(self):
+        """(Re)construit les lignes de l'historique depuis le cache (plus
+        recent en haut)."""
+        while self._history_layout.count() > 1:
+            item = self._history_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        rows = []
+        for e in reversed(self._call_history_cache[-50:]):
+            if not isinstance(e, dict):
+                continue
+            row = _CallHistoryRow(
+                e.get("peer", ""), e.get("dir", "out"),
+                e.get("outcome", ""), e.get("ts", 0.0), self._row_h)
+            row.sig_call.connect(self.sig_call)
+            self._history_layout.insertWidget(len(rows), row)
+            rows.append(row)
+        self._history_rows = rows
+        if not rows:
+            # Liste vide : message centre DANS la zone scrollable (garde la
+            # zone visible -> barre d'onglets en haut).
+            lbl = QLabel("Aucun appel\nrécent.")
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setStyleSheet(
+                "color:#9aa0a6; font-size:9pt; background:transparent; "
+                "padding-top:24px;")
+            self._history_layout.insertWidget(0, lbl)
+
+    def _launch_app(self, AppClass):
+        """Lance une app : instancie en lazy au 1er appel, l'ajoute au stack,
+        l'affiche, appelle on_show. Pour un jeu (CAPTURES_KEYBOARD), force le
+        premier plan Windows + focus pour que les frappes (fleches/WASD/P/C)
+        arrivent a l'app et non a SC (meme mecanisme que le champ conversation)."""
+        # Toute ouverture d'app via le home repart d'une origine "neutre" : le
+        # retour ira au home. Seul _open_game_from_folder repositionne ensuite
+        # _app_origin = "games" pour qu'un jeu lance DEPUIS le dossier y revienne.
+        # (Sans ce reset, une valeur "games" residuelle renvoyait par erreur au
+        # dossier Jeux en quittant une autre app comme les Reglages.)
+        self._app_origin = None
+        try:
+            inst = self._app_cache.get(AppClass.APP_ID)
+            if inst is None:
+                inst = AppClass(self._screen_w, self._screen_h,
+                                self._screen_rad, self._phone_services, self)
+                self._app_cache[AppClass.APP_ID] = inst
+                self._stack.addWidget(inst)
+                # Si l'app heberge son propre fond (ex. dossier Jeux), on lui
+                # pousse le fond courant des sa creation (sinon elle afficherait
+                # le fond par defaut jusqu'au prochain changement).
+                _swp = getattr(inst, "set_wallpaper", None)
+                if callable(_swp):
+                    try:
+                        _swp(self._load_phone_wallpaper())
+                    except Exception:
+                        pass
+                # Une app peut demander a revenir au home (ex. "Quitter" d'un
+                # menu de jeu). Connexion une seule fois, a la creation.
+                try:
+                    inst.sig_request_home.connect(self._go_home)
+                except Exception:
+                    pass
+                # App Parametres : delegue ses actions a l'overlay.
+                if hasattr(inst, "sig_open_profile"):
+                    try:
+                        inst.sig_open_profile.connect(
+                            self._open_profile_settings_from_app)
+                    except Exception:
+                        pass
+                if hasattr(inst, "sig_open_wallpaper"):
+                    try:
+                        inst.sig_open_wallpaper.connect(self._choose_phone_wallpaper)
+                    except Exception:
+                        pass
+                if hasattr(inst, "sig_apply_wallpaper"):
+                    try:
+                        inst.sig_apply_wallpaper.connect(self._apply_phone_wallpaper)
+                    except Exception:
+                        pass
+                if hasattr(inst, "sig_reset_wallpaper"):
+                    try:
+                        inst.sig_reset_wallpaper.connect(self._reset_phone_wallpaper)
+                    except Exception:
+                        pass
+                # Dossier Jeux : ouvre un jeu (sig_open_app) + recoit la liste
+                # des jeux a afficher (set_games) et le fond courant.
+                if hasattr(inst, "sig_open_app"):
+                    try:
+                        inst.sig_open_app.connect(self._open_game_from_folder)
+                    except Exception:
+                        pass
+                if hasattr(inst, "set_games"):
+                    try:
+                        inst.set_games(list(self._games_by_id.values()))
+                    except Exception:
+                        pass
+                    # Rendu continu avec le home : meme fond d'ecran.
+                    try:
+                        inst.set_wallpaper(self._load_phone_wallpaper())
+                    except Exception:
+                        pass
+                # App Parametres : dossier des fonds + fond actuellement coche.
+                if hasattr(inst, "set_wallpaper_dir"):
+                    try:
+                        inst.set_wallpaper_dir(str(self._phone_wallpaper_dir()))
+                    except Exception:
+                        pass
+                if hasattr(inst, "set_default_preview"):
+                    try:
+                        inst.set_default_preview(
+                            self._default_phone_wallpaper_path())
+                    except Exception:
+                        pass
+                if hasattr(inst, "set_selected_key"):
+                    try:
+                        cfg = _core._load_client_cfg() if _CORE_AVAILABLE else {}
+                        inst.set_selected_key((cfg or {}).get("phone_wallpaper_key", ""))
+                    except Exception:
+                        pass
+            self._current_app = inst
+            self._stack.setCurrentWidget(inst)
+            # Rafraichit le pseudo local dans les services (au cas ou ils
+            # auraient ete construits avant la connexion au serveur).
+            try:
+                if self._phone_services is not None and _CORE_AVAILABLE:
+                    self._phone_services.my_name = state.my_name
+            except Exception:
+                pass
+            if getattr(AppClass, "CAPTURES_KEYBOARD", False):
+                # Plus de vol de premier plan : le jeu recoit ses touches via
+                # le listener global (evenements synthetiques, cf. _on_game_key)
+                # et ses touches sont supprimees cote OS. SC garde le focus
+                # -> vrai overlay, on reste EN JEU. Rien a forcer ici.
+                pass
+            inst.on_show()
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try: _core._dbg_log(f"[PHONE APP] launch KO : {e}")
+                except Exception: pass
+
+    def _arm_game_confirm_later(self, app, delay_ms: int = 300):
+        """Re-arme la garde anti-fuite (_confirm_armed) d'un jeu apres un
+        court delai. A l'ouverture via Entree, l'overlay vole le premier plan
+        a SC ; le RELACHEMENT de cette Entree est alors souvent delivre a SC
+        (qui avait encore le focus a cet instant) et n'atteint pas le jeu, si
+        bien que son keyReleaseEvent ne re-arme jamais la garde -> Entree
+        morte dans le menu. Ce timer garantit le re-armement independamment du
+        focus. L'Entree d'OUVERTURE, elle, a deja ete consommee dans les
+        millisecondes suivant le lancement (avant ce delai), donc elle reste
+        ignoree comme voulu."""
+        try:
+            QTimer.singleShot(
+                delay_ms,
+                lambda a=app: setattr(a, "_confirm_armed", True),
+            )
+        except Exception:
+            pass
+
+    def _open_photo_viewer(self, path):
+        """Affiche une photo EN GRAND sur l'ecran de jeu (fenetre separee,
+        sans bordure ni fond, 80% de la hauteur, orientation d'origine). Le
+        telephone reste visible (la galerie derriere). Retour arriere ferme
+        (route par le listener clavier global -> _close_photo_viewer)."""
+        try:
+            from circusvoip_phone_camera import PhotoViewerWindow
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try: _core._dbg_log(f"[PHONE VIEWER] module absent : {e}")
+                except Exception: pass
+            return
+        try:
+            # Fermer une eventuelle photo deja ouverte avant d'en montrer une.
+            if self._photo_viewer is not None:
+                try: self._photo_viewer.close()
+                except Exception: pass
+                self._photo_viewer = None
+            win = PhotoViewerWindow(path)
+            win._on_closed = self._on_photo_viewer_closed
+            self._photo_viewer = win
+            # Fenetre PASSIVE : on la montre sans voler le focus a SC.
+            win.show()
+            win.raise_()
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try: _core._dbg_log(f"[PHONE VIEWER] open KO : {e}")
+                except Exception: pass
+
+    def _is_photo_viewer_active(self):
+        w = self._photo_viewer
+        try:
+            return w is not None and w.isVisible()
+        except Exception:
+            return False
+
+    def _close_photo_viewer(self):
+        w = self._photo_viewer
+        if w is None:
+            return
+        try:
+            w.close_viewer()
+        except Exception:
+            try: w.close()
+            except Exception: pass
+
+    def _on_photo_viewer_closed(self):
+        self._photo_viewer = None
+
+    def _launch_photo(self):
+        """[v0.3] Lance la camera (fenetre separee couchee a viseur evide,
+        hors stack) et masque le telephone le temps de la prise de vue. La
+        camera gere sa propre fermeture (Echap) ; on rouvre le telephone au
+        raccourci habituel."""
+        try:
+            from circusvoip_phone_camera import CameraWindow
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try: _core._dbg_log(f"[PHONE PHOTO] module absent : {e}")
+                except Exception: pass
+            return
+        try:
+            if self._photo_window is None:
+                self._photo_window = CameraWindow(self._phone_services)
+            # A la fermeture de la camera : reafficher le telephone.
+            self._photo_window._on_closed = self._reshow_after_camera
+            # Fenetre d'armement : l'Entree qui OUVRE la camera (maintenue /
+            # auto-repetee) ne doit pas declencher de photo.
+            self._camera_arm_ts = time.monotonic()
+            # Masquer le CHASSIS du telephone SANS fermer l'overlay : le listener
+            # clavier global doit RESTER ACTIF pour router les touches camera
+            # (hide_animated() l'arreterait -> raccourcis morts). On ne touche
+            # donc ni a _visible_state ni au listener : simple hide() de la
+            # fenetre.
+            if self._current_app is not None:
+                try:
+                    self._current_app.on_hide()
+                except Exception:
+                    pass
+            self.hide()
+            # Camera : fenetre PASSIVE (ne vole pas le focus a SC). On la montre
+            # et on la remonte, sans l'activer. Les touches viennent du listener.
+            self._photo_window.show()
+            self._photo_window.raise_()
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try: _core._dbg_log(f"[PHONE PHOTO] launch KO : {e}")
+                except Exception: pass
+
+    def _reshow_after_camera(self):
+        """Reaffiche le telephone quand la camera se ferme. Le listener clavier
+        global n'ayant jamais ete arrete, il n'y a rien a redemarrer."""
+        try:
+            self.show()
+            self.raise_()
+        except Exception:
+            pass
+
+    def _is_camera_active(self) -> bool:
+        """True quand la fenetre camera est ouverte (thread listener). Sert a
+        router R/Entree/Espace/Retour vers la camera plutot que vers SC/jeu."""
+        try:
+            return (self._photo_window is not None
+                    and self._photo_window.isVisible())
+        except Exception:
+            return False
+
+    def _on_camera_key(self, norm: str):
+        """Touche camera recue via le listener global (thread -> main).
+          r            -> pivoter
+          enter/space  -> prendre la photo (sauf pendant la fenetre d'armement)
+          esc          -> fermer (Retour arriere / Echap)."""
+        win = self._photo_window
+        if win is None or not win.isVisible():
+            return
+        try:
+            if norm == "r":
+                win._rotate()
+            elif norm == "enter":
+                # Ignore la touche d'ouverture (maintien / auto-repeat) pendant
+                # ~0.5 s, puis chaque pression prend une photo.
+                if time.monotonic() - getattr(self, "_camera_arm_ts", 0.0) < 0.5:
+                    return
+                win.take_photo()
+            elif norm == "esc":
+                win.close()
+        except Exception:
+            pass
+
+    def _open_game_from_folder(self, app_id):
+        """Ouvre un jeu demande par le dossier Jeux (sig_open_app). Resout
+        l'APP_ID en classe via le registre, lance le jeu, puis memorise que
+        l'origine est le dossier (le retour du jeu y reviendra)."""
+        Cls = self._games_by_id.get(app_id)
+        if Cls is None:
+            return
+        self._launch_app(Cls)
+        # _launch_app a pu reinitialiser le contexte ; on marque l'origine
+        # APRES, pour que le retour (_go_home) revienne dans le dossier.
+        self._app_origin = "games"
+
+    def _go_home(self):
+        """Retour a l'accueil : met l'app courante en pause (on_hide). Si on
+        venait du dossier Jeux ("games"), on revient DANS le dossier ; sinon
+        on reaffiche le home du telephone."""
+        if self._current_app is not None:
+            try:
+                self._current_app.on_hide()
+            except Exception:
+                pass
+            self._current_app = None
+        # Retour facon iOS : depuis un jeu ouvert via le dossier, revenir au
+        # dossier Jeux plutot qu'au home. (Mettre False ci-dessous pour que
+        # le retour aille TOUJOURS au home.)
+        if self._app_origin == "games":
+            self._app_origin = None
+            folder = self._app_cache.get("games")
+            if folder is not None:
+                self._current_app = folder
+                self._stack.setCurrentWidget(folder)
+                try:
+                    folder.on_show()
+                except Exception:
+                    pass
+                return
+        self._app_origin = None
+        if self._page_home is not None:
+            self._stack.setCurrentWidget(self._page_home)
+        else:
+            self._stack.setCurrentWidget(self._page_contacts)
 
     # ------------------------------------------------------------------
     # Construction des 4 ecrans
@@ -8992,6 +10236,7 @@ class PhoneOverlayWindow(QWidget):
         h.addWidget(spacer_left)
         # Titre centre
         title = QLabel("Contacts")
+        self._contacts_title = title
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet(
             f"color:{_PHONE_SCREEN_TXT}; font-size:12pt; font-weight:700; "
@@ -9000,9 +10245,28 @@ class PhoneOverlayWindow(QWidget):
         h.addWidget(title, stretch=1)
         # Engrenage cliquable (D5 : ouvre la popup Reglages profil)
         gear = _PhoneIconLabel("gear", gear_size, True, header)
-        gear.sig_clicked.connect(self.sig_settings_clicked.emit)
+        gear.sig_clicked.connect(self._open_profile_settings_from_contacts)
         h.addWidget(gear)
         v.addWidget(header)
+
+        # Barre d'onglets (visible uniquement en mode Appels) : Menu | Historique.
+        self._appels_tabbar = QWidget()
+        self._appels_tabbar.setStyleSheet("background:transparent;")
+        tb = QHBoxLayout(self._appels_tabbar)
+        tb.setContentsMargins(10, 0, 10, 4)
+        tb.setSpacing(6)
+        self._tab_menu_btn = QPushButton("Menu")
+        self._tab_hist_btn = QPushButton("Historique")
+        for b in (self._tab_menu_btn, self._tab_hist_btn):
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFlat(True)
+            tb.addWidget(b, stretch=1)
+        self._tab_menu_btn.clicked.connect(
+            lambda: self._set_appels_tab("menu"))
+        self._tab_hist_btn.clicked.connect(
+            lambda: self._set_appels_tab("historique"))
+        self._appels_tabbar.setVisible(False)
+        v.addWidget(self._appels_tabbar)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
@@ -9030,6 +10294,34 @@ class PhoneOverlayWindow(QWidget):
         self._contacts_layout.addStretch(1)
         self._contacts_scroll.setWidget(self._contacts_host)
         v.addWidget(self._contacts_scroll, stretch=1)
+
+        # Liste de l'historique des appels (onglet Historique) : meme style,
+        # cachee par defaut (affichee quand on bascule sur l'onglet).
+        self._history_scroll = QScrollArea()
+        self._history_scroll.setWidgetResizable(True)
+        self._history_scroll.setFrameShape(QFrame.NoFrame)
+        self._history_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._history_scroll.setStyleSheet(
+            "QScrollArea { background:transparent; }"
+            "QScrollBar:vertical { width:6px; background:transparent; }"
+            "QScrollBar::handle:vertical { background:#d0d3d7; "
+            "  border-radius:3px; }"
+        )
+        self._history_host = QWidget()
+        self._history_host.setStyleSheet("background:transparent;")
+        self._history_layout = QVBoxLayout(self._history_host)
+        self._history_layout.setContentsMargins(0, 4, 0, 4)
+        self._history_layout.setSpacing(2)
+        self._history_layout.addStretch(1)
+        self._history_scroll.setWidget(self._history_host)
+        self._history_scroll.setVisible(False)
+        v.addWidget(self._history_scroll, stretch=1)
+        self._lbl_history_empty = QLabel("Aucun appel\nrécent.")
+        self._lbl_history_empty.setAlignment(Qt.AlignCenter)
+        self._lbl_history_empty.setStyleSheet(
+            "color:#9aa0a6; font-size:9pt; background:transparent;")
+        self._lbl_history_empty.setVisible(False)
+        v.addWidget(self._lbl_history_empty)
 
         # Etat "liste vide" affiche quand l'annuaire n'a aucun contact.
         self._lbl_empty = QLabel(
@@ -9396,6 +10688,11 @@ class PhoneOverlayWindow(QWidget):
         self._convo_input.sig_submit.connect(self._on_convo_submit)
         self._convo_input.sig_changed.connect(self._on_convo_draft_changed)
         bottom.addWidget(self._convo_input, stretch=1)
+        # Bouton piece jointe (trombone) : ouvre la page des screenshots.
+        clip_sz = max(28, int(self._row_h * 0.85))
+        self._btn_clip = _PhoneIconLabel("clip", clip_sz, True)
+        self._btn_clip.sig_clicked.connect(self._open_screenshot_picker)
+        bottom.addWidget(self._btn_clip, alignment=Qt.AlignBottom)
         # Bouton envoyer (fleche).
         send_sz = max(28, int(self._row_h * 0.85))
         self._btn_send = _PhoneIconLabel("send", send_sz, True)
@@ -9458,13 +10755,175 @@ class PhoneOverlayWindow(QWidget):
         self._convo_should_scroll_to_bottom = True
         # Reinserer les bulles dans l'ordre. ts passe a la bulle pour
         # afficher le timestamp en bas (ajout 23/05/2026).
+        self._convo_bubbles = []          # pour la navigation D-pad
         for ts, body, is_me in messages_items:
-            bubble = _PhoneMessageBubble(body, is_me, self._screen_w, ts=ts)
+            bubble = _PhoneMessageBubble(body, is_me, self._screen_w, ts=ts,
+                                         screen_h=self._screen_h)
             self._convo_layout.addWidget(bubble)
+            self._convo_bubbles.append(bubble)
+        # Selection par defaut : le champ de saisie (juste apres les bulles).
+        self._convo_nav_index = len(self._convo_bubbles) + 1
+        try:
+            self._apply_convo_nav_highlight()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # [D5+] Ecran Reglages profil (page interne du telephone)
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    #  Page "Screenshots" : choisir une capture a envoyer dans la
+    #  conversation courante (ouverte par le trombone).
+    # ------------------------------------------------------------------
+    def _build_screen_screenshots(self) -> QWidget:
+        page = QWidget()
+        page.setStyleSheet("background:transparent;")
+        v = QVBoxLayout(page)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(4)
+
+        top = QHBoxLayout()
+        top.setSpacing(4)
+        back = _PhoneIconLabel("back", max(16, int(self._row_h * 0.7)), True)
+        back.sig_clicked.connect(self._close_screenshot_picker)
+        top.addWidget(back)
+        title = QLabel("Screenshots")
+        title.setStyleSheet(
+            f"color:{_PHONE_NAME_ONLINE}; font-size:11pt; font-weight:700; "
+            "background:transparent;")
+        title.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        top.addWidget(title, stretch=1)
+        v.addLayout(top)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color:#e3e5e8; background:#e3e5e8; max-height:1px;")
+        v.addWidget(sep)
+
+        self._shots_scroll = QScrollArea()
+        self._shots_scroll.setWidgetResizable(True)
+        self._shots_scroll.setFrameShape(QFrame.NoFrame)
+        self._shots_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._shots_scroll.setStyleSheet(
+            "QScrollArea { background:transparent; }"
+            "QScrollBar:vertical { width:6px; background:transparent; }"
+            "QScrollBar::handle:vertical { background:#d0d3d7; "
+            "  border-radius:3px; }")
+        self._shots_host = QWidget()
+        self._shots_host.setStyleSheet("background:transparent;")
+        self._shots_grid = QVBoxLayout(self._shots_host)
+        self._shots_grid.setContentsMargins(2, 4, 2, 4)
+        self._shots_grid.setSpacing(6)
+        self._shots_grid.addStretch(1)
+        self._shots_scroll.setWidget(self._shots_host)
+        v.addWidget(self._shots_scroll, stretch=1)
+
+        self._lbl_shots_empty = QLabel(
+            "Aucun screenshot.\nPrends une photo avec\nl'appareil photo !")
+        self._lbl_shots_empty.setAlignment(Qt.AlignCenter)
+        self._lbl_shots_empty.setStyleSheet(
+            "color:#9aa0a6; font-size:9pt; background:transparent;")
+        self._lbl_shots_empty.setVisible(False)
+        v.addWidget(self._lbl_shots_empty)
+        return page
+
+    def _screenshots_dir(self) -> str:
+        """Dossier des captures de l'appareil photo (meme regle que
+        circusvoip_phone_camera._photos_dir, sans dependre du module)."""
+        base = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(base, "screenshots")
+
+    def _open_screenshot_picker(self):
+        """Trombone : liste les captures (recentes d'abord) et affiche la
+        page de selection. Retour possible vers la conversation."""
+        self._populate_screenshots()
+        self._stack.setCurrentWidget(self._page_shots)
+
+    def _close_screenshot_picker(self):
+        self._stack.setCurrentWidget(self._page_convo)
+        try:
+            self._apply_convo_nav_highlight()
+        except Exception:
+            pass
+
+    def _populate_screenshots(self):
+        while self._shots_grid.count() > 1:
+            item = self._shots_grid.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        files = []
+        try:
+            d = self._screenshots_dir()
+            if os.path.isdir(d):
+                for fn in os.listdir(d):
+                    if fn.lower().endswith((".png", ".jpg", ".jpeg")):
+                        full = os.path.join(d, fn)
+                        try:
+                            files.append((os.path.getmtime(full), full))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        files.sort(reverse=True)          # plus recentes d'abord
+        files = files[:30]                # limite d'affichage
+        self._lbl_shots_empty.setVisible(not files)
+        idx = 0
+        rows = []
+        for _mt, full in files:
+            row = _ScreenshotRow(full, self._row_h * 2.2)
+            row.sig_pick.connect(self._on_screenshot_picked)
+            self._shots_grid.insertWidget(idx, row)
+            idx += 1
+            rows.append(row)
+        self._shots_rows = rows
+        self._shots_nav_index = 0
+        self._apply_shots_nav_highlight()
+
+    def _apply_shots_nav_highlight(self):
+        rows = getattr(self, "_shots_rows", [])
+        on_page = (self._stack.currentWidget() is self._page_shots)
+        for i, r in enumerate(rows):
+            try:
+                r.set_nav_highlight(on_page and i == self._shots_nav_index)
+            except Exception:
+                pass
+
+    def _nav_shots(self, direction: str):
+        """Navigation D-pad page screenshots : haut/bas = ligne, Entree =
+        choisir (envoie), Echap = retour conversation."""
+        rows = getattr(self, "_shots_rows", [])
+        if direction == "esc":
+            self._close_screenshot_picker()
+            return
+        if not rows:
+            return
+        if direction in ("up", "left"):
+            self._shots_nav_index = (self._shots_nav_index - 1) % len(rows)
+        elif direction in ("down", "right"):
+            self._shots_nav_index = (self._shots_nav_index + 1) % len(rows)
+        elif direction == "enter":
+            row = rows[self._shots_nav_index]
+            self._on_screenshot_picked(row.path())
+            return
+        self._apply_shots_nav_highlight()
+        try:
+            self._shots_scroll.ensureWidgetVisible(
+                rows[self._shots_nav_index], 0, 8)
+        except Exception:
+            pass
+
+    def _on_screenshot_picked(self, path: str):
+        """Une capture a ete choisie : on demande l'envoi a MainWindow (qui
+        gere le protocole image) puis on revient a la conversation."""
+        pseudo = self._convo_pseudo
+        self._close_screenshot_picker()
+        if pseudo and path:
+            try:
+                self.sig_send_image.emit(pseudo, path)
+            except Exception:
+                pass
+
     def _build_screen_settings(self) -> QWidget:
         """Ecran Reglages profil : preview ronde + zoom +/- + pad
         directionnel + boutons Choisir / Supprimer. Tous les widgets
@@ -9729,6 +11188,23 @@ class PhoneOverlayWindow(QWidget):
         self._apply_convo_nav_highlight()
         self._apply_nav_highlight()
 
+    def show_screen_calls(self):
+        """Affiche l'ecran APPELS (mode 'call' : onglets Menu/Historique).
+        Utilise au retour d'un appel, pour ne jamais retomber sur l'ancien
+        ecran 'full' (tel+lettre titre 'Contacts') quand l'utilisateur n'a pas
+        ouvert Appels lui-meme."""
+        self._open_native_contacts(0)
+
+    def show_screen_home(self):
+        """[v0.3] Bascule sur l'ecran d'accueil (home). Repli sur Contacts si
+        le home n'existe pas (modules phone_apps absents)."""
+        self._convo_in_field = False
+        self._current_app = None
+        if self._page_home is not None:
+            self._stack.setCurrentWidget(self._page_home)
+        else:
+            self._stack.setCurrentWidget(self._page_contacts)
+
     def show_screen_outgoing(self, peer: str):
         """Bascule sur l'ecran appel sortant. peer = nom de la cible."""
         self._lbl_outgoing_name.setText(peer or "")
@@ -9770,7 +11246,7 @@ class PhoneOverlayWindow(QWidget):
         self._stack.setCurrentWidget(self._page_convo)
         # Reset navigation D-pad : on demarre sur le champ texte (cible la
         # plus utile en arrivant), hors mode frappe. Surbrillance appliquee.
-        self._convo_nav_index = 1
+        self._convo_nav_index = len(self._convo_bubbles) + 1
         self._convo_in_field = False
         try:
             self._convo_input.clearFocus()
@@ -9785,6 +11261,33 @@ class PhoneOverlayWindow(QWidget):
         appeler refresh_settings_preview() juste apres pour peupler
         l'affichage avec la photo et le zoom courants."""
         self._stack.setCurrentWidget(self._page_settings)
+
+    def _open_profile_settings_from_contacts(self):
+        """Roue dentee de l'en-tete Contacts : ouvre les Reglages profil ;
+        le retour reviendra a Contacts."""
+        self._settings_origin = "contacts"
+        self.sig_settings_clicked.emit()
+
+    def _open_profile_settings_from_app(self):
+        """App Parametres -> 'Photo de profil' : ouvre le MEME ecran Reglages
+        profil (preview rafraichie via le flux existant), mais le retour
+        reviendra a l'app Parametres."""
+        self._settings_origin = "settings"
+        self.sig_settings_clicked.emit()
+
+    def show_screen_settings_app(self):
+        """Reaffiche l'app Parametres (retour depuis l'ecran photo de profil
+        ouvert depuis elle). Repli sur le home si l'app n'est pas en cache."""
+        inst = self._app_cache.get("settings")
+        if inst is not None:
+            self._current_app = inst
+            self._stack.setCurrentWidget(inst)
+            try:
+                inst.on_show()
+            except Exception:
+                pass
+        else:
+            self.show_screen_home()
 
     def update_shortcut_labels(self, accept_key: str = "", decline_key: str = "",
                                 mute_key: str = "", speaker_key: str = ""):
@@ -9857,6 +11360,13 @@ class PhoneOverlayWindow(QWidget):
         unread = set(unread_set or [])
         ts_map = last_msg_ts_map or {}
         contacts = (annuaire or {}).get("contacts", {})
+        # Memorise les derniers arguments pour pouvoir reconstruire la liste
+        # sans nouvelle donnee (ex. quand on bascule Appels <-> Messagerie).
+        self._last_contacts_args = dict(
+            annuaire=annuaire, online_names=online, my_name=my_name,
+            unread_set=unread, photo_provider=photo_provider,
+            last_msg_ts_map=ts_map,
+        )
 
         # Vider les lignes existantes (tout sauf le stretch final).
         while self._contacts_layout.count() > 1:
@@ -9887,12 +11397,16 @@ class PhoneOverlayWindow(QWidget):
         connected = _sort_group([n for n in names if n in online])
         disconnected = _sort_group([n for n in names if n not in online])
 
+        on_hist = (self._contacts_mode == "call"
+                   and self._appels_tab == "historique")
         if not connected and not disconnected:
-            self._contacts_scroll.setVisible(False)
-            self._lbl_empty.setVisible(True)
+            if not on_hist:
+                self._contacts_scroll.setVisible(False)
+                self._lbl_empty.setVisible(True)
             return
-        self._contacts_scroll.setVisible(True)
-        self._lbl_empty.setVisible(False)
+        if not on_hist:
+            self._contacts_scroll.setVisible(True)
+            self._lbl_empty.setVisible(False)
 
         def _photo(p):
             if photo_provider is None:
@@ -9902,12 +11416,13 @@ class PhoneOverlayWindow(QWidget):
             except Exception:
                 return None
 
+        mode = self._contacts_mode
         idx = 0
         nav_rows = []
         for pseudo in connected:
             row = _PhoneContactRow(
                 pseudo, True, self._row_h, unread=(pseudo in unread),
-                photo_bytes=_photo(pseudo),
+                photo_bytes=_photo(pseudo), mode=mode,
             )
             row.sig_call.connect(self.sig_call)
             row.sig_message.connect(self.sig_message)
@@ -9916,22 +11431,33 @@ class PhoneOverlayWindow(QWidget):
             nav_rows.append(row)
         for pseudo in disconnected:
             row = _PhoneContactRow(
-                pseudo, False, self._row_h,
-                photo_bytes=_photo(pseudo),
+                pseudo, False, self._row_h, unread=(pseudo in unread),
+                photo_bytes=_photo(pseudo), mode=mode,
             )
-            row.sig_forget.connect(self.sig_forget)
+            if mode == "message":
+                # Messagerie : la ligne (meme hors-ligne) ouvre la conversation
+                # et est navigable au D-pad.
+                row.sig_message.connect(self.sig_message)
+                nav_rows.append(row)
+            else:
+                row.sig_forget.connect(self.sig_forget)
             self._contacts_layout.insertWidget(idx, row)
             idx += 1
 
         # Reconstruire l'etat de navigation D-pad : seules les lignes
         # connectees (avec phone+letter) sont navigables. On clampe l'index
         # courant et on re-applique la surbrillance.
-        self._nav_rows = nav_rows
-        if not nav_rows:
-            self._nav_index = 0
-        else:
-            self._nav_index = max(0, min(self._nav_index, len(nav_rows) - 1))
-        self._nav_action = 0 if self._nav_action not in (0, 1) else self._nav_action
+        # Sur l'onglet Historique, la navigation porte sur les lignes
+        # d'historique : on ne remplace PAS _nav_rows par les contacts (mais on
+        # a quand meme reconstruit les lignes pour le retour sur l'onglet Menu).
+        if not on_hist:
+            self._nav_rows = nav_rows
+            if not nav_rows:
+                self._nav_index = 0
+            else:
+                self._nav_index = max(0, min(self._nav_index, len(nav_rows) - 1))
+            self._nav_action = (0 if self._nav_action not in (0, 1)
+                                else self._nav_action)
         self._apply_nav_highlight()
 
     # ------------------------------------------------------------------
@@ -9951,16 +11477,118 @@ class PhoneOverlayWindow(QWidget):
                 pass
 
     @Slot(str)
+    def _is_game_active(self) -> bool:
+        """True quand l'app courante est un jeu qui capture le clavier. Sert
+        au listener pour router les touches vers le jeu (event synthetique) et
+        les supprimer cote OS, SANS voler le premier plan (SC reste actif)."""
+        app = self._current_app
+        return app is not None and getattr(app, "CAPTURES_KEYBOARD", False)
+
+    # Correspondance touche normalisee -> (Qt.Key, texte) pour l'injection.
+    _GAME_KEY_QT = {
+        "up":    (Qt.Key_Up, ""),    "down":  (Qt.Key_Down, ""),
+        "left":  (Qt.Key_Left, ""),  "right": (Qt.Key_Right, ""),
+        "enter": (Qt.Key_Return, "\r"),
+        "p": (Qt.Key_P, "p"), "r": (Qt.Key_R, "r"),
+        "f": (Qt.Key_F, "f"), "t": (Qt.Key_T, "t"),
+        "v": (Qt.Key_V, "v"),
+    }
+
+    def _on_game_key(self, norm: str):
+        """Slot main-thread : injecte une touche de jeu dans l'app courante via
+        un evenement clavier synthetique (KeyPress + KeyRelease). Le jeu la
+        traite par son keyPressEvent habituel, sans que l'overlay ait le focus
+        clavier Windows -> SC garde le premier plan (vrai overlay)."""
+        app = self._current_app
+        if app is None or not getattr(app, "CAPTURES_KEYBOARD", False):
+            return
+        qt = self._GAME_KEY_QT.get(norm)
+        if qt is None:
+            return
+        keycode, text = qt
+        try:
+            from PySide6.QtGui import QKeyEvent
+            from PySide6.QtCore import QEvent
+            QApplication.postEvent(
+                app, QKeyEvent(QEvent.KeyPress, keycode, Qt.NoModifier, text))
+            QApplication.postEvent(
+                app, QKeyEvent(QEvent.KeyRelease, keycode, Qt.NoModifier, text))
+        except Exception:
+            pass
+
     def _on_nav_key(self, direction: str):
         """Slot main-thread : route une touche D-pad selon l'ecran courant.
         Ecran contacts -> _nav_contacts ; ecran conversation -> _nav_convo.
         Les autres ecrans ne sont pas navigables au clavier (scope actuel)."""
         try:
             cur = self._stack.currentWidget()
+            # [v0.3] Home : grille d'apps.
+            if self._page_home is not None and cur is self._page_home:
+                if direction != "esc":
+                    self._page_home.handle_nav(direction)
+                    # Si 'enter' vient de lancer un jeu capture-clavier, cette
+                    # meme Entree va fuiter dans son keyPressEvent (focus Qt)
+                    # et validerait son 1er bouton de menu : on desarme la
+                    # validation, qui se rearmera au relachement de la touche.
+                    if direction == "enter" and self._current_app is not None \
+                            and getattr(self._current_app,
+                                        "CAPTURES_KEYBOARD", False):
+                        try:
+                            self._current_app._confirm_armed = False
+                        except Exception:
+                            pass
+                        self._arm_game_confirm_later(self._current_app)
+                return
+            # [v0.3] App CircusPhone affichee.
+            if self._current_app is not None and cur is self._current_app:
+                if direction == "esc":
+                    # L'app peut consommer le retour (ex. revenir a son menu
+                    # interne) ; sinon on revient au home du telephone.
+                    consumed = False
+                    try:
+                        consumed = bool(self._current_app.handle_back())
+                    except Exception:
+                        consumed = False
+                    if not consumed:
+                        self._go_home()
+                    return
+                # Jeu (capture clavier brute) : ne PAS router le D-pad ; le
+                # jeu recoit ses touches via keyPressEvent natif (focus Qt).
+                if not getattr(self._current_app, "CAPTURES_KEYBOARD", False):
+                    prev = self._current_app
+                    try:
+                        self._current_app.handle_nav(direction)
+                    except Exception:
+                        pass
+                    # Cas dossier Jeux : 'enter' a pu lancer un jeu capture-
+                    # clavier (sig_open_app -> _open_game_from_folder). Comme
+                    # depuis le home, cette Entree va fuiter dans le menu du
+                    # jeu : on desarme sa validation (rearmee au relachement).
+                    if direction == "enter" \
+                            and self._current_app is not None \
+                            and self._current_app is not prev \
+                            and getattr(self._current_app,
+                                        "CAPTURES_KEYBOARD", False):
+                        try:
+                            self._current_app._confirm_armed = False
+                        except Exception:
+                            pass
+                        self._arm_game_confirm_later(self._current_app)
+                return
             if cur is self._page_contacts:
+                if direction == "esc":
+                    self._go_home()
+                    return
                 self._nav_contacts(direction)
             elif cur is self._page_convo:
                 self._nav_convo(direction)
+            elif cur is self._page_shots:
+                self._nav_shots(direction)
+            elif cur is self._page_settings:
+                # Ecran photo de profil : Echap = meme retour que la fleche
+                # (revient a l'origine : app Parametres ou Contacts).
+                if direction == "esc":
+                    self.sig_settings_back.emit()
         except Exception as e:
             if _CORE_AVAILABLE:
                 try: _core._dbg_log(f"[PHONE NAV] route KO : {e}")
@@ -9973,6 +11601,12 @@ class PhoneOverlayWindow(QWidget):
           enter    : declenche l'action sur la ligne courante
         Ignore si rien a naviguer."""
         try:
+            # Mode Appels : gauche/droite basculent l'onglet Menu/Historique
+            # (independamment du contenu de la liste courante).
+            if self._contacts_mode == "call" and direction in ("left", "right"):
+                self._set_appels_tab(
+                    "menu" if direction == "left" else "historique")
+                return
             n = len(self._nav_rows)
             if n == 0:
                 return
@@ -9982,17 +11616,13 @@ class PhoneOverlayWindow(QWidget):
             elif direction == "down":
                 self._nav_index = (self._nav_index + 1) % n
                 self._ensure_nav_visible()
-            elif direction == "left":
-                self._nav_action = 0   # Appeler
-            elif direction == "right":
-                self._nav_action = 1   # Message
             elif direction == "enter":
                 row = self._nav_rows[self._nav_index]
                 pseudo = row.pseudo()
-                if self._nav_action == 0:
-                    self.sig_call.emit(pseudo)
-                else:
-                    self.sig_message.emit(pseudo)
+                if self._contacts_mode == "message":
+                    self.sig_message.emit(pseudo)   # ouvre la conversation
+                else:                                # mode "call"
+                    self.sig_call.emit(pseudo)       # Menu/Historique -> appel
                 return  # l'action peut changer d'ecran : pas de re-highlight
             self._apply_nav_highlight()
         except Exception as e:
@@ -10001,8 +11631,8 @@ class PhoneOverlayWindow(QWidget):
                 except Exception: pass
 
     def _nav_convo(self, direction: str):
-        """Navigation D-pad ecran conversation. 3 cibles : Retour (0),
-        champ texte (1), Envoyer (2).
+        """Navigation D-pad ecran conversation. 4 cibles : Retour (0),
+        champ texte (1), Trombone/screenshots (2), Envoyer (3).
         Hors champ :
           left/up    : cible precedente
           right/down : cible suivante
@@ -10025,20 +11655,48 @@ class PhoneOverlayWindow(QWidget):
                     self._apply_convo_nav_highlight()
                 return
 
+            nb = len(getattr(self, "_convo_bubbles", []))
+            total = nb + 4      # bulles (0..nb-1) puis 4 actions (nb..nb+3)
             if direction in ("left", "up"):
-                self._convo_nav_index = (self._convo_nav_index - 1) % 3
+                self._convo_nav_index = (self._convo_nav_index - 1) % total
             elif direction in ("right", "down"):
-                self._convo_nav_index = (self._convo_nav_index + 1) % 3
+                self._convo_nav_index = (self._convo_nav_index + 1) % total
+            elif direction == "esc":
+                # Hors champ : Retour arriere quitte la conversation (comme
+                # sur toutes les autres pages).
+                self.sig_back_contacts.emit()
+                return
             elif direction == "enter":
                 idx = self._convo_nav_index
-                if idx == 0:
+                if idx < nb:
+                    # Bulle selectionnee : si c'est une image, l'ouvrir EN
+                    # GRAND sur l'ecran de jeu (meme visionneuse que la
+                    # galerie). Sinon (texte), rien.
+                    try:
+                        p = self._convo_bubbles[idx].image_path()
+                    except Exception:
+                        p = None
+                    if p:
+                        viewer = getattr(self, "_open_photo_viewer", None)
+                        if callable(viewer):
+                            try:
+                                viewer(p)
+                            except Exception:
+                                pass
+                    return
+                a = idx - nb        # 0=Retour, 1=champ, 2=Trombone, 3=Envoyer
+                if a == 0:
                     self.sig_back_contacts.emit()
                     return   # changement d'ecran
-                elif idx == 2:
+                elif a == 2:
+                    # Trombone : ouvrir la page des screenshots.
+                    self._open_screenshot_picker()
+                    return   # changement d'ecran
+                elif a == 3:
                     self._on_convo_submit()
                     # reste sur la conversation, le champ est vide : on
                     # garde la selection sur Envoyer.
-                elif idx == 1:
+                elif a == 1:
                     # Entrer dans le champ pour taper. La fenetre overlay a
                     # le flag Qt.Tool : un setFocus() seul ne suffit pas a
                     # lui donner le focus clavier (le champ ne s'active pas).
@@ -10062,20 +11720,35 @@ class PhoneOverlayWindow(QWidget):
                     except Exception:
                         pass
             elif direction == "esc":
-                # Hors champ, Echap : on revient aux contacts (raccourci
-                # pratique). Optionnel mais coherent.
+                # Hors champ, retour (Retour arriere) : on revient aux
+                # contacts (raccourci pratique). Optionnel mais coherent.
                 self.sig_back_contacts.emit()
                 return
             self._apply_convo_nav_highlight()
+            self._ensure_convo_nav_visible()
         except Exception as e:
             if _CORE_AVAILABLE:
                 try: _core._dbg_log(f"[PHONE NAV] convo KO : {e}")
                 except Exception: pass
 
-    def _win32_force_foreground(self):
-        """Force l'overlay a devenir la fenetre active Windows (focus clavier
-        systeme), afin que le champ texte recoive reellement les frappes
-        meme quand Star Citizen est au premier plan.
+    def _ensure_convo_nav_visible(self):
+        """Fait defiler la conversation pour garder la bulle selectionnee
+        visible (quand la selection est sur un message, pas sur une action)."""
+        try:
+            nb = len(getattr(self, "_convo_bubbles", []))
+            i = self._convo_nav_index
+            if 0 <= i < nb:
+                self._convo_scroll.ensureWidgetVisible(self._convo_bubbles[i],
+                                                       0, 12)
+        except Exception:
+            pass
+
+    def _win32_force_foreground(self, target=None):
+        """Force une fenetre a devenir la fenetre active Windows (focus clavier
+        systeme), afin qu'elle recoive reellement les frappes meme quand Star
+        Citizen est au premier plan. `target` = widget a mettre au premier plan
+        (defaut : l'overlay lui-meme ; pour la camera, on passe la fenetre
+        photo, qui est une fenetre separee).
 
         SetForegroundWindow seul echoue souvent sur Windows moderne a cause
         de la restriction anti-vol-de-focus : seul le thread du processus
@@ -10094,7 +11767,8 @@ class PhoneOverlayWindow(QWidget):
                 return False
             import ctypes
             from ctypes import wintypes
-            hwnd = int(self.winId())
+            win = target if target is not None else self
+            hwnd = int(win.winId())
             if hwnd == 0:
                 return False
             user32 = ctypes.windll.user32
@@ -10141,16 +11815,30 @@ class PhoneOverlayWindow(QWidget):
         on_convo = (self._stack.currentWidget() is self._page_convo)
         sel = (-1 if (self._convo_in_field or not on_convo)
                else self._convo_nav_index)
+        bubbles = getattr(self, "_convo_bubbles", [])
+        nb = len(bubbles)
+        # Surbrillance des bulles (indices 0..nb-1).
+        for i, b in enumerate(bubbles):
+            try:
+                b.set_nav_selected(sel == i)
+            except Exception:
+                pass
+        # Surbrillance des actions (indices nb..nb+3 -> 0..3).
+        a = (sel - nb) if sel >= nb else -1
         try:
-            self._convo_back.set_nav_selected(sel == 0)
+            self._convo_back.set_nav_selected(a == 0)
         except Exception:
             pass
         try:
-            self._convo_input.set_nav_selected(sel == 1)
+            self._convo_input.set_nav_selected(a == 1)
         except Exception:
             pass
         try:
-            self._btn_send.set_nav_selected(sel == 2)
+            self._btn_clip.set_nav_selected(a == 2)
+        except Exception:
+            pass
+        try:
+            self._btn_send.set_nav_selected(a == 3)
         except Exception:
             pass
 
@@ -10284,6 +11972,14 @@ class PhoneOverlayWindow(QWidget):
         if not self._visible_state:
             return
         self._visible_state = False
+        # [v0.3] Mettre l'app courante en pause a la fermeture du telephone
+        # (sinon un jeu continuerait de ticker fenetre cachee : son QTimer
+        # n'est pas arrete par le simple hide de la fenetre parente).
+        if self._current_app is not None:
+            try:
+                self._current_app.on_hide()
+            except Exception:
+                pass
         # Arreter le listener D-pad : on ne reserve plus les fleches une
         # fois le telephone ferme.
         try:
@@ -10312,6 +12008,44 @@ class PhoneOverlayWindow(QWidget):
         """True si l'overlay est actuellement ouvert (ou en cours
         d'animation d'ouverture)."""
         return self._visible_state
+
+
+class _GameLogFeed(QObject):
+    """[v0.3] Fan-out thread-safe des lignes du Game.log vers des abonnes
+    (les apps CircusPhone, ex : Portefeuille). Le tail tourne dans un thread
+    daemon (c2-gamelog-tail-smart), donc on passe par un signal Qt : les
+    slots des abonnes (qui vivent sur le thread Qt) sont appeles en
+    connexion *queued*, donc thread-safe pour toucher l'UI. Evite a chaque
+    app d'ouvrir son propre tail concurrent sur le meme fichier.
+
+    Contrat consomme par les apps (cf. circusvoip_phone_apps.PhoneServices) :
+      subscribe(cb)/unsubscribe(cb) ou cb(line: str), et current_path().
+    """
+    sig_line = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._path = ""
+
+    def subscribe(self, callback):
+        # AutoConnection : depuis le thread tail vers un slot du thread Qt,
+        # Qt route en queued automatiquement.
+        self.sig_line.connect(callback)
+
+    def unsubscribe(self, callback):
+        try:
+            self.sig_line.disconnect(callback)
+        except (TypeError, RuntimeError):
+            pass
+
+    def emit_line(self, line: str):
+        self.sig_line.emit(line)
+
+    def set_path(self, path: str):
+        self._path = path or ""
+
+    def current_path(self) -> str:
+        return self._path
 
 
 class MainWindow(QMainWindow):
@@ -10383,6 +12117,9 @@ class MainWindow(QMainWindow):
         #                   boot, enrichi a chaque reception de la liste
         #                   des joueurs, sauve apres chaque changement.
         self._phone_overlay = None
+        # [v0.3] Feed Game.log partage : le tail (c2-gamelog-tail-smart) y
+        # pousse chaque ligne, les apps CircusPhone s'y abonnent (Portefeuille).
+        self._gamelog_feed = _GameLogFeed()
         self._phone_annuaire = _phone_load_annuaire()
         # CircusPhone (D4 etape 3) : conversations privees + brouillons,
         # charges du fichier au boot. Tout passe par les fonctions
@@ -10574,18 +12311,17 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-        # Check des mises a jour en arriere-plan : DESACTIVE pour la release
-        # publique (le systeme de MAJ ne sert qu'au dev / tests joueurs).
-        # Le serveur d'update tourne sur le VPS port 8080. Le worker
-        # interroge en background 2s apres le boot, signale via
-        # _sig_update_available si une MAJ est dispo, et le bouton
-        # "Verifier les MAJ" (page Parametres) passe en orange.
-        # Pour reactiver (dev / tests joueurs) : decommenter le bloc ci-dessous.
-        # threading.Thread(
-        #     target=self._update_check_worker,
-        #     daemon=True,
-        #     name="c2-update-check",
-        # ).start()
+        # Check des mises a jour en arriere-plan : REACTIVE en v0.2.0 dev
+        # pour les tests joueurs. Le serveur d'update tourne sur le VPS
+        # port 8080. Le worker interroge en background 2s apres le boot,
+        # signale via _sig_update_available si une MAJ est dispo, et le
+        # bouton "Verifier les MAJ" (page Parametres) passe en orange.
+        # Pour redesactiver : recommenter le bloc ci-dessous.
+        threading.Thread(
+            target=self._update_check_worker,
+            daemon=True,
+            name="c2-update-check",
+        ).start()
 
     # ------------------------------------------------------------------
     # UI
@@ -10768,6 +12504,11 @@ class MainWindow(QMainWindow):
         self._phone_state   = "idle"
         self._phone_call_id = None
         self._phone_peer    = None
+        # Historique des appels (persistant) + suivi des appels en cours pour
+        # determiner l'issue (repondu / manque / refuse).
+        #   entree : {"peer":str, "dir":"in"|"out", "outcome":str, "ts":float}
+        self._call_history = self._load_call_history()
+        self._call_track = {}   # call_id -> {peer, dir, ts, answered}
         self.stack = QStackedWidget()
         self._build_page_main()
         self._build_page_settings()
@@ -11131,13 +12872,10 @@ class MainWindow(QMainWindow):
         # Initialiser l'affichage des touches depuis state
         self._refresh_radio_key_labels()
 
-        # Section Mise a jour : DESACTIVEE pour la release publique (le
-        # systeme de MAJ ne sert qu'au dev / tests joueurs). Le QPushButton
-        # est tout de meme instancie et stylise (le reste du code le
-        # reference : _on_update_available, _set_update_button_style, etc.),
-        # mais il n'est PAS ajoute au layout, donc invisible.
-        # Pour reactiver (dev / tests joueurs) : decommenter les deux
-        # v_upd.addWidget / v_left.addWidget en bas du bloc.
+        # Section Mise a jour : REACTIVEE en v0.2.0 dev pour les tests joueurs.
+        # Le QPushButton est instancie, stylise et ajoute au layout.
+        # Pour redesactiver (release publique sans MAJ visible) : recommenter
+        # les deux v_upd.addWidget / v_left.addWidget en bas du bloc.
         gb_upd = QGroupBox("Mise a jour")
         gb_upd.setStyleSheet("QGroupBox { font-weight: bold; padding-top: 14px; }")
         v_upd = QVBoxLayout(gb_upd)
@@ -11146,8 +12884,8 @@ class MainWindow(QMainWindow):
         self.btn_check_update.setMinimumHeight(28)
         self._set_update_button_style(False)
         self.btn_check_update.clicked.connect(self._on_check_update_clicked)
-        # v_upd.addWidget(self.btn_check_update)
-        # v_left.addWidget(gb_upd)
+        v_upd.addWidget(self.btn_check_update)
+        v_left.addWidget(gb_upd)
 
         v_left.addStretch(1)
         cols.addWidget(col_left, stretch=1)
@@ -11501,6 +13239,7 @@ class MainWindow(QMainWindow):
             # Couper la sonnerie immediatement + retour repos (le serveur
             # ne renotifie pas celui qui refuse).
             self._phone_stop_ring()
+            self._call_track_finalize(cid, "declined")
             self._phone_set_state("idle")
             # Bascule l'overlay sur l'ecran Contacts (le serveur ne nous
             # renotifie pas, donc c'est ici qu'on fait le retour visuel).
@@ -11527,6 +13266,7 @@ class MainWindow(QMainWindow):
             # Couper le bip d'appel si on annulait une sonnerie sortante +
             # retour repos (le serveur ne renotifie pas le raccrocheur).
             self._phone_stop_ring()
+            self._call_track_finalize(cid, "missed")
             self._phone_set_state("idle")
             # Bascule l'overlay sur l'ecran Contacts (le serveur ne nous
             # renotifie pas, donc c'est ici qu'on fait le retour visuel).
@@ -11536,9 +13276,72 @@ class MainWindow(QMainWindow):
 
     # --- Slots : reception des signaux du NetWorker (thread Qt) ---
 
+    # ---- Historique des appels (onglet Appels > Historique) --------------
+    def _load_call_history(self):
+        """Charge l'historique d'appels persiste (max 50 entrees)."""
+        try:
+            if _CORE_AVAILABLE:
+                cfg = _core._load_client_cfg() or {}
+                h = cfg.get("call_history")
+                if isinstance(h, list):
+                    return [e for e in h if isinstance(e, dict)][-50:]
+        except Exception:
+            pass
+        return []
+
+    def _save_call_history(self):
+        try:
+            if _CORE_AVAILABLE:
+                cfg = _core._load_client_cfg() or {}
+                cfg["call_history"] = self._call_history[-50:]
+                _core._save_client_cfg(cfg)
+        except Exception:
+            pass
+
+    def _record_call(self, peer, direction, outcome):
+        """Ajoute une entree a l'historique, persiste, et rafraichit l'onglet
+        Historique si l'overlay l'affiche.
+          direction : "in" (entrant) | "out" (sortant)
+          outcome   : "answered" | "missed" | "declined" | "busy" | "offline"."""
+        if not peer:
+            return
+        try:
+            self._call_history.append({
+                "peer": peer, "dir": direction,
+                "outcome": outcome, "ts": time.time(),
+            })
+            self._call_history = self._call_history[-50:]
+            self._save_call_history()
+            ov = self._phone_overlay
+            if ov is not None and hasattr(ov, "refresh_call_history"):
+                try:
+                    ov.refresh_call_history(self._call_history)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _call_track_start(self, call_id, peer, direction):
+        """Memorise un appel qui demarre (pour determiner l'issue a la fin)."""
+        if call_id:
+            self._call_track[call_id] = {
+                "peer": peer, "dir": direction,
+                "ts": time.time(), "answered": False,
+            }
+
+    def _call_track_finalize(self, call_id, default_outcome):
+        """Cloture un appel suivi : 'answered' s'il a ete decroche, sinon
+        l'issue par defaut fournie. Enregistre l'entree d'historique."""
+        info = self._call_track.pop(call_id, None) if call_id else None
+        if info is None:
+            return
+        outcome = "answered" if info.get("answered") else default_outcome
+        self._record_call(info.get("peer"), info.get("dir", "out"), outcome)
+
     @Slot(str, str)
     def _on_phone_ringing(self, call_id: str, target: str):
         self._phone_set_state("ringing_out", peer=target, call_id=call_id)
+        self._call_track_start(call_id, target, "out")
         self._phone_log(f"← phone_call_ringing : ça sonne chez {target} "
                         f"(call_id={call_id})")
         # Appelant : on lance le bip d'appel en boucle.
@@ -11553,6 +13356,7 @@ class MainWindow(QMainWindow):
     @Slot(str, str)
     def _on_phone_incoming(self, call_id: str, caller: str):
         self._phone_set_state("ringing_in", peer=caller, call_id=call_id)
+        self._call_track_start(call_id, caller, "in")
         self._phone_log(f"← phone_call_incoming : {caller} vous appelle "
                         f"(call_id={call_id})")
         # Destinataire : on lance la sonnerie en boucle.
@@ -11581,6 +13385,8 @@ class MainWindow(QMainWindow):
         my = state.my_name if _CORE_AVAILABLE else None
         peer = callee if caller == my else caller
         self._phone_set_state("in_call", peer=peer, call_id=call_id)
+        if call_id in self._call_track:
+            self._call_track[call_id]["answered"] = True
         self._phone_log(f"← phone_call_accepted : en appel avec {peer} "
                         f"(call_id={call_id})")
         # Appel decroche : la sonnerie / le bip s'arrete des deux cotes.
@@ -11603,6 +13409,7 @@ class MainWindow(QMainWindow):
                         f"(call_id={call_id})")
         # Appelant : la cible a refuse, on coupe le bip d'appel.
         self._phone_stop_ring()
+        self._call_track_finalize(call_id, "declined")
         self._phone_set_state("idle")
         self._phone_back_to_contacts()
 
@@ -11613,6 +13420,13 @@ class MainWindow(QMainWindow):
         # Par securite (aucun son ne devrait tourner a ce stade, mais
         # idempotent).
         self._phone_stop_ring()
+        # Retire toute piste d'appel sortant vers cette cible AVANT d'enregistrer
+        # (sinon un 'ended' ulterieur du serveur la finaliserait une 2e fois).
+        for _cid, _info in list(self._call_track.items()):
+            if _info.get("dir") == "out" and _info.get("peer") == target:
+                self._call_track.pop(_cid, None)
+        self._record_call(target, "out",
+                          "offline" if cause == "offline" else "busy")
         self._phone_set_state("idle")
         self._phone_back_to_contacts()
 
@@ -11633,6 +13447,7 @@ class MainWindow(QMainWindow):
                             f"{caller} (call_id={call_id})")
         # Timeout 45s : on coupe la sonnerie / le bip des deux cotes.
         self._phone_stop_ring()
+        self._call_track_finalize(call_id, "missed")
         self._phone_set_state("idle")
         self._phone_back_to_contacts()
 
@@ -11653,6 +13468,7 @@ class MainWindow(QMainWindow):
                         f"(call_id={call_id})")
         # Fin d'appel : on coupe tout son en cours.
         self._phone_stop_ring()
+        self._call_track_finalize(call_id, "missed")
         self._phone_set_state("idle")
         self._phone_back_to_contacts()
 
@@ -11662,7 +13478,13 @@ class MainWindow(QMainWindow):
         rien a basculer)."""
         ov = self._phone_overlay
         if ov is not None and ov.is_open():
-            ov.show_screen_contacts()
+            # Ecran APPELS (mode call) : un appel releve du contexte Appels.
+            # Evite de retomber sur l'ancien ecran 'full' titre 'Contacts' si
+            # l'utilisateur n'avait pas ouvert Appels avant l'appel.
+            if hasattr(ov, "show_screen_calls"):
+                ov.show_screen_calls()
+            else:
+                ov.show_screen_contacts()
 
     def _phone_on_disconnect(self):
         """Appele quand la connexion serveur tombe : tout appel en cours
@@ -11726,6 +13548,7 @@ class MainWindow(QMainWindow):
             # Actions depuis l'ecran Conversation (D4 etape 3).
             ov.sig_send_message.connect(self._on_phone_overlay_send_message)
             ov.sig_back_contacts.connect(self._on_phone_overlay_back_contacts)
+            ov.sig_send_image.connect(self._on_phone_send_image)
             ov.sig_draft_changed.connect(self._on_phone_overlay_draft_changed)
             # [D5+] Reglages profil : page interne du telephone. Engrenage
             # bascule vers l'ecran Reglages. Chaque widget de l'ecran emet
@@ -11787,6 +13610,14 @@ class MainWindow(QMainWindow):
         ov = self._phone_ensure_overlay()
         if ov is None:
             return
+        # Si la CAMERA est ouverte, le raccourci telephone la FERME (elle
+        # reaffiche le telephone via son callback), plutot que de basculer
+        # l'overlay masque derriere : sinon on arreterait le listener global
+        # et les raccourcis camera deviendraient inutilisables.
+        pw = getattr(ov, "_photo_window", None)
+        if pw is not None and pw.isVisible():
+            pw.close()
+            return
         if ov.is_open():
             ov.hide_animated()
         else:
@@ -11801,7 +13632,7 @@ class MainWindow(QMainWindow):
             elif st == "in_call":
                 ov.show_screen_in_call(peer)
             else:
-                ov.show_screen_contacts()
+                ov.show_screen_home()
             ov.show_animated()
 
     def _phone_refresh_overlay_contacts(self):
@@ -11858,6 +13689,8 @@ class MainWindow(QMainWindow):
                 photo_provider=self._photo_provider_for_contacts,
                 last_msg_ts_map=last_msg_ts_map,
             )
+            if hasattr(ov, "refresh_call_history"):
+                ov.refresh_call_history(self._call_history)
         except Exception as e:
             self._on_log(f"[PHONE] refresh contacts KO : {e}")
 
@@ -12000,6 +13833,113 @@ class MainWindow(QMainWindow):
         self._phone_refresh_overlay_contacts()
 
     @Slot()
+    def _on_phone_send_image(self, pseudo: str, path: str):
+        """Envoi d'un screenshot dans la conversation : charge l'image, la
+        compresse (JPEG, <=720px, sous la limite de frame WS), l'envoie en
+        base64 au serveur qui la route, et la stocke localement en bulle
+        image ("[img]<fichier>" dans l'historique)."""
+        if not pseudo or not path:
+            return
+        try:
+            import base64
+            from PySide6.QtCore import QBuffer, QIODevice
+            img = QImage(path)
+            if img.isNull():
+                self._phone_log(f"[IMG] illisible : {path}")
+                return
+            # Qualite d'envoi : on privilegie une resolution/qualite ELEVEE
+            # (l'image doit rester nette meme ouverte en plein ecran sur le
+            # moniteur), en ne baissant que ce qu'il faut pour tenir dans le
+            # budget de transmission (PHONE_MAX_IMG_B64). On essaie d'abord la
+            # pleine largeur (plafonnee a 1600 px) a bonne qualite, puis on
+            # degrade progressivement qualite PUIS resolution si trop lourd.
+            _MAX_W = 1600
+            if img.width() > _MAX_W:
+                img = img.scaledToWidth(_MAX_W, Qt.SmoothTransformation)
+            raw = b""
+            _fits = False
+            _widths = [w for w in (img.width(), 1280, 1024, 800)
+                       if w <= img.width()]
+            # dedoublonner en gardant l'ordre
+            _seen_w = set(); _widths = [w for w in _widths
+                                        if not (w in _seen_w or _seen_w.add(w))]
+            for _w in _widths:
+                im2 = (img if _w == img.width()
+                       else img.scaledToWidth(_w, Qt.SmoothTransformation))
+                for quality in (85, 72, 58, 45, 32):
+                    buf = QBuffer()
+                    buf.open(QIODevice.WriteOnly)
+                    im2.save(buf, "JPEG", quality)
+                    raw = bytes(buf.data())
+                    buf.close()
+                    if len(raw) * 4 // 3 <= PHONE_MAX_IMG_B64:
+                        _fits = True
+                        break
+                if _fits:
+                    break
+            b64 = base64.b64encode(raw).decode("ascii")
+            if len(b64) > PHONE_MAX_IMG_B64:
+                self._phone_log(f"[IMG] trop lourde meme compressee "
+                                f"({len(b64)} b64) : abandon")
+                return
+            # 1) Envoi WS.
+            try:
+                ok = _core._ws_send_safe({
+                    "type": "phone_image_send",
+                    "target": pseudo,
+                    "data": b64,
+                })
+            except Exception as e:
+                ok = False
+                self._on_log(f"[IMG] _ws_send_safe KO : {e}")
+            if not ok:
+                self._phone_log("[IMG] Envoi echoue (non connecte ?)")
+            # 2) Cache local + historique (meme si l'envoi a echoue, pour
+            #    que l'utilisateur voie sa bulle).
+            ts = time.time()
+            fname = f"{int(ts * 1000)}_{pseudo}_out.jpg"
+            try:
+                PHONE_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+                (PHONE_IMAGES_DIR / fname).write_bytes(raw)
+            except Exception as e:
+                self._phone_log(f"[IMG] cache local KO : {e}")
+            _phone_append_sent(self._phone_messages, pseudo,
+                               PHONE_IMG_PREFIX + fname, ts)
+            _phone_save_messages(self._phone_messages)
+            self._phone_log(f"[IMG] envoyee -> {pseudo} "
+                            f"({len(raw)} o jpeg, {len(b64)} b64)")
+            # 3) Refresh la conversation affichee.
+            ov = self._phone_overlay
+            if ov is not None and getattr(ov, "_convo_pseudo", "") == pseudo:
+                try:
+                    items = _phone_merge_messages(self._phone_messages, pseudo)
+                    ov.refresh_conversation(items)
+                except Exception:
+                    pass
+        except Exception as e:
+            self._phone_log(f"[IMG] envoi KO : {e}")
+
+    def _on_phone_image_received(self, sender: str, b64: str, ts: float):
+        """Reception d'une image (base64) : decode, stocke dans le cache
+        local, puis reutilise TOUT le flux texte (annuaire, non-lus, notif,
+        refresh) via _on_phone_message_received avec un body '[img]<fichier>'."""
+        if not sender or not b64:
+            return
+        try:
+            import base64
+            raw = base64.b64decode(b64.encode("ascii"), validate=True)
+        except Exception:
+            self._phone_log(f"[IMG] base64 invalide de {sender} : ignore")
+            return
+        fname = f"{int((ts or time.time()) * 1000)}_{sender}_in.jpg"
+        try:
+            PHONE_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+            (PHONE_IMAGES_DIR / fname).write_bytes(raw)
+        except Exception as e:
+            self._phone_log(f"[IMG] cache reception KO : {e}")
+            return
+        self._on_phone_message_received(sender, PHONE_IMG_PREFIX + fname, ts)
+
     def _on_phone_overlay_back_contacts(self):
         """Fleche retour depuis l'ecran conversation : sauvegarde le
         brouillon courant + retour a l'ecran Contacts."""
@@ -12042,6 +13982,20 @@ class MainWindow(QMainWindow):
                 lambda: _phone_save_messages(self._phone_messages)
             )
         self._phone_draft_save_timer.start(1000)
+
+    @Slot(dict)
+    def _on_phone_server_msg(self, data: dict):
+        """Route un message multijoueur (mp_*) recu du serveur vers l'app du
+        telephone actuellement affichee (qui expose handle_server_msg)."""
+        ov = getattr(self, "_phone_overlay", None)
+        if ov is None:
+            return
+        app = getattr(ov, "_current_app", None)
+        if app is not None and hasattr(app, "handle_server_msg"):
+            try:
+                app.handle_server_msg(data)
+            except Exception:
+                pass
 
     @Slot(str, str, float)
     def _on_phone_message_received(self, sender: str, body: str, ts: float):
@@ -12256,13 +14210,17 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_phone_overlay_settings_back(self):
-        """Fleche retour de l'ecran Reglages : revient a Contacts."""
+        """Fleche retour de l'ecran Reglages profil : revient a l'origine
+        (app Parametres si on y venait de la, sinon Contacts)."""
         ov = self._phone_overlay
         if ov is None:
             return
         try:
-            ov.show_screen_contacts()
-            self._phone_refresh_overlay_contacts()
+            if getattr(ov, "_settings_origin", "contacts") == "settings":
+                ov.show_screen_settings_app()
+            else:
+                ov.show_screen_contacts()
+                self._phone_refresh_overlay_contacts()
         except Exception:
             pass
 
@@ -14878,9 +16836,13 @@ class MainWindow(QMainWindow):
         self._worker.sig_phone_busy.connect(self._on_phone_busy)
         self._worker.sig_phone_missed.connect(self._on_phone_missed)
         self._worker.sig_phone_ended.connect(self._on_phone_ended)
+        self._worker.sig_phone_server_msg.connect(self._on_phone_server_msg)
         # CircusPhone (D4 etape 3) : reception d'un MP texte.
         self._worker.sig_phone_message_received.connect(
             self._on_phone_message_received
+        )
+        self._worker.sig_phone_image_received.connect(
+            self._on_phone_image_received
         )
         # [D5] Reponse a une demande de photo de profil.
         self._worker.sig_profile_photo_response.connect(
@@ -16251,6 +18213,12 @@ class MainWindow(QMainWindow):
                 f = f_new
                 cur_path = path
                 self._on_log(f"[GAMELOG] Tail demarre sur : {path}")
+                # [v0.3] Exposer le chemin courant aux abonnes du feed
+                # (current_path()), utile au rattrapage one-shot du Wallet.
+                try:
+                    self._gamelog_feed.set_path(path)
+                except Exception:
+                    pass
                 return True
             except Exception as e:
                 self._on_log(f"[GAMELOG] Echec ouverture {path} : {e}")
@@ -16407,6 +18375,14 @@ class MainWindow(QMainWindow):
                 _core._process_gamelog_line(line, self._core_shim)
             except Exception as e:
                 self._on_log(f"[GAMELOG] _process_gamelog_line KO : {e}")
+
+            # [v0.3] Fan-out vers les abonnes du feed (apps CircusPhone).
+            # Emis depuis ce thread daemon ; les slots Qt sont appeles en
+            # queued (thread-safe). Best-effort : ne jamais casser le tail.
+            try:
+                self._gamelog_feed.emit_line(line)
+            except Exception:
+                pass
 
     # _row_for() supprime : remplace par self._player_cards[name].
     # Ancienne implementation parcourait QTableWidget pour matcher le

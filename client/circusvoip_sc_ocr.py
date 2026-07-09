@@ -729,6 +729,8 @@ _KNOWN_ZONES_INTERIORS = [
     "hangar_mediumfront_distributioncenter",
     "hangar_smalltop_distributioncenter",
     "hangar_smallfront_distributioncenter",
+    # Habitats (habs loues) des rest stops - releve Kainan CRU-L5 07/07/2026.
+    "rs_habs_005_occu_001",
     "reststop_cargo_occu_0001",    # cargo habitat reststop (plusieurs instances)
     "reststop_cargo_occu_0002",
     "reststop_cargo_occu_0003",
@@ -743,6 +745,7 @@ _KNOWN_ZONES_INTERIORS = [
     "transitcarriage_levskismall",
     "transitcarriage_levskimedium",
     "transitcarriage_elev_util",   # ascenseur utilitaire
+    "transitcarriage_ez_habs",     # ascenseur des habs (EZ Habs) - CRU-L5 07/07/2026
     "transitcarriage_elev_util_securityclearance",  # ascenseur security clearance
     "transitcarriage_lorville_tram",   # tram Lorville (gare centrale)
     "transitcarriage_ugfacilitylta",  # ascenseur UGF (underground facility)
@@ -778,6 +781,10 @@ _KNOWN_ZONES_INTERIORS = [
     "rs_entry_cru-leo1",
     "rs_entry_cru-leo2",
     "rs_entry_cru-leo3",
+    # Hall commercial des rest stops Crusader LEO (releve Kainan CRU-L5,
+    # 07/07/2026 : OCR "rs comm cru leol" -> leo1). Meme famille que les
+    # rs_entry_cru-leoN ci-dessus ; le fuzzy rattrape _<->- et l<->1.
+    "rs_comm_cru-leo1",
     # Underground Facilities (bunkers) - le "_0001_int" est le format observe
     # en jeu (_int = interieur). Si d'autres numeros apparaissent dans les logs
     # on pourra enrichir ou ajouter un strip du numero interne.
@@ -921,6 +928,33 @@ _KNOWN_ZONES_INTERIORS = [
     "newbabbage_shuttle",
     "newbabbage_metro",
     "objectcontainer-newbab_domes_int_001",  # Dome Newbab (interieur)
+    # Zones New Babbage ajoutees 02/07/2026 (log + screenshots Kainan, qui
+    # font foi sur l'orthographe reelle du HUD SC) :
+    # - "ObjectContainer-newbab_sp_transit_int_001" (TIRET apres
+    #   ObjectContainer, comme domes_int). Sans cette entree l'OCR sortait
+    #   des variantes brutes instables (underscore, "odjectcortairier_
+    #   rewbab...", "rlewbab"...) -> zones differentes entre joueurs au
+    #   meme endroit.
+    "objectcontainer-newbab_sp_transit_int_001",  # transit spaceport int.
+    # - "ObjectContainerModifier_SP_INT" (COLLE, underscore) : spaceport
+    #   New Babbage. Sans entree exacte, le fuzzy mappait a tort sur
+    #   "objectcontainer-lorville_sp_int" (Lorville, Hurston !) -> fausse
+    #   localisation inter-planetes.
+    "objectcontainermodifier_sp_int",
+    # - Hangars de surface New Babbage (convention _top comme Lorville ;
+    #   xltop observe en jeu avec cid, autres tailles par anticipation).
+    "hangar_smalltop_newbabbage",
+    "hangar_mediumtop_newbabbage",
+    "hangar_largetop_newbabbage",
+    "hangar_xltop_newbabbage",
+    # - "TransitCarriage NewBabbage Hangars <cid>" : tram vers les hangars.
+    #   Sans cette entree, le fuzzy mappait a tort sur
+    #   "transitcarriage_newbabbage_hospital" (Hangars ~ hospital).
+    "transitcarriage_newbabbage_hangars",
+    # - "TransitCarriage_Hta_Circular_<cid>" : ligne circulaire HtA
+    #   (screen 02/07/2026). Rattrape aussi les variantes OCR "cifcular",
+    #   "flta_circular".
+    "transitcarriage_hta_circular",
     # Orison (Crusader / Stanton 2) - ville flottante.
     # Zones observees 23/05/2026 Kainan (screen + log debug). Le HUD SC
     # affiche les noms avec underscores et numerotation des elements

@@ -8,15 +8,15 @@ calculée à partir de la position lue par OCR sur l'écran du joueur.
 
 La plupart des joueurs ont uniquement besoin de l'installeur **client** :
 
-➡️ **[Télécharger CircusVOIP_Client_Setup_v0.2.0.exe](https://github.com/kainann/CircusVOIP/releases/tag/client-v0.2.0)**
+➡️ **[Télécharger le dernier installeur client](https://github.com/kainann/CircusVOIP/releases/latest)**
 
 Lancez l'installeur, configurez votre micro, configurez la zone OCR,
 définissez les raccourcis radio et profil, connectez-vous au serveur de
 votre groupe et c'est parti.
 
-⚠️ **Le serveur de votre groupe doit être en v0.2** pour profiter des
-nouveautés du client v0.2 (CircusPhone, soundboard, photos de profil).
-Mettez à jour le serveur en même temps que le client.
+⚠️ **Le serveur de votre groupe doit être en v0.3** pour profiter des
+nouveautés du client v0.3 (applications du CircusPhone, jeux multijoueur,
+scores partagés). Mettez à jour le serveur en même temps que le client.
 
 ## Pour le serveur
 
@@ -24,7 +24,7 @@ Un groupe a besoin d'**un seul serveur**, hébergé soit :
 
 ### Sur le PC d'un joueur (le plus simple)
 
-➡️ **[Télécharger CircusVOIP_Server_Setup_v0.2.0.exe](https://github.com/kainann/CircusVOIP/releases/tag/server-v0.2.0)**
+➡️ **[Télécharger le dernier installeur serveur](https://github.com/kainann/CircusVOIP/releases/latest)**
 
 Lancez l'installeur, le serveur démarre et génère un mot de passe
 automatiquement. Communiquez l'IP de la machine + le mot de passe aux
@@ -37,6 +37,14 @@ veux limiter l'exposition, héberger sur un VPS dédié (3-5 €/mois) est
 plus prudent que sur ton PC perso.
 
 ### Sur une machine dédiée (VPS, PC secondaire, etc.)
+
+> 📘 **Pour une installation propre et durable sur un VPS Linux**
+> (utilisateur dédié, environnement virtuel, services systemd qui
+> redémarrent tout seuls, pare-feu, logs), suivez le guide complet :
+> **[docs/INSTALL_SERVEUR.md](docs/INSTALL_SERVEUR.md)**.
+>
+> La méthode ci-dessous est un démarrage rapide : elle convient pour
+> tester, mais le serveur s'arrête dès que vous fermez le terminal.
 
 **Python 3.10 ou supérieur requis.** Cloner le repo et lancer les
 sources :
@@ -122,11 +130,17 @@ Un téléphone virtuel s'ouvre en surimpression par-dessus Star Citizen.
 Il permet d'**appeler** et d'**envoyer des messages écrits** aux autres
 joueurs, directement depuis le jeu.
 
-- **Navigation entièrement au clavier** (flèches directionnelles +
-  Entrée) : la souris reste captée par Star Citizen quand l'overlay est
-  ouvert, vous gardez donc le contrôle de votre personnage. Les flèches
-  naviguent dans les contacts et les conversations, Entrée valide, Échap
-  revient en arrière.
+- **Navigation entièrement au clavier** : la souris reste captée par Star
+  Citizen quand l'overlay est ouvert, vous gardez donc le contrôle de
+  votre personnage. **Flèches** pour se déplacer, **Entrée** pour
+  sélectionner/valider, **Retour arrière** pour revenir en arrière.
+  Espace et ZQSD ne sont jamais interceptées : aucune touche de
+  déplacement n'est confisquée au jeu.
+- **Raccourcis par défaut** : `F6` ouvrir/fermer le téléphone,
+  `F7` décrocher, `F8` refuser/raccrocher, `F9` mute micro,
+  `F10` haut-parleur — tous modifiables dans les Paramètres.
+  ⚠️ Ces touches ne sont pas bloquées : elles partent **aussi** dans Star
+  Citizen. Si elles servent à vos commandes de jeu, réassignez-les.
 - **Conversations privées** avec historique horodaté.
 - **Tri intelligent des contacts** : les conversations les plus récentes
   remontent en haut de la liste.
@@ -134,6 +148,34 @@ joueurs, directement depuis le jeu.
   temps que vous sont ajoutés à vos contacts.
 - **Sonneries** lors des appels et notification sonore à la réception
   d'un message.
+
+### Applications du CircusPhone (v0.3)
+
+Le téléphone accueille des applications, accessibles depuis son écran
+d'accueil :
+
+- **Portefeuille** — suivi automatique de vos mouvements d'argent, lus
+  depuis le journal du jeu : ventes et achats en boutique, marchandises,
+  transferts entre joueurs (avec le nom et la taxe), locations de
+  véhicules. Filtres 24 h / 7 j / 30 j / Tout, historique persistant.
+- **Blueprints** — vos plans de fabrication débloqués, avec leur recette
+  complète : temps de fabrication et matériaux nécessaires.
+- **Jeux** — trois jeux, avec deux modes de partie distincts :
+  - **Valakkar** (le ver des sables) : solo, avec les **meilleurs scores
+    partagés** entre tous les joueurs du serveur.
+  - **Sol VS Terra** (bataille navale) : solo contre l'IA, ou **1v1 avec
+    n'importe quel joueur connecté au serveur**, où qu'il soit dans le
+    verse.
+  - **Poker** (Texas Hold'em, 2 à 8 joueurs) : se joue **en proximité
+    réelle** — les adversaires doivent être au même endroit en jeu
+    (30 m), ce que le serveur vérifie.
+- **Caméra & Photos** — prenez des clichés par-dessus le jeu et
+  affichez-les en grand sur votre écran.
+- **Paramètres** — choix du fond d'écran.
+
+Portefeuille et Blueprints relisent aussi les **anciens journaux
+archivés** par Star Citizen : vous récupérez ce qui a été obtenu lors de
+sessions jouées sans CircusVOIP ouvert.
 
 ### Photos de profil
 Vous pouvez associer une photo à votre profil. Elle s'affiche en face de

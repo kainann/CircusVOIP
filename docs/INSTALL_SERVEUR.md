@@ -44,11 +44,11 @@ sudo apt install -y python3 python3-venv python3-pip
 
 sudo -u circusvoip python3 -m venv /home/circusvoip/app/venv
 sudo -u circusvoip /home/circusvoip/app/venv/bin/pip install \
-    websockets cryptography pillow cffi pycparser
+    websockets cryptography
 ```
 
-Cinq dépendances, c'est tout. (`pillow` sert aux photos de profil,
-`cryptography` à la génération du certificat TLS.)
+Deux dépendances, c'est tout (`cffi` et `pycparser` sont tirés
+automatiquement par `cryptography`, qui sert à générer le certificat TLS).
 
 ## 3. Déposer le code serveur
 

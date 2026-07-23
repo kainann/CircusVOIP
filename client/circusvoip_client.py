@@ -1775,6 +1775,11 @@ _CORE_MANAGED_CFG_KEYS = frozenset({
     "proximity_short_key", "cycle_channel_key",
     "phone_open_key", "phone_accept_key", "phone_decline_key",
     "phone_mute_key", "phone_speaker_key",
+    # Flag de migration one-shot des defauts F6-F10 (build 62). Doit etre
+    # core-managed : sinon _save_cfg au close le reecraserait avec la valeur
+    # du boot (absente) -> la migration se rejouerait a chaque demarrage et
+    # remettrait un raccourci que l'utilisateur aurait volontairement efface.
+    "phone_keys_defaults_applied",
     # Fond d'ecran du CircusPhone (ecrit en cours de session par l'app
     # Parametres via _core._save_client_cfg ; sans ca, _save_cfg(self._cfg)
     # reecraserait au close avec la valeur du boot -> fond non sauvegarde).
@@ -9402,6 +9407,12 @@ class PhoneOverlayWindow(QWidget):
         self._nav_index = 0
         self._nav_action = 0
         self._nav_rows = []
+        # [build 61] Comme l'app Blueprints : le curseur n'est pas materialise
+        # a l'ouverture de l'ecran. Le PREMIER up/down doit REVELER la
+        # selection sur la ligne courante (index 0 = contact au message le
+        # plus recent, en haut) au lieu de sauter (bas -> 2e ligne, ou
+        # haut -> derniere ligne via le modulo).
+        self._nav_shown = False
         # Mode de l'ecran contacts selon l'icone d'accueil qui l'a ouvert :
         #   "full"    = ecran Appels (lignes avec tel + lettre)  [defaut]
         #   "message" = ecran Messagerie (ligne entiere -> conversation)
@@ -9586,12 +9597,26 @@ class PhoneOverlayWindow(QWidget):
         except Exception:
             self._games_by_id = {}
 
+        # [build 61] Icones vectorielles (fin des emoji, rendu identique
+        # sur tous les PC) : make_phone_icon dessine en QPainter ; repli
+        # sur l'ancien glyphe si la fabrique est absente (vieux phone_apps)
+        # ou si le dessin echoue.
+        def _icon(kind: str, glyph: str):
+            try:
+                from circusvoip_phone_apps import make_phone_icon
+                pm = make_phone_icon(kind)
+                if pm is not None:
+                    return pm
+            except Exception:
+                pass
+            return glyph
+
         # 2 icones ecrans natifs : Appels et Messagerie pointent sur l'ecran
         # contacts unifie, avec l'action D-pad par defaut pre-reglee.
         entries = [
-            HomeEntry("calls", "Appels", "\u260E",
+            HomeEntry("calls", "Appels", _icon("calls", "\u260E"),
                       lambda: self._open_native_contacts(action=0)),
-            HomeEntry("msg", "Messagerie", "\u2709",
+            HomeEntry("msg", "Messagerie", _icon("msg", "\u2709"),
                       lambda: self._open_native_contacts(action=1)),
         ]
         # Apps v0.3 (lazy-load via la fabrique _launch_app).
@@ -9599,7 +9624,7 @@ class PhoneOverlayWindow(QWidget):
             PHONE_APPS, lambda C: (lambda: self._launch_app(C))
         )
         # Camera : cas special (fenetre separee couchee, hors stack/registre).
-        entries.append(HomeEntry("photo", "Caméra", "\U0001F4F7",
+        entries.append(HomeEntry("photo", "Caméra", _icon("camera", "\U0001F4F7"),
                                  lambda: self._launch_photo()))
         # Photos : galerie des cliches (app normale du stack). On lit l'icone
         # (polaroids) et le libelle DEPUIS la classe, pas en dur.
@@ -9620,22 +9645,30 @@ class PhoneOverlayWindow(QWidget):
         )
         self._stack.addWidget(self._page_home)
 
-    def _default_phone_wallpaper_path(self):
-        """Chemin du fond d'ecran PAR DEFAUT (image embarquee), ou None.
-        'hugolisoir.png' est cherchee D'ABORD dans le dossier des fonds
-        (circusvoip_phone_wallpapers/), puis a la racine du client (repli
-        historique). Sinon le home retombe sur son degrade genere."""
+    def set_home_msg_badge(self, on: bool):
+        """[build 61] Allume/eteint le badge de notification (rond rouge)
+        sur l'icone Messagerie de l'ecran d'accueil. Pousse par MainWindow
+        (_phone_refresh_overlay_contacts), seul detenteur de l'etat des
+        messages non lus. No-op si le home v0.3 est absent (repli v0.2) ou
+        ne supporte pas les badges (vieux phone_apps)."""
+        home = getattr(self, "_page_home", None)
+        if home is None or not hasattr(home, "set_badges"):
+            return
         try:
-            for p in (_BASE_DIR / "circusvoip_phone_wallpapers" / "hugolisoir.png",
-                      _BASE_DIR / "hugolisoir.png"):
-                if p.exists():
-                    return str(p)
+            home.set_badges({"msg"} if on else set())
         except Exception:
             pass
+
+    def _default_phone_wallpaper_path(self):
+        """Fond d'ecran PAR DEFAUT : plus d'image embarquee (release build 62).
+        Le defaut est desormais un aplat NOIR genere par le home
+        (HOME_BG_DEFAULT_*). On retourne toujours None -> le home et la tuile
+        « Défaut » retombent sur ce fond noir. (Historique : renvoyait
+        hugolisoir.png ; retire pour la release.)"""
         return None
 
     def _default_phone_wallpaper(self):
-        """QPixmap du fond par defaut (hugolisoir.png) ou None (-> degrade)."""
+        """QPixmap du fond par defaut, ou None (-> aplat noir genere)."""
         path = self._default_phone_wallpaper_path()
         if path:
             try:
@@ -9648,8 +9681,7 @@ class PhoneOverlayWindow(QWidget):
 
     def _load_phone_wallpaper(self):
         """Charge le fond d'ecran : clé config 'phone_wallpaper' si definie,
-        sinon le fond PAR DEFAUT (hugolisoir.png), sinon None (degrade du
-        home). Best-effort."""
+        sinon le fond PAR DEFAUT (aplat noir genere), sinon None. Best-effort."""
         try:
             cfg = _core._load_client_cfg() if _CORE_AVAILABLE else {}
             path = (cfg or {}).get("phone_wallpaper")
@@ -9796,6 +9828,9 @@ class PhoneOverlayWindow(QWidget):
         self._contacts_mode = "message" if is_msg else "call"
         self._nav_action = 0
         self._nav_index = 0
+        # [build 61] curseur re-masque : le 1er up/down le revelera sur la
+        # 1re ligne (message le plus recent) au lieu de sauter.
+        self._nav_shown = False
         try:
             self._contacts_title.setText("Messages" if is_msg else "Appels")
         except Exception:
@@ -9832,6 +9867,8 @@ class PhoneOverlayWindow(QWidget):
         zone scrollable visible (stretch=1) pour que la barre d'onglets reste
         en haut (sinon le layout se recentre)."""
         self._appels_tab = "historique" if tab == "historique" else "menu"
+        self._nav_index = 0
+        self._nav_shown = False
         is_hist = (self._appels_tab == "historique")
         self._contacts_scroll.setVisible(not is_hist)
         self._history_scroll.setVisible(is_hist)
@@ -11471,7 +11508,8 @@ class PhoneOverlayWindow(QWidget):
         on_contacts = (self._stack.currentWidget() is self._page_contacts)
         for i, row in enumerate(self._nav_rows):
             try:
-                sel = on_contacts and (i == self._nav_index)
+                sel = (on_contacts and self._nav_shown
+                       and i == self._nav_index)
                 row.set_nav_highlight(sel, self._nav_action)
             except Exception:
                 pass
@@ -11611,12 +11649,19 @@ class PhoneOverlayWindow(QWidget):
             if n == 0:
                 return
             if direction == "up":
-                self._nav_index = (self._nav_index - 1) % n
+                if not self._nav_shown:
+                    self._nav_shown = True   # 1er appui : revele, ne bouge pas
+                else:
+                    self._nav_index = (self._nav_index - 1) % n
                 self._ensure_nav_visible()
             elif direction == "down":
-                self._nav_index = (self._nav_index + 1) % n
+                if not self._nav_shown:
+                    self._nav_shown = True
+                else:
+                    self._nav_index = (self._nav_index + 1) % n
                 self._ensure_nav_visible()
             elif direction == "enter":
+                self._nav_shown = True
                 row = self._nav_rows[self._nav_index]
                 pseudo = row.pseudo()
                 if self._contacts_mode == "message":
@@ -11656,7 +11701,14 @@ class PhoneOverlayWindow(QWidget):
                 return
 
             nb = len(getattr(self, "_convo_bubbles", []))
-            total = nb + 4      # bulles (0..nb-1) puis 4 actions (nb..nb+3)
+            # [build 61] Ordre de navigation (option A) : Retour EN TETE (0),
+            # puis les bulles (1..nb, la derniere = dernier message), puis
+            # les 3 actions de saisie (nb+1 champ, nb+2 trombone, nb+3
+            # envoyer). Ainsi, depuis le champ texte, fleche HAUT arrive sur
+            # le DERNIER MESSAGE (et non sur le bouton Retour comme avant),
+            # puis remonte les messages ; Retour n'est atteint qu'apres le
+            # tout premier message.
+            total = nb + 4      # Retour(0) + bulles(1..nb) + 3 actions
             if direction in ("left", "up"):
                 self._convo_nav_index = (self._convo_nav_index - 1) % total
             elif direction in ("right", "down"):
@@ -11668,12 +11720,14 @@ class PhoneOverlayWindow(QWidget):
                 return
             elif direction == "enter":
                 idx = self._convo_nav_index
-                if idx < nb:
-                    # Bulle selectionnee : si c'est une image, l'ouvrir EN
-                    # GRAND sur l'ecran de jeu (meme visionneuse que la
-                    # galerie). Sinon (texte), rien.
+                if idx == 0:
+                    self.sig_back_contacts.emit()   # Retour (tete de liste)
+                    return   # changement d'ecran
+                if 1 <= idx <= nb:
+                    # Bulle selectionnee (index 1..nb -> bulle 0..nb-1) : si
+                    # c'est une image, l'ouvrir en grand ; sinon (texte) rien.
                     try:
-                        p = self._convo_bubbles[idx].image_path()
+                        p = self._convo_bubbles[idx - 1].image_path()
                     except Exception:
                         p = None
                     if p:
@@ -11684,11 +11738,8 @@ class PhoneOverlayWindow(QWidget):
                             except Exception:
                                 pass
                     return
-                a = idx - nb        # 0=Retour, 1=champ, 2=Trombone, 3=Envoyer
-                if a == 0:
-                    self.sig_back_contacts.emit()
-                    return   # changement d'ecran
-                elif a == 2:
+                a = idx - nb        # nb+1->1 champ, nb+2->2 trombone, nb+3->3 envoyer
+                if a == 2:
                     # Trombone : ouvrir la page des screenshots.
                     self._open_screenshot_picker()
                     return   # changement d'ecran
@@ -11817,28 +11868,29 @@ class PhoneOverlayWindow(QWidget):
                else self._convo_nav_index)
         bubbles = getattr(self, "_convo_bubbles", [])
         nb = len(bubbles)
-        # Surbrillance des bulles (indices 0..nb-1).
+        # [build 61] Nouvel ordre : Retour(0), bulles(1..nb), actions(nb+1..nb+3).
+        # Retour (index 0).
+        try:
+            self._convo_back.set_nav_selected(sel == 0)
+        except Exception:
+            pass
+        # Bulles : index de nav 1..nb -> bulle 0..nb-1.
         for i, b in enumerate(bubbles):
             try:
-                b.set_nav_selected(sel == i)
+                b.set_nav_selected(sel == i + 1)
             except Exception:
                 pass
-        # Surbrillance des actions (indices nb..nb+3 -> 0..3).
-        a = (sel - nb) if sel >= nb else -1
+        # Actions de saisie : nb+1 champ, nb+2 trombone, nb+3 envoyer.
         try:
-            self._convo_back.set_nav_selected(a == 0)
+            self._convo_input.set_nav_selected(sel == nb + 1)
         except Exception:
             pass
         try:
-            self._convo_input.set_nav_selected(a == 1)
+            self._btn_clip.set_nav_selected(sel == nb + 2)
         except Exception:
             pass
         try:
-            self._btn_clip.set_nav_selected(a == 2)
-        except Exception:
-            pass
-        try:
-            self._btn_send.set_nav_selected(a == 3)
+            self._btn_send.set_nav_selected(sel == nb + 3)
         except Exception:
             pass
 
@@ -12705,6 +12757,15 @@ class MainWindow(QMainWindow):
 
         v_right.addLayout(h_rp)
 
+        # Compteur de joueurs en ligne sur le serveur (build 62). 100 %
+        # client-side : compte state.players (les autres) + soi-meme si
+        # connecte. Mis a jour par _refresh_no_other_players_label(), qui est
+        # deja appele sur join / leave / reset / connexion / deconnexion.
+        self.lbl_online_count = QLabel("Joueurs en ligne : —")
+        self.lbl_online_count.setStyleSheet(
+            f"color: {THEME_MUTED}; font-weight: bold; padding: 2px 4px;")
+        v_right.addWidget(self.lbl_online_count)
+
         # --- Liste joueurs en cards ---
         # Remplace l'ancien QTableWidget par un QScrollArea contenant
         # une suite de PlayerCard. Plus visuel, et les pseudos longs +
@@ -12884,8 +12945,15 @@ class MainWindow(QMainWindow):
         self.btn_check_update.setMinimumHeight(28)
         self._set_update_button_style(False)
         self.btn_check_update.clicked.connect(self._on_check_update_clicked)
-        v_upd.addWidget(self.btn_check_update)
-        v_left.addWidget(gb_upd)
+        # [BUILD 62 - RELEASE STABLE] Bouton "Verifier les MAJ" MASQUE.
+        # Les deux addWidget ci-dessous sont commentes : le QPushButton et le
+        # QGroupBox restent instancies (indispensable, car
+        # _set_update_button_style() et _on_update_available() referencent
+        # self.btn_check_update ; les supprimer leverait AttributeError), mais
+        # ils ne sont plus ajoutes au layout donc invisibles.
+        # POUR REACTIVER (build de dev) : decommenter les deux lignes.
+        # v_upd.addWidget(self.btn_check_update)
+        # v_left.addWidget(gb_upd)
 
         v_left.addStretch(1)
         cols.addWidget(col_left, stretch=1)
@@ -13689,6 +13757,15 @@ class MainWindow(QMainWindow):
                 photo_provider=self._photo_provider_for_contacts,
                 last_msg_ts_map=last_msg_ts_map,
             )
+            # [build 61] Badge global sur l'icone Messagerie du home :
+            # allume tant qu'AU MOINS un contact a des MP non lus. Branche
+            # ICI (et nulle part ailleurs) car cette fonction est deja le
+            # point de passage oblige de tous les changements d'etat
+            # unread : reception d'un MP, ouverture d'une conversation
+            # (mark_read), reception pendant convo ouverte. Une seule
+            # source de verite = badge toujours coherent.
+            if hasattr(ov, "set_home_msg_badge"):
+                ov.set_home_msg_badge(bool(unread_set))
             if hasattr(ov, "refresh_call_history"):
                 ov.refresh_call_history(self._call_history)
         except Exception as e:
@@ -17022,6 +17099,13 @@ class MainWindow(QMainWindow):
             is_connected = bool(_CORE_AVAILABLE and state.connected)
             no_others = (len(self._player_cards) == 0)
             self.lbl_no_other_players.setVisible(is_connected and no_others)
+            # Compteur global (build 62) : les autres + soi-meme si connecte.
+            if hasattr(self, "lbl_online_count"):
+                if is_connected:
+                    n_online = len(state.players) + 1
+                    self.lbl_online_count.setText(f"Joueurs en ligne : {n_online}")
+                else:
+                    self.lbl_online_count.setText("Joueurs en ligne : —")
         except Exception:
             pass
 
@@ -18001,7 +18085,36 @@ class MainWindow(QMainWindow):
             state.mute_all_key         = _canon(core_cfg.get("mute_all_key"))
             state.proximity_short_key  = _canon(core_cfg.get("proximity_short_key"))
             state.cycle_channel_key    = _canon(core_cfg.get("cycle_channel_key"))
-            # CircusPhone (D4 etape 4) : 5 raccourcis telephone.
+            # --- CircusPhone (build 62) : raccourcis par defaut F6-F10 ---
+            # Avant le b62 ces 5 cles etaient vides ; la fonctionnalite etait
+            # donc inerte tant que l'utilisateur n'allait pas la configurer.
+            # Migration ONE-SHOT : on pose les defauts sur les cles absentes
+            # OU nulles, une seule fois (flag phone_keys_defaults_applied).
+            # Grace au flag, si l'utilisateur EFFACE volontairement un
+            # raccourci ensuite, il reste efface (on ne le lui remet pas a
+            # chaque demarrage).
+            _PHONE_KEY_DEFAULTS = {
+                "phone_open_key":    "f6",
+                "phone_accept_key":  "f7",
+                "phone_decline_key": "f8",
+                "phone_mute_key":    "f9",
+                "phone_speaker_key": "f10",
+            }
+            if not core_cfg.get("phone_keys_defaults_applied"):
+                _changed = []
+                for _k, _v in _PHONE_KEY_DEFAULTS.items():
+                    if not core_cfg.get(_k):      # absent ou null ou ""
+                        core_cfg[_k] = _v
+                        _changed.append(f"{_k}={_v}")
+                core_cfg["phone_keys_defaults_applied"] = True
+                try:
+                    _core._save_client_cfg(core_cfg)
+                    if _changed:
+                        self._on_log("[CONFIG] Raccourcis CircusPhone par "
+                                     f"defaut appliques : {', '.join(_changed)}")
+                except Exception as _e:
+                    self._on_log(f"[CONFIG] Ecriture defauts phone KO : {_e}")
+
             state.phone_open_key     = _canon(core_cfg.get("phone_open_key"))
             state.phone_accept_key   = _canon(core_cfg.get("phone_accept_key"))
             state.phone_decline_key  = _canon(core_cfg.get("phone_decline_key"))

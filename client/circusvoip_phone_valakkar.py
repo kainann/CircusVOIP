@@ -47,6 +47,14 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QApplication, QWidget
 
 from circusvoip_phone_apps import PhoneApp, PhoneServices
+# [build 61] Icone vectorielle (fin des emoji : rendu identique sur tous
+# les PC). Import defensif : un vieux circusvoip_phone_apps sans fabrique
+# ne doit pas faire tomber l'app du registre -> repli glyphe.
+try:
+    from circusvoip_phone_apps import LazyPhoneIcon as _LazyPhoneIcon
+except Exception:
+    _LazyPhoneIcon = None
+
 
 import datetime
 try:
@@ -134,7 +142,8 @@ class ValakkarApp(PhoneApp):
 
     APP_ID = "valakkar"
     APP_NAME = "Valakkar"
-    APP_ICON = "\U0001F40D"          # 🐍 (placeholder ; sprite worm_head plus tard)
+    APP_ICON = (_LazyPhoneIcon("valakkar", "\U0001F40D")
+                if _LazyPhoneIcon is not None else "\U0001F40D")
     CAPTURES_KEYBOARD = True         # jeu : l'overlay route les touches brutes
 
     def __init__(self, screen_w, screen_h, screen_radius, services,

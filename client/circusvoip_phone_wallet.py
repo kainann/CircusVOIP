@@ -50,6 +50,14 @@ from PySide6.QtWidgets import (
 )
 
 from circusvoip_phone_apps import PhoneApp, PhoneServices
+# [build 61] Icone vectorielle (fin des emoji : rendu identique sur tous
+# les PC). Import defensif : un vieux circusvoip_phone_apps sans fabrique
+# ne doit pas faire tomber l'app du registre -> repli glyphe.
+try:
+    from circusvoip_phone_apps import LazyPhoneIcon as _LazyPhoneIcon
+except Exception:
+    _LazyPhoneIcon = None
+
 
 
 # ======================================================================
@@ -571,6 +579,183 @@ class GameLogRawTailThread(QThread):
 
 
 # ======================================================================
+#  [build 60] Scan des anciens logs (dossier logbackups) — INFRA PARTAGEE
+# ======================================================================
+# Star Citizen archive automatiquement chaque Game.log dans
+# <channel>\logbackups\ au lancement suivant (mecanisme officiel CIG,
+# ligne "BackupNameAttachment=... -- used by backup system" en tete).
+# Ce scanner GENERIQUE parcourt ces backups pour retrouver les evenements
+# des sessions ou CircusVOIP ne tournait pas. Chaque app consommatrice
+# fournit SON parser (via factory) et SON seuil de version :
+#   - Blueprints : BlueprintParser, seuil (4, 7) — les blueprints existent
+#     depuis la 4.7 et ont survecu au wipe 4.8.
+#   - Portefeuille : TransferParser, seuil (4, 8) — les aUEC ont ete WIPES
+#     au passage 4.8, les transactions anterieures ne concernent plus rien.
+# Filtres par fichier (en-tete, ~100 premieres lignes) :
+#   - Channel : "[Trace] Environment:   PUB" (= LIVE). Repli sur \LIVE\
+#     dans "Executable:" si Environment absent. PTU/EPTU rejetes.
+#   - Version : "Branch: sc-alpha-X.Y..." avec (X, Y) >= min_version.
+# Verifie sur logs reels : Branch en ligne 71 (LIVE 28/05 et PTU 13/05)
+# -> 100 lignes d'en-tete par securite.
+
+LOGBACKUPS_HEADER_LINES = 100
+
+_LB_ENV_RE = re.compile(r"\[Trace\]\s*Environment:\s*(?P<env>\w+)")
+_LB_BRANCH_RE = re.compile(r"Branch:\s*sc-alpha-(?P<maj>\d+)\.(?P<min>\d+)")
+_LB_EXE_RE = re.compile(r"Executable:\s*(?P<path>.+)", re.IGNORECASE)
+
+
+def read_backup_header(path) -> dict:
+    """Lit les LOGBACKUPS_HEADER_LINES premieres lignes d'un backup et en
+    extrait {env, version, exe_live}. S'arrete des que env ET version sont
+    connus. Ne leve jamais : {} si fichier illisible."""
+    info: dict = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for i, line in enumerate(f):
+                if i >= LOGBACKUPS_HEADER_LINES:
+                    break
+                if "env" not in info:
+                    m = _LB_ENV_RE.search(line)
+                    if m:
+                        info["env"] = m.group("env").upper()
+                if "version" not in info:
+                    m = _LB_BRANCH_RE.search(line)
+                    if m:
+                        info["version"] = (int(m.group("maj")),
+                                           int(m.group("min")))
+                if "exe_live" not in info:
+                    m = _LB_EXE_RE.search(line)
+                    if m:
+                        info["exe_live"] = "\\LIVE\\" in m.group("path").upper()
+                if "env" in info and "version" in info:
+                    break
+    except Exception:
+        return {}
+    return info
+
+
+def backup_is_eligible(info: dict, min_version: tuple) -> bool:
+    """Verdict des filtres channel + version sur un en-tete de backup.
+    - Channel : Environment == PUB fait foi. Si absent, repli sur \\LIVE\\
+      dans Executable. Ni l'un ni l'autre -> rejet (prudence).
+    - Version : Branch >= min_version. Branch absent -> rejet (un log sans
+      en-tete identifiable n'est pas un backup valide)."""
+    env = info.get("env")
+    if env is not None:
+        if env != "PUB":
+            return False
+    elif not info.get("exe_live", False):
+        return False
+    version = info.get("version")
+    if version is None or version < tuple(min_version):
+        return False
+    return True
+
+
+def find_logbackups_dir(gamelog_path) -> Optional[Path]:
+    """Dossier logbackups a cote du Game.log courant. None si absent
+    (desinstallation, chemin exotique) -> pas de scan, zero regression."""
+    try:
+        d = Path(gamelog_path).parent / "logbackups"
+        if d.is_dir():
+            return d
+    except Exception:
+        pass
+    return None
+
+
+class LogBackupsScanThread(QThread):
+    """Parcourt logbackups et emet les evenements trouves par le parser
+    fourni. Thread dedie : le premier scan peut representer des dizaines
+    de fichiers / des centaines de Mo, l'UI doit rester reactive.
+
+    parser_factory : callable sans argument -> objet avec .feed(line)->list.
+                     Un parser NEUF est cree PAR FICHIER : indispensable
+                     pour les automates a etat multi-lignes (TransferParser)
+                     afin qu'une notif coupee en fin de fichier ne corrompe
+                     pas le parsing du fichier suivant.
+    min_version    : tuple (maj, min) — seuil Branch: sc-alpha-X.Y.
+
+    sig_event(dict)         : un evenement parse (blueprint, operation...)
+    sig_progress(int, int)  : (fichiers traites, total a traiter)
+    sig_done(dict)          : {"found": int, "files": int,
+                               "scanned": {nom: taille}} ; "scanned" cumule
+                              l'ancien etat + les fichiers de ce scan (y
+                              compris rejetes par filtre : pas besoin de
+                              relire leur en-tete au prochain scan).
+    """
+
+    sig_event = Signal(dict)
+    sig_progress = Signal(int, int)
+    sig_done = Signal(dict)
+
+    def __init__(self, backups_dir, already_scanned: dict, parser_factory,
+                 min_version: tuple, parent=None):
+        super().__init__(parent)
+        self._dir = Path(backups_dir)
+        # {nom_fichier: taille} des backups deja traites. La taille permet
+        # de re-traiter un fichier qui aurait change (cas improbable : les
+        # backups CIG sont figes une fois ecrits, mais robuste par design).
+        self._already = dict(already_scanned or {})
+        self._factory = parser_factory
+        self._min_version = tuple(min_version)
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        found = 0
+        parsed_files = 0
+        scanned = dict(self._already)
+        try:
+            candidates = [p for p in sorted(self._dir.iterdir())
+                          if p.is_file()]
+        except Exception:
+            candidates = []
+        # Incremental : on ne retient que les fichiers jamais vus (ou dont
+        # la taille a change). Tous les autres ont DEJA ete lus en entier
+        # lors d'un scan precedent.
+        todo = []
+        for p in candidates:
+            try:
+                size = p.stat().st_size
+            except Exception:
+                continue
+            if self._already.get(p.name) == size:
+                continue
+            todo.append((p, size))
+
+        total = len(todo)
+        for i, (p, size) in enumerate(todo):
+            if self._stop:
+                break
+            self.sig_progress.emit(i + 1, total)
+            info = read_backup_header(p)
+            if backup_is_eligible(info, self._min_version):
+                try:
+                    parser = self._factory()
+                    with open(p, "r", encoding="utf-8",
+                              errors="ignore") as f:
+                        for line in f:
+                            if self._stop:
+                                break
+                            for ev in parser.feed(line):
+                                found += 1
+                                self.sig_event.emit(ev)
+                    parsed_files += 1
+                except Exception:
+                    # Fichier illisible en cours de route : on ne le marque
+                    # pas comme scanne, il sera retente au prochain scan.
+                    continue
+            if not self._stop:
+                scanned[p.name] = size
+        self.sig_done.emit({"found": found, "files": parsed_files,
+                            "scanned": scanned})
+
+
+# ======================================================================
 #  Une ligne de l'historique (carte transfert) — reprise a l'identique.
 # ======================================================================
 class TransferRow(QFrame):
@@ -688,6 +873,12 @@ WALLET_FILE = _BASE_DIR / "circusphone_wallet.json"
 # infinie du fichier). 500 = large pour un usage normal.
 WALLET_MAX_OPS = 500
 
+# [build 60] Seuil de version SC des anciens logs (logbackups) a scanner
+# pour le Portefeuille. Les aUEC ont ete WIPES au passage 4.8 : les
+# transactions des logs anterieurs concernent de l'argent qui n'existe
+# plus. Si un futur wipe efface a nouveau les credits, remonter ce seuil.
+WALLET_LOGBACKUPS_MIN_VERSION = (4, 8)
+
 
 def _load_wallet() -> dict:
     """Charge le fichier wallet ({version, gamelog_path, operations})."""
@@ -734,7 +925,8 @@ class WalletApp(PhoneApp):
 
     APP_ID = "wallet"
     APP_NAME = "Portefeuille"
-    APP_ICON = "\u20B5"            # ₵
+    APP_ICON = (_LazyPhoneIcon("wallet", "\u20B5")
+                if _LazyPhoneIcon is not None else "\u20B5")
     CAPTURES_KEYBOARD = False      # app non-jeu : nav D-pad standard
 
     def __init__(self, screen_w, screen_h, screen_radius, services, parent=None):
@@ -762,6 +954,9 @@ class WalletApp(PhoneApp):
         # Flag : True pendant le rattrapage one-shot pour ne pas re-sauver a
         # chaque ligne (on sauve une fois a la fin).
         self._bulk_loading = False
+        # [build 60] scan des anciens logs (logbackups)
+        self._backups_thread: Optional[LogBackupsScanThread] = None
+        self._backups_dirty = False   # au moins 1 op ingeree par le scan
 
         self._build_screen()
         self._populate_from_ops()
@@ -916,6 +1111,12 @@ class WalletApp(PhoneApp):
             self.scroll.verticalScrollBar().setValue(0)
         except Exception:
             pass
+        # [build 61] Re-scan des anciens logs a CHAQUE ouverture de l'app :
+        # couvre le cas d'une session SC jouee SANS CircusVOIP pendant que
+        # le client restait ouvert. Quasi gratuit grace a l'incremental
+        # (aucun nouveau fichier -> scan instantane) ; le garde
+        # _backups_thread evite les scans concurrents.
+        self._start_backups_scan()
 
     def on_hide(self):
         """Quitte l'ecran : no-op. Contrairement aux jeux, le wallet doit
@@ -959,6 +1160,12 @@ class WalletApp(PhoneApp):
             except Exception:
                 pass
             self._raw_thread = None
+        if self._backups_thread is not None:
+            try:
+                self._backups_thread.stop()
+                self._backups_thread.wait(2000)
+            except Exception:
+                pass
         self._unsubscribe_feed()
 
     # ------------------------------------------------------------------
@@ -988,6 +1195,96 @@ class WalletApp(PhoneApp):
             self._data["gamelog_path"] = path
             _save_wallet(self._data)
             self._start_raw_tail(path, history=True, oneshot=False)
+        # [build 60] Dans tous les cas (integre ou autonome), tenter le
+        # scan des anciens logs. Thread independant du tail temps reel.
+        self._start_backups_scan()
+
+    def _resolve_gamelog_path(self) -> Optional[str]:
+        """Chemin du Game.log courant : feed integre si dispo, sinon
+        repli autonome."""
+        path = None
+        gamelog = getattr(self.services, "gamelog", None)
+        if gamelog is not None and hasattr(gamelog, "current_path"):
+            try:
+                path = gamelog.current_path()
+            except Exception:
+                path = None
+        return path or find_gamelog(self._data.get("gamelog_path"))
+
+    # ------------------------------------------------------------------
+    #  [build 60] Scan des anciens logs (logbackups)
+    # ------------------------------------------------------------------
+    def _start_backups_scan(self):
+        if self._backups_thread is not None:
+            return  # deja en cours
+        path = self._resolve_gamelog_path()
+        if not path:
+            return  # pas de Game.log connu -> pas de logbackups derivable
+        backups_dir = find_logbackups_dir(path)
+        if backups_dir is None:
+            return  # dossier absent : rien a faire, zero regression
+        already = self._data.get("logbackups_scanned")
+        if not isinstance(already, dict):
+            already = {}
+        self._backups_thread = LogBackupsScanThread(
+            backups_dir, already,
+            parser_factory=TransferParser,
+            min_version=WALLET_LOGBACKUPS_MIN_VERSION)
+        self._backups_thread.sig_event.connect(self._on_backup_op)
+        self._backups_thread.sig_progress.connect(self._on_backup_progress)
+        self._backups_thread.sig_done.connect(self._on_backup_done)
+        self._backups_thread.start()
+
+    def _on_backup_op(self, op: dict):
+        n_before = len(self._ops)
+        # flash=False : import historique. Mode bulk force le temps de
+        # l'ingest pour eviter une sauvegarde JSON par operation (la
+        # sauvegarde unique a lieu dans _on_backup_done).
+        was_bulk = self._bulk_loading
+        self._bulk_loading = True
+        try:
+            self._ingest(op, flash=False)
+        finally:
+            self._bulk_loading = was_bulk
+        if len(self._ops) != n_before:
+            self._backups_dirty = True
+
+    def _on_backup_progress(self, done: int, total: int):
+        if total > 0:
+            self._set_status(f"Lecture des anciens logs… {done}/{total}")
+
+    def _on_backup_done(self, result: dict):
+        thread = self._backups_thread
+        self._backups_thread = None
+        if thread is not None:
+            try:
+                thread.wait(1000)
+            except Exception:
+                pass
+        scanned = result.get("scanned")
+        if isinstance(scanned, dict):
+            self._data["logbackups_scanned"] = scanned
+        if self._backups_dirty:
+            self._data["operations"] = self._ops
+        _save_wallet(self._data)
+        self._update_total()
+        found = int(result.get("found", 0))
+        files = int(result.get("files", 0))
+        if found > 0:
+            unit = "opération retrouvée" if found == 1 else "opérations retrouvées"
+            sess = "session" if files == 1 else "sessions"
+            self._set_status(f"{found} {unit} dans {files} {sess} "
+                             "d'anciens logs", live=True)
+        elif self._subscribed:
+            self._set_status("En direct (tail partagé)", live=True)
+        else:
+            # [build 61] Mode tail autonome : sans cette restauration, le
+            # "Lecture des anciens logs… n/n" d'un re-scan (on_show) qui ne
+            # trouve rien resterait fige jusqu'au prochain evenement du
+            # thread de tail. Meme prefixe "En direct" que le thread pour
+            # que le handler de statut le traite comme un etat live.
+            self._set_status("En direct (suivi du Game.log)", live=True)
+        self._backups_dirty = False
 
     def _catch_up_session(self):
         """Lecture one-shot du Game.log courant pour rattraper la session

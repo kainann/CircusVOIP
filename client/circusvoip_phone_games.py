@@ -35,6 +35,14 @@ from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
 from circusvoip_phone_apps import PhoneApp, PhoneHome, HomeEntry
+# [build 61] Icone vectorielle (fin des emoji : rendu identique sur tous
+# les PC). Import defensif : un vieux circusvoip_phone_apps sans fabrique
+# ne doit pas faire tomber l'app du registre -> repli glyphe.
+try:
+    from circusvoip_phone_apps import LazyPhoneIcon as _LazyPhoneIcon
+except Exception:
+    _LazyPhoneIcon = None
+
 
 
 class GamesFolderApp(PhoneApp):
@@ -44,7 +52,8 @@ class GamesFolderApp(PhoneApp):
 
     APP_ID:   str = "games"
     APP_NAME: str = "Jeux"
-    APP_ICON = "\U0001F3AE"   # 🎮 manette
+    APP_ICON = (_LazyPhoneIcon("games", "\U0001F3AE")
+                if _LazyPhoneIcon is not None else "\U0001F3AE")
     CAPTURES_KEYBOARD: bool = False
 
     # Emis avec l'APP_ID du jeu choisi. L'overlay le resout vers la classe

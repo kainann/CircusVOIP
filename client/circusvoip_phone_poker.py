@@ -50,6 +50,14 @@ from PySide6.QtWidgets import QApplication, QWidget
 
 import circusvoip_phone_poker_engine as pe
 from circusvoip_phone_apps import PhoneApp, PhoneServices
+# [build 61] Icone vectorielle (fin des emoji : rendu identique sur tous
+# les PC). Import defensif : un vieux circusvoip_phone_apps sans fabrique
+# ne doit pas faire tomber l'app du registre -> repli glyphe.
+try:
+    from circusvoip_phone_apps import LazyPhoneIcon as _LazyPhoneIcon
+except Exception:
+    _LazyPhoneIcon = None
+
 try:
     import circusvoip_phone_mp as mp
 except Exception:               # module absent -> multijoueur desactive,
@@ -149,7 +157,8 @@ class PokerApp(PhoneApp):
 
     APP_ID = "poker"
     APP_NAME = "Poker"
-    APP_ICON = "\u2660"              # ♠
+    APP_ICON = (_LazyPhoneIcon("poker", "\u2660")
+                if _LazyPhoneIcon is not None else "\u2660")
     CAPTURES_KEYBOARD = True         # jeu : l'overlay route les touches brutes
 
     def __init__(self, screen_w, screen_h, screen_radius, services, parent=None):

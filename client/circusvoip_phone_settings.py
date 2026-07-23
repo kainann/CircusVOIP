@@ -45,6 +45,14 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QApplication, QWidget
 
 from circusvoip_phone_apps import PhoneApp, PhoneServices
+# [build 61] Icone vectorielle (fin des emoji : rendu identique sur tous
+# les PC). Import defensif : un vieux circusvoip_phone_apps sans fabrique
+# ne doit pas faire tomber l'app du registre -> repli glyphe.
+try:
+    from circusvoip_phone_apps import LazyPhoneIcon as _LazyPhoneIcon
+except Exception:
+    _LazyPhoneIcon = None
+
 
 
 def _load_oriented_pixmap(path):
@@ -68,10 +76,10 @@ _TEXT   = "#c9d1d9"
 _MUTED  = "#6e7681"
 _ACCENT = "#2f6fed"
 
-# Fond par defaut (degrade genere) = le repli du home quand aucun fond n'est
-# configure. Doit matcher HOME_BG_DEFAULT_* de circusvoip_phone_apps.
-_DEFAULT_TOP = "#16263f"
-_DEFAULT_BOT = "#0a0d14"
+# Fond par defaut = NOIR (release build 62). Doit matcher HOME_BG_DEFAULT_*
+# de circusvoip_phone_apps (les deux stops identiques => aplat noir).
+_DEFAULT_TOP = "#000000"
+_DEFAULT_BOT = "#000000"
 _DEFAULT_KEY = "__default__"
 
 # Fonds proposes generes par code : (nom, couleur haut, couleur bas).
@@ -91,7 +99,8 @@ class SettingsApp(PhoneApp):
 
     APP_ID = "settings"
     APP_NAME = "Paramètres"
-    APP_ICON = "\u2699"
+    APP_ICON = (_LazyPhoneIcon("settings", "\u2699")
+                if _LazyPhoneIcon is not None else "\u2699")
     CAPTURES_KEYBOARD = False
 
     sig_open_profile   = Signal()              # ecran photo de profil

@@ -20,6 +20,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import secrets
 import time
@@ -41,6 +42,57 @@ try:
 except ImportError:
     print("Installez websockets : py -3.14 -m pip install websockets")
     exit(1)
+
+
+# ─────────────────────────────────────────────
+#  Nettoyage des logs de handshake WebSocket
+# ─────────────────────────────────────────────
+# Quand une connexion NON-WebSocket tape le port audio (scan de ports, sonde
+# de monitoring, navigateur/curl en http://...:PORT), la lib `websockets`
+# refuse au handshake et logge un TRACEBACK complet ("opening handshake
+# failed" + InvalidUpgrade: missing Connection header). C'est benin — le
+# serveur rejette correctement, aucun joueur n'est affecte — mais ca pollue le
+# journal et fait croire a un incident lors des analyses (observe 3x le
+# 20/07/2026). Ce filtre transforme ces rejets en UNE ligne WARNING lisible,
+# sans stack trace, sans toucher a la logique de connexion.
+# InvalidHandshake est la classe de base de tous les echecs de handshake
+# (dont InvalidUpgrade). On l'importe explicitement : `websockets.exceptions`
+# n'est pas resolu par le simple `import websockets` (imports paresseux de la
+# lib). Import defensif pour ne jamais casser le demarrage si l'API bouge.
+try:
+    from websockets.exceptions import InvalidHandshake as _InvalidHandshake
+    _BENIGN_HANDSHAKE = (_InvalidHandshake,)
+except Exception:  # pragma: no cover
+    _BENIGN_HANDSHAKE = ()
+
+
+class _WsHandshakeNoiseFilter(logging.Filter):
+    _BENIGN = _BENIGN_HANDSHAKE
+
+    def filter(self, record):
+        exc = record.exc_info[1] if record.exc_info else None
+        is_benign = isinstance(exc, self._BENIGN)
+        if not is_benign and exc is None:
+            # certaines versions loggent sans exc_info : repli sur le message
+            is_benign = "opening handshake failed" in record.getMessage()
+        if is_benign:
+            detail = type(exc).__name__ if exc is not None else "requete non-WebSocket"
+            record.msg = ("handshake rejete (connexion non-WebSocket sur le "
+                          f"port audio : {detail}) - ignore")
+            record.args = ()
+            record.exc_info = None
+            record.exc_text = None
+            record.levelno = logging.WARNING
+            record.levelname = "WARNING"
+        return True  # on garde la ligne (nettoyee), on ne supprime jamais
+
+
+def _install_ws_handshake_log_filter():
+    """Attache le filtre au logger que websockets utilise pour les connexions
+    serveur. Idempotent (ne s'ajoute qu'une fois)."""
+    lg = logging.getLogger("websockets.server")
+    if not any(isinstance(f, _WsHandshakeNoiseFilter) for f in lg.filters):
+        lg.addFilter(_WsHandshakeNoiseFilter())
 
 from circusvoip_server_config import get_token
 
@@ -471,6 +523,10 @@ async def _serve(ui):
         return
     _ssl_ctx = build_ssl_context(str(_cert_file), str(_key_file))
     ui.log(f"TLS active : serveur audio en wss:// (cert {_detail})")
+
+    # Rend les rejets de handshake non-WebSocket (scans de ports) lisibles :
+    # une ligne WARNING au lieu d'un traceback complet dans journalctl.
+    _install_ws_handshake_log_filter()
 
     async with websockets.serve(
         lambda ws: handler(ws, ui),

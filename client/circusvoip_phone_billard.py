@@ -40,6 +40,14 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QApplication, QWidget
 
 from circusvoip_phone_apps import PhoneApp, PhoneServices
+# [build 61] Icone vectorielle (fin des emoji : rendu identique sur tous
+# les PC). Import defensif : un vieux circusvoip_phone_apps sans fabrique
+# ne doit pas faire tomber l'app du registre -> repli glyphe.
+try:
+    from circusvoip_phone_apps import LazyPhoneIcon as _LazyPhoneIcon
+except Exception:
+    _LazyPhoneIcon = None
+
 try:
     import circusvoip_phone_mp as mp
 except Exception:
@@ -258,7 +266,8 @@ class BilliardApp(PhoneApp):
 
     APP_ID = "billard"
     APP_NAME = "Billard"
-    APP_ICON = "\U0001F3B1"          # 🎱
+    APP_ICON = (_LazyPhoneIcon("billard", "\U0001F3B1")
+                if _LazyPhoneIcon is not None else "\U0001F3B1")
     CAPTURES_KEYBOARD = True         # jeu : l'overlay route les touches brutes
 
     BALL_R = 0.018          # rayon bille en fraction de la largeur de table

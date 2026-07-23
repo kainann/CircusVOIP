@@ -801,6 +801,16 @@ async def _cleanup_loop():
             # Le cleanup_loop fait clients.pop() directement sans passer
             # par le finally du handler, d'ou cet appel explicite.
             await _phone_drop_calls_for(name, reason="peer_timeout")
+            # Multijoueur : comme pour une deconnexion propre, retirer le
+            # joueur de ses lobbies (sinon il reste FANTOME : compteur faux,
+            # lobby non dissous s'il etait hote, membres non prevenus, partie
+            # figee sur son tour). Le cleanup_loop ne passant pas par le
+            # 'finally' du handler, l'appel doit etre explicite ici aussi.
+            if _mp_server is not None:
+                try:
+                    await _mp_emit(_mp_server.on_disconnect(name))
+                except Exception:
+                    pass
             await _broadcast_all(json.dumps({"type": "leave", "name": name}))
 
         # Stats agregees toutes les 30s (= 6 ticks de 5s). Affichees dans
@@ -1022,6 +1032,139 @@ async def _send_to_name(name: str, payload: dict) -> bool:
         return True
     except Exception:
         return False
+
+
+# ======================================================================
+#  Multijoueur (lobbies) : delegue a circusvoip_mp_server (logique pure).
+#  Le serveur fournit position/joueurs ; les handlers renvoient une liste
+#  de (dest_name, message) que _mp_emit envoie via _send_to_name.
+# ======================================================================
+try:
+    import circusvoip_mp_server as _mpmod
+    _mp_server = _mpmod.MpServer(
+        pos_of=lambda n: (clients.get(_find_ws_by_name(n)) or {}).get("pos"),
+        online_names=lambda: [i["name"] for i in clients.values()
+                              if i.get("name")],
+    )
+except Exception as _e:   # module absent ou erreur d'init -> MP desactive
+    _mpmod = None
+    _mp_server = None
+
+
+_MP_TYPES = ("mp_create", "mp_list", "mp_join", "mp_ready",
+             "mp_start", "mp_leave", "mp_game")
+
+# ---------------------------------------------------------------------------
+# Meilleurs scores PARTAGES (classement serveur, tous joueurs confondus).
+#   hs_submit {game, score}  -> enregistre si c'est le meilleur perso du joueur
+#   hs_get    {game}         -> {type:"hs_list", game, scores:[{name,score,date}]}
+# Stockage : circusvoip_highscores.json (top _HS_MAX par jeu, une entree par
+# joueur = son meilleur score).
+# ---------------------------------------------------------------------------
+_HS_FILE = _BASE_DIR / "circusvoip_highscores.json"
+_HS_MAX = 20
+_HS_TYPES = ("hs_submit", "hs_get")
+_highscores = None      # {game: [{"name","score","date"}]}, charge au 1er acces
+
+
+def _hs_load():
+    global _highscores
+    if _highscores is not None:
+        return _highscores
+    _highscores = {}
+    try:
+        if _HS_FILE.exists():
+            with open(_HS_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                for g, lst in raw.items():
+                    if isinstance(lst, list):
+                        _highscores[str(g)] = [
+                            {"name": str(e.get("name", "?")),
+                             "score": int(e.get("score", 0)),
+                             "date": str(e.get("date", ""))}
+                            for e in lst if isinstance(e, dict)]
+    except Exception as e:
+        print(f"[HS] chargement KO : {e}")
+    return _highscores
+
+
+def _hs_save():
+    try:
+        with open(_HS_FILE, "w", encoding="utf-8") as f:
+            json.dump(_hs_load(), f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[HS] sauvegarde KO : {e}")
+
+
+def _hs_handle(name: str, t: str, data: dict):
+    """Aiguille un message hs_*. Retourne [(dest, msg)] comme les handlers MP."""
+    hs = _hs_load()
+    game = str(data.get("game") or "")
+    if not game:
+        return []
+    if t == "hs_submit":
+        try:
+            score = int(data.get("score", 0))
+        except Exception:
+            return []
+        if score <= 0:
+            return []
+        lst = hs.setdefault(game, [])
+        mine = next((e for e in lst if e["name"] == name), None)
+        changed = False
+        if mine is None:
+            lst.append({"name": name, "score": score,
+                        "date": time.strftime("%d/%m/%y")})
+            changed = True
+        elif score > mine["score"]:
+            mine["score"] = score
+            mine["date"] = time.strftime("%d/%m/%y")
+            changed = True
+        if changed:
+            lst.sort(key=lambda e: e["score"], reverse=True)
+            hs[game] = lst[:_HS_MAX]
+            _hs_save()
+        # Toujours renvoyer le classement a jour a l'emetteur (feedback).
+        return [(name, {"type": "hs_list", "game": game,
+                        "scores": hs.get(game, [])})]
+    if t == "hs_get":
+        return [(name, {"type": "hs_list", "game": game,
+                        "scores": hs.get(game, [])})]
+    return []
+
+
+def _mp_handle(name: str, t: str, data: dict):
+    """Aiguille un message mp_* vers MpServer. Retourne [(dest, msg)]."""
+    if _mp_server is None:
+        return []
+    if t == "mp_create":
+        return _mp_server.on_create(name, data.get("game"),
+                                    data.get("scope"), data.get("params"))
+    if t == "mp_list":
+        return _mp_server.on_list(name, data.get("game"), data.get("scope"))
+    if t == "mp_join":
+        return _mp_server.on_join(name, data.get("lobby_id"))
+    if t == "mp_ready":
+        return _mp_server.on_ready(name, data.get("lobby_id"),
+                                   data.get("ready"))
+    if t == "mp_start":
+        return _mp_server.on_start(name, data.get("lobby_id"))
+    if t == "mp_leave":
+        return _mp_server.on_leave(name, data.get("lobby_id"))
+    if t == "mp_game":
+        return _mp_server.on_game(name, data.get("lobby_id"),
+                                  data.get("payload"))
+    return []
+
+
+async def _mp_emit(out):
+    """Envoie chaque (dest_name, payload) renvoye par un handler MP."""
+    for dest, payload in (out or []):
+        try:
+            await _send_to_name(dest, payload)
+        except Exception:
+            pass
 
 
 def _phone_clear_call(call_id: str):
@@ -1982,6 +2125,48 @@ async def handler(ws):
                             "ts":     ts,
                         })
 
+            elif msg_type == "phone_image_send":
+                # Un joueur envoie un SCREENSHOT (JPEG base64) a un autre.
+                # Meme philosophie que les MP texte : le serveur ROUTE sans
+                # stocker ; destinataire hors ligne = image perdue. Garde-fous :
+                # cible valide, pas d'auto-envoi, base64 non vide et sous la
+                # limite de frame WS (~1 Mo par defaut websockets).
+                if ws in clients:
+                    sender = clients[ws]["name"]
+                    target = data.get("target")
+                    b64    = data.get("data")
+                    if not isinstance(target, str) or not target:
+                        _log(f"[PHONE-IMG] {sender} : ignore "
+                             f"(target invalide)", ORANGE)
+                    elif target == sender:
+                        _log(f"[PHONE-IMG] {sender} : ignore (auto-envoi)",
+                             ORANGE)
+                    elif not isinstance(b64, str) or not b64:
+                        _log(f"[PHONE-IMG] {sender} : ignore (data vide)",
+                             ORANGE)
+                    elif len(b64) > 900_000:
+                        _log(f"[PHONE-IMG] {sender} -> {target} : ignore "
+                             f"(image trop lourde : {len(b64)} b64)", ORANGE)
+                    elif _find_ws_by_name(target) is None:
+                        _log(f"[PHONE-IMG] {sender} -> {target} : cible "
+                             f"hors ligne, image perdue", ORANGE)
+                        _phone_log_event("img_lost", call_id=None,
+                                         sender=sender, target=target,
+                                         len=len(b64))
+                    else:
+                        ts = time.time()
+                        _log(f"[PHONE-IMG] {sender} -> {target} "
+                             f"({len(b64)} b64)", PURPLE)
+                        _phone_log_event("img_sent", call_id=None,
+                                         sender=sender, target=target,
+                                         len=len(b64))
+                        await _send_to_name(target, {
+                            "type":   "phone_image_received",
+                            "sender": sender,
+                            "data":   b64,
+                            "ts":     ts,
+                        })
+
             # ─────────────────────────────────────────────
             #  [D5] Photos de profil : upload + request
             # ─────────────────────────────────────────────
@@ -2146,6 +2331,30 @@ async def handler(ws):
                                     _log(f"[PROFILE] {requester} <- {target} "
                                          f"({len(jpeg_bytes)} bytes)", MUTED)
 
+            elif msg_type in _MP_TYPES:
+                # Multijoueur (lobbies). Le joueur est identifie par son
+                # pseudo serveur ; MpServer valide proximite/capacite et
+                # renvoie les messages a diffuser.
+                if ws in clients and _mp_server is not None:
+                    pname = clients[ws]["name"]
+                    try:
+                        out = _mp_handle(pname, msg_type, data)
+                    except Exception as e:
+                        out = []
+                        _log(f"[MP] {pname} {msg_type} KO : {e}", ORANGE)
+                    await _mp_emit(out)
+
+            elif msg_type in _HS_TYPES:
+                # Meilleurs scores partages (classement serveur par jeu).
+                if ws in clients:
+                    pname = clients[ws]["name"]
+                    try:
+                        out = _hs_handle(pname, msg_type, data)
+                    except Exception as e:
+                        out = []
+                        _log(f"[HS] {pname} {msg_type} KO : {e}", ORANGE)
+                    await _mp_emit(out)
+
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
@@ -2166,6 +2375,13 @@ async def handler(ws):
             # AVANT d'annoncer son leave. L'autre partie recevra
             # phone_call_ended (reason=peer_disconnect).
             await _phone_drop_calls_for(name, reason="peer_disconnect")
+            # Multijoueur : retirer le joueur de ses lobbies (dissout le
+            # lobby s'il en etait l'hote ; previent les membres restants).
+            if _mp_server is not None:
+                try:
+                    await _mp_emit(_mp_server.on_disconnect(name))
+                except Exception:
+                    pass
             # D4b : si ce joueur faisait partie de listes HP d'autres appels
             # (en tant que voisin d'un owner), le retirer pour eviter que le
             # peer croie pouvoir l'entendre encore. On parcourt les calls
@@ -2570,13 +2786,13 @@ class ServerUI:
         try:
             import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "CircusVOIP.Server.0.2"
+                "CircusVOIP.Server.0.3"
             )
         except Exception:
             pass
 
         self.root = tk.Tk()
-        self.root.title("CircusVOIP — Serveur 0.2")
+        self.root.title("CircusVOIP — Serveur 0.3")
         self.root.configure(bg=BG)
         # Icone de la fenetre + barre des taches : StarCircus_Server.ico
         # qui est dans le meme dossier que le script. Fallback silencieux

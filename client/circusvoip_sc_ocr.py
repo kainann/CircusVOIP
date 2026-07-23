@@ -354,6 +354,17 @@ _OCR_CHAR_EQUIV = {
     "e": "ec",  # parfois e lu comme c
     "v": "vy",
     "a": "a4",
+    # m <-> n : confusion observee 16/07/2026 dans le log positions du VPS
+    # (session hugo) : "misc_prospector" lu "nisc_prospeceot", "nisc_progector",
+    # "nisc_probector", "ni5g_probpector"... — 7 lectures distinctes commencant
+    # par "nisc"/"ni5g" ont fui vers le serveur (cids name: divergents ->
+    # micro-coupures VOIP). Rejeu du matcher sur le corpus : m<->n rattrape
+    # 6 des 13 fuites observees (distance passe de 3 a 2 = seuil).
+    # Controle collisions intra-whitelist avant/apres (383 zones) : UNE seule
+    # paire nouvelle, hangar_xlfront_distributioncenter <->
+    # hangar_mediumtop_distributioncenter a distance 7 = seuil 7 (noms 33+
+    # chars, meme batiment, match exact prioritaire) — risque negligeable.
+    "m": "mn",
     # 2 <-> z : confusion observee 07/05/2026 sur "pyro2" lu "pyroz" en boucle
     # (HUD Pyro avec petit rendu, l'OCR voit z au lieu du 2). Sans cette
     # equivalence, la fuzzy match resolvait pyroz indifferemment vers pyro1,
@@ -579,6 +590,17 @@ _KNOWN_ZONES_SHIPS = [
     "mrai_fury_lx",
     # Origin (suite)
     "origin_85x",
+    # Origin 125a — decouvert par verification systematique du log positions
+    # VPS du 16/07/2026 : 277 lectures de Kainan (vol 16h34-16h36 locale)
+    # TOUTES en fuite (zone inconnue). ⚠ Le HUD emet "ORIG_125a" (prefixe
+    # ABREGE) alors que les Origin historiques ci-dessous sont en "origin_*"
+    # (forme longue). Le fuzzy rattrape orig_XXX -> origin_XXX pour les
+    # anciens (2 insertions <= seuil), mais le 125a n'avait aucune entree
+    # a portee. On garde la forme observee. Variantes vues : ortg_125a,
+    # u_orig_125a_720 (rattrapees par fuzzy + zone collante).
+    # Si d'autres vaisseaux Origin recents sortent en "ORIG_", les ajouter
+    # sous cette forme abregee.
+    "orig_125a",
     "origin_100i",
     "origin_300i",
     "origin_315p",
@@ -592,6 +614,19 @@ _KNOWN_ZONES_SHIPS = [
     "drak_cutlass_red",      # variante medical
     "drak_cutlass_blue",     # variante police
     "drak_cutlass_steel",    # variante transport troupes
+    # Vaisseaux de MISSION Drake (abordage) — observes 16/07/2026 lors des
+    # missions d'abordage du Glaciem Ring (Nyx) :
+    #   - "DRAK_Cutlass_Black_PU_Boarding" : Cutlass cible/support de mission,
+    #     SANS id d'instance dans le HUD -> cid retombe sur name: (partage
+    #     entre deux Cutlass de mission distincts — limitation connue, cf.
+    #     backlog b61 point 6). Variantes OCR observees et rattrapees par
+    #     cette entree : cuflass (40x chez Skywat !), cutiass, biack,
+    #     blackpu, cuf_lass.
+    #   - "DRAK_Caterpillar_Boarded_<id>" : Caterpillar aborde, AVEC id
+    #     d'instance (strip standard). Variantes : calerpillar, dfak_,
+    #     caterp_llar, caterpfllar.
+    "drak_cutlass_black_pu_boarding",
+    "drak_caterpillar_boarded",
     "drak_buccaneer",
     "drak_caterpillar",
     "drak_command_module",   # module de pilotage (cockpit) du Caterpillar - container_id distinct du vaisseau
@@ -602,6 +637,11 @@ _KNOWN_ZONES_SHIPS = [
     "drak_cutter_scout",     # variante reconnaissance
     "drak_dragonfly",
     "drak_herald",
+    # Drake Ironclad — nouveau vaisseau, observe 16/07/2026 avec id
+    # d'instance propre ("DRAK_Ironclad_720570013379"). Variante OCR vue
+    # chez Kainan : "drak_tronclad" (i<->t, rattrapee a distance 0 avec
+    # l'equivalence l/t/i existante).
+    "drak_ironclad",
     "drak_vulture",
     # DRAK ships vus en test 09/05/2026 (showroom A18)
     "drak_mule",             # Mule (cargo leger, hover)
@@ -643,6 +683,18 @@ _KNOWN_ZONES_SHIPS = [
     # Greycat Industrial : STV (Small Terrestrial Vehicle), buggy de surface
     # offert avec certains packages. SC affiche "GRIN_STV" dans le HUD.
     "grin_stv",
+    # GLSN Basher — nouveau vaisseau constructeur GLSN, observe 16/07/2026
+    # (hangar Levski, 51 lectures serveur, ZERO variante OCR : l'entree est
+    # preventive, pour rattraper les futures lectures bruitees).
+    "glsn_basher",
+    # Kruger L-21 Wolf — nom technique confirme par Kainan le 17/07/2026 :
+    # "KRIG_L21_Wolf" (KRIG = Kruger Intergalactic). C'etait LA zone la plus
+    # bruitee du log positions VPS du 16/07 : ~3700 lectures de hugo reparties
+    # sur ~30 graphies (kric/krig/kaig, l2/lz/l2i/lzi/l2_i, wo/io/wolf/iolf/
+    # wol/iol...) — confusions g<->c, 1<->i/z, l<->i et troncatures du "Wolf".
+    # Chaque graphie produisait un cid name: divergent. Le fuzzy + la zone
+    # collante font converger la constellation vers cette canonique.
+    "krig_l21_wolf",
 ]
 
 _KNOWN_ZONES_INTERIORS = [
@@ -729,6 +781,8 @@ _KNOWN_ZONES_INTERIORS = [
     "hangar_mediumfront_distributioncenter",
     "hangar_smalltop_distributioncenter",
     "hangar_smallfront_distributioncenter",
+    # Habitats (habs loues) des rest stops - releve Kainan CRU-L5 07/07/2026.
+    "rs_habs_005_occu_001",
     "reststop_cargo_occu_0001",    # cargo habitat reststop (plusieurs instances)
     "reststop_cargo_occu_0002",
     "reststop_cargo_occu_0003",
@@ -743,6 +797,7 @@ _KNOWN_ZONES_INTERIORS = [
     "transitcarriage_levskismall",
     "transitcarriage_levskimedium",
     "transitcarriage_elev_util",   # ascenseur utilitaire
+    "transitcarriage_ez_habs",     # ascenseur des habs (EZ Habs) - CRU-L5 07/07/2026
     "transitcarriage_elev_util_securityclearance",  # ascenseur security clearance
     "transitcarriage_lorville_tram",   # tram Lorville (gare centrale)
     "transitcarriage_ugfacilitylta",  # ascenseur UGF (underground facility)
@@ -762,6 +817,16 @@ _KNOWN_ZONES_INTERIORS = [
     # Si d'autres vaisseaux ont un ascenseur intra (Reclaimer, 890 Jump,
     # Hammerhead...), ajouter sous la meme convention en les observant.
     "transitcarriage_anvl_carrack_elevator",
+    # Ascenseur arriere du RSI Polaris — observe 16/07/2026 (82 lectures
+    # serveur + 4 variantes OCR : transiicarriage, trans_tcarriage,
+    # transitcarr_age, trars_ecarr_age — toutes rattrapees, dist 0-3,
+    # seuil 7). NOTE : observe alors que le joueur etait dans un PERSEUS
+    # (asset d'ascenseur Polaris reutilise par CIG dans le Perseus,
+    # lectures propres, pas une erreur OCR). ⚠ A verifier en jeu : cet
+    # ascenseur porte-t-il un id d'instance comme celui du Carrack ?
+    # Sans id, deux vaisseaux distincts partageraient le cid name: de
+    # leur ascenseur (cf. backlog b61 point 6).
+    "transitcarriage_rsi_polaris_rear_elevator",
     # TransportCarriage GrimHex - ascenseurs principaux observes 23/05/2026
     # ATTENTION : SC utilise DEUX nomenclatures distinctes :
     #   - "TransitCarriage_*"   : trams/ascenseurs Levski, A18, Lorville, UGF, reststops
@@ -778,6 +843,10 @@ _KNOWN_ZONES_INTERIORS = [
     "rs_entry_cru-leo1",
     "rs_entry_cru-leo2",
     "rs_entry_cru-leo3",
+    # Hall commercial des rest stops Crusader LEO (releve Kainan CRU-L5,
+    # 07/07/2026 : OCR "rs comm cru leol" -> leo1). Meme famille que les
+    # rs_entry_cru-leoN ci-dessus ; le fuzzy rattrape _<->- et l<->1.
+    "rs_comm_cru-leo1",
     # Underground Facilities (bunkers) - le "_0001_int" est le format observe
     # en jeu (_int = interieur). Si d'autres numeros apparaissent dans les logs
     # on pourra enrichir ou ajouter un strip du numero interne.
@@ -786,6 +855,12 @@ _KNOWN_ZONES_INTERIORS = [
     "objectcontainer-ugf_ita_c_0001_int",
     "objectcontainer-ugf_cor_a_0001_int",
     "objectcontainer-ugf_dls_a_0001_int",
+    # Teach's Ship Shop (boutique de vaisseaux) — observe 16/07/2026
+    # (18 lectures serveur, format "ObjectContainer_TeachsShipShop").
+    # Underscore et non tiret apres "objectcontainer" (contrairement aux
+    # ugf ci-dessus) : la normalisation des separateurs unifie de toute
+    # facon, mais on garde la forme observee.
+    "objectcontainer_teachsshipshop",
     # POI (Points of Interest) dans l'espace
     "tsg_gascloud_001",            # gas cloud events (plusieurs instances)
     "tsg_gascloud_002",
@@ -921,13 +996,59 @@ _KNOWN_ZONES_INTERIORS = [
     "newbabbage_shuttle",
     "newbabbage_metro",
     "objectcontainer-newbab_domes_int_001",  # Dome Newbab (interieur)
+    # Zones New Babbage ajoutees 02/07/2026 (log + screenshots Kainan, qui
+    # font foi sur l'orthographe reelle du HUD SC) :
+    # - "ObjectContainer-newbab_sp_transit_int_001" (TIRET apres
+    #   ObjectContainer, comme domes_int). Sans cette entree l'OCR sortait
+    #   des variantes brutes instables (underscore, "odjectcortairier_
+    #   rewbab...", "rlewbab"...) -> zones differentes entre joueurs au
+    #   meme endroit.
+    "objectcontainer-newbab_sp_transit_int_001",  # transit spaceport int.
+    # - "ObjectContainerModifier_SP_INT" (COLLE, underscore) : spaceport
+    #   New Babbage. Sans entree exacte, le fuzzy mappait a tort sur
+    #   "objectcontainer-lorville_sp_int" (Lorville, Hurston !) -> fausse
+    #   localisation inter-planetes.
+    "objectcontainermodifier_sp_int",
+    # - Hangars de surface New Babbage (convention _top comme Lorville ;
+    #   xltop observe en jeu avec cid, autres tailles par anticipation).
+    "hangar_smalltop_newbabbage",
+    "hangar_mediumtop_newbabbage",
+    "hangar_largetop_newbabbage",
+    "hangar_xltop_newbabbage",
+    # - "TransitCarriage NewBabbage Hangars <cid>" : tram vers les hangars.
+    #   Sans cette entree, le fuzzy mappait a tort sur
+    #   "transitcarriage_newbabbage_hospital" (Hangars ~ hospital).
+    "transitcarriage_newbabbage_hangars",
+    # - "TransitCarriage_Hta_Circular_<cid>" : ligne circulaire HtA
+    #   (screen 02/07/2026). Rattrape aussi les variantes OCR "cifcular",
+    #   "flta_circular".
+    "transitcarriage_hta_circular",
     # Orison (Crusader / Stanton 2) - ville flottante.
     # Zones observees 23/05/2026 Kainan (screen + log debug). Le HUD SC
     # affiche les noms avec underscores et numerotation des elements
     # (Util_A, Shuttle_A, etc.). Ne PAS extrapoler vers _B, _C... sans
     # observation directe : la convention SC n'est pas systematique
     # (ex: Lorville n'a qu'un tram, Levski a Large/Medium/Small).
+    # Hangars Orison (Crusader). Famille ajoutee 22/07/2026 suite au test du
+    # 20/07 : les joueurs etaient dans le hangar largetop, dont l'OCR est tres
+    # instable (9 graphies observees pour 162 positions, la valeur correcte
+    # "hangar_largetop_orison" n'etant JAMAIS lue proprement : g lu c/a/d/q,
+    # top->tod, hangar->hardar/hanqar). Sans entree cible, les 9 variantes
+    # passaient brutes. Avec "hangar_largetop_orison" dans la whitelist, les 9
+    # canonicalisent (distance 1-3 <= seuil 3 pour 22 chars ; n<->r existant
+    # rattrape hardar->hangar). Verifie : _orison est a >=7 des suffixes
+    # voisins (_levski_nyx, _reststop) -> pas de collision intra-whitelist.
+    # largetop = SEULE taille observee terrain ; les autres tailles sont
+    # ajoutees par symetrie de convention (comme Levski/Reststop/Grimhex).
+    # Retirer une taille si elle n'existe pas au spaceport Orison.
+    "hangar_xltop_orison",
+    "hangar_xlfront_orison",
+    "hangar_largetop_orison",       # observe test 20/07 : 9 graphies OCR, 162 pos
+    "hangar_largefront_orison",
+    "hangar_mediumtop_orison",
     "hangar_mediumfront_orison",   # screen + log, cid 304252274855
+    "hangar_smalltop_orison",
+    "hangar_smallfront_orison",
     "oc_arcade_int_001",            # ObjectContainer arcade (commerce/loisirs)
     "oc_orison_hospital_int_001",   # ObjectContainer hopital interieur
     "spaceport_interior",           # interieur du spaceport
@@ -1046,8 +1167,15 @@ def _ocr_distance_threshold(name_len: int) -> int:
       26-32 chars : 4 erreurs
        > 32 chars : 6 erreurs (fix tester B / 2K 21:9 ultrawide, 27/04/2026)
 
-    Les zones courtes (<=10 chars) ont une distance mutuelle min de 3,
-    donc un seuil de 2 sur 7-9 chars reste sans ambiguite.
+    NOTE 16/07/2026 : l'affirmation historique « les zones courtes ont une
+    distance mutuelle min de 3 » est FAUSSE (pyro1<->pyro2 = 1, les lettres
+    de misc_hull = 1, etc. — 325 paires de la whitelist sont a distance <=
+    seuil commun). Ce qui protege reellement : (1) le match EXACT est teste
+    en premier, une lecture propre ne passe jamais par le fuzzy ; (2) les
+    ambiguites reelles observees (pyrob -> pyro1/pyro6) ont ete reglees au
+    cas par cas par des equivalences ciblees. NE PAS monter les seuils des
+    tranches courtes/moyennes : une lecture bruitee sauterait vers une zone
+    SOEUR (cutlass_black <-> blue a 2, freelancer_* a 2-3...).
 
     MAJ 27/04/2026 : sur ultrawide 21:9, l'OCR cumule plus d'erreurs (3-4
     confusions par lecture : r->t, n->u, s->y, v->n) sur les noms tres longs
@@ -1165,12 +1293,19 @@ def _correct_ocr_zone_impl(name: str) -> str:
     #     "_9917714663391", "_841555881873".
     #     Les suffixes courts type "_001", "_002" font partie du nom canonique
     #     (tsg_gascloud_002, keeger_segment_social_001) et NE doivent PAS etre strip.
-    stripped = re.sub(r"[_\s-]+\d{6,}\b.*$", "", name)
+    #     [\d_]* apres les 6+ chiffres : tolere un ID COUPE par un underscore
+    #     par l'OCR — bug reel observe le 10/07/2026 chez Kainan
+    #     ("drak_buccaneer_568079072_714") : sans ca, le \b (frontiere de mot)
+    #     ne peut jamais tomber au milieu de "..._714" (underscore = caractere
+    #     de mot) et les 4 patterns de strip echouaient tous -> la zone
+    #     partait BRUTE au serveur (cid name: divergent).
+    stripped = re.sub(r"[_\s-]+\d{6,}[\d_]*\b.*$", "", name)
     # (a bis) suffixe numerique colle sans separateur : "misc_prospector841541787448"
     #        On exige >= 6 chiffres consecutifs pour ne pas couper des noms
     #        legitimes comme "levski_v2" (seulement 1 chiffre) ou "area18"
     #        (qui est entierement dans _KNOWN_ZONES donc geree avant).
-    stripped = re.sub(r"\d{6,}\b.*$", "", stripped)
+    #        Meme tolerance [\d_]* que (a) pour les IDs coupes par underscore.
+    stripped = re.sub(r"\d{6,}[\d_]*\b.*$", "", stripped)
     # (b) suffixe alphanumerique COMMENÇANT par un chiffre long (ID bruite par OCR).
     #     Ex: "_841541787am8" (chiffres+lettres melanges), "_3415417374g6"
     #     On exige au moins 5 chars dont au moins 4 chiffres pour eviter de
@@ -2079,6 +2214,45 @@ def _are_containers_similar(cid_a: str, cid_b: str) -> bool:
         prev = curr
 
     return prev[lb] <= 2
+
+
+# --- [build 61] Zone collante -----------------------------------------------
+# Complement de _are_containers_similar pour les cids "name:" tres bruites.
+# Probleme observe 16/07/2026 (log positions VPS, session hugo) : des lectures
+# OCR cumulant 3-4 confusions ("misc_piospeekoll", "misc_proepece61"...)
+# depassent le seuil du fuzzy matcher whitelist ET la distance 2 de
+# _are_containers_similar -> le cid name: bascule 1-2 lectures -> micro-
+# coupure VOIP avec les coequipiers du meme container.
+# Principe : si la NOUVELLE lecture n'est PAS une zone connue (donc du bruit
+# que la whitelist n'a pas su corriger) et qu'elle est a distance OCR
+# raisonnable du cid name: PRECEDENT, on colle a l'ancien. La comparaison ne
+# se fait que contre UNE zone (celle ou on est deja) -> aucun risque de
+# collision inter-zones. Une vraie transition passe toujours : soit la
+# nouvelle zone matche la whitelist (exact/fuzzy -> pas du bruit, pas de
+# collage), soit les coords bougent (garde <5m dans le core), soit la
+# distance depasse STICKY_ZONE_MAX_DIST.
+STICKY_ZONE_MAX_DIST = 6
+
+
+def _is_sticky_zone_variant(cid_last, cid_new) -> bool:
+    """True si cid_new (name:) est une variante OCR bruitee de cid_last
+    (name:) : nouvelle lecture inconnue de la whitelist ET distance OCR
+    (avec equivalences de caracteres) <= STICKY_ZONE_MAX_DIST."""
+    if not cid_last or not cid_new or cid_last == cid_new:
+        return False
+    if not (isinstance(cid_last, str) and isinstance(cid_new, str)):
+        return False
+    if not (cid_last.startswith("name:") and cid_new.startswith("name:")):
+        return False
+    name_last = re.sub(r"[_\s-]+", "_", cid_last[5:].strip().lower())
+    name_new = re.sub(r"[_\s-]+", "_", cid_new[5:].strip().lower())
+    if not name_last or not name_new:
+        return False
+    # Une lecture qui correspond a une zone CONNUE n'est pas du bruit :
+    # c'est une vraie transition, on ne colle jamais.
+    if name_new in _KNOWN_ZONES:
+        return False
+    return _ocr_distance(name_new, name_last) <= STICKY_ZONE_MAX_DIST
 
 
 # =============================================================================

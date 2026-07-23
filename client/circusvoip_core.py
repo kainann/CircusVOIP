@@ -741,18 +741,26 @@ class State:
     # Touche pour cycler les canaux (descente, boucle en haut)
     cycle_channel_key    = None
     # CircusPhone (D4 etape 4) : 5 raccourcis configurables.
-    # Tous vides par defaut (la spec : "Vides par defaut, configurables
-    # dans Parametres"). Format : "ctrl+shift+x" ou "f1" etc., normalises.
+    # Build 62 : ces raccourcis ont desormais des VALEURS PAR DEFAUT (F6-F10).
+    # Historique : la spec D4 disait "vides par defaut" ; on est revenu
+    # dessus pour la release, la fonctionnalite etant inutilisable tant que
+    # l'utilisateur n'allait pas la configurer a la main. Restent
+    # entierement reconfigurables dans Parametres.
+    # ATTENTION : les hotkeys sont GLOBAUX et NON bloquants (listener pynput
+    # sans suppression) -> la touche part AUSSI dans Star Citizen. F6-F10
+    # ont ete retenues comme peu conflictuelles ; en cas de collision avec
+    # un bind SC, l'utilisateur reassigne dans Parametres.
+    # Format : "ctrl+shift+x" ou "f6" etc., normalises (minuscules).
     #   phone_open_key     : ouvrir/fermer l'overlay smartphone (actif partout)
     #   phone_accept_key   : decrocher  (actif uniquement en appel entrant)
     #   phone_decline_key  : refuser/raccrocher (actif sonnerie ou en cours)
     #   phone_mute_key     : toggle mute micro (actif pendant un appel)
     #   phone_speaker_key  : toggle haut-parleur (actif pendant un appel)
-    phone_open_key     = None
-    phone_accept_key   = None
-    phone_decline_key  = None
-    phone_mute_key     = None
-    phone_speaker_key  = None
+    phone_open_key     = "f6"
+    phone_accept_key   = "f7"
+    phone_decline_key  = "f8"
+    phone_mute_key     = "f9"
+    phone_speaker_key  = "f10"
     # Overlays floating windows
     # - overlays_show : True quand le bouton "Overlay" est ON (overlays affiches)
     # - overlays_edit : True quand le bouton "Overlay Edition" est ON
@@ -2664,6 +2672,7 @@ from circusvoip_sc_ocr import (
     _apply_sign_memory,
     _is_sign_flip,
     _are_containers_similar,
+    _is_sticky_zone_variant,
     _is_cave_container,
 )
 
@@ -3709,6 +3718,26 @@ def _ocr_loop_inner(ui: "ClientUI"):
                              f"(reecrit en {cid_last!r})")
                     pos["container_id"]   = cid_last
                     pos["container_name"] = last_pos.get("container_name", pos.get("container_name"))
+                    stats_cid_similar += 1
+                # [build 61] Zone collante : variante OCR tres bruitee d'un cid
+                # name: (au-dela de la distance 2 de _are_containers_similar,
+                # jusqu'a STICKY_ZONE_MAX_DIST avec equivalences OCR), si la
+                # nouvelle lecture n'est PAS une zone connue de la whitelist.
+                # Meme garde coords que ci-dessus : on ne colle que si le
+                # joueur n'a pas bouge. Corrige les fuites observees le
+                # 16/07/2026 (misc_piospeekoll, misc_proepece61...) qui
+                # cassaient le cid 1-2 lectures -> micro-coupures VOIP.
+                elif (cid_last != cid_new
+                    and _is_sticky_zone_variant(cid_last, cid_new)
+                    and abs(pos.get("x", 0) - last_pos.get("x", 0)) < 5
+                    and abs(pos.get("y", 0) - last_pos.get("y", 0)) < 5
+                    and abs(pos.get("z", 0) - last_pos.get("z", 0)) < 5):
+                    _dbg_log(f"[ZONE COLLANTE] {cid_new!r} ~= {cid_last!r} "
+                             f"(reecrit en {cid_last!r})")
+                    pos["container_id"]   = cid_last
+                    pos["container_name"] = last_pos.get("container_name", pos.get("container_name"))
+                    if last_pos.get("zone") is not None:
+                        pos["zone"] = last_pos.get("zone")
                     stats_cid_similar += 1
 
                 d = distance(pos, last_pos)

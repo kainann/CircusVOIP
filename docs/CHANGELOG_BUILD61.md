@@ -1,7 +1,7 @@
 # CircusVOIP — Changelog build 61
 
 > **Version** : 0.3.x alpha build 61
-> **Statut** : préparé — *non publié* (à marquer « publié le JJ/MM » une fois les tests OK)
+> **Statut** : **publié** — inclus dans la release stable **v0.3.0** (23/07/2026))
 > **Type** : mise à jour 100 % client (rien à déployer sur le VPS de jeu)
 
 ---

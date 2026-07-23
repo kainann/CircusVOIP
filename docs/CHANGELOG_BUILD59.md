@@ -1,6 +1,6 @@
 # CircusVOIP — Changelog v0.3.0 alpha, build 59
 
-**Statut : préparé, non publié** · Correctifs sur le build 58 (08/07/2026)
+**Statut : publié** — inclus dans la release stable **v0.3.0** (23/07/2026)
 
 Build de correctifs centré sur Sol VS Terra et les raccourcis clavier,
 suite aux premiers retours du build 58.

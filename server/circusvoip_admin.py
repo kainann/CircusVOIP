@@ -95,6 +95,7 @@ class State:
     # Etat repliquant celui du serveur (recu via admin_welcome + push events)
     channels        = []          # list[str]
     profiles        = []          # list[str]
+    broadcasters    = []          # list[str] - role PTT diffusion globale (flag 0x04)
     players         = {}          # {name: {pos, channel, profile, helmet_on, prox_short}}
     anonymous_mode  = False
     server_token    = ""          # token joueur (pour l'afficher dans l'UI admin)
@@ -212,6 +213,7 @@ def _handle_message(ui, data: dict):
         # ou list[dict] avec permissions (nouveau serveur). Normalise
         # toujours en list[dict].
         state.profiles        = _normalize_profiles_list(data.get("profiles", []))
+        state.broadcasters    = list(data.get("broadcasters", []))
         state.anonymous_mode  = bool(data.get("anonymous_mode", False))
         state.server_token    = data.get("server_token", "")
         state.players         = {}
@@ -321,6 +323,10 @@ def _handle_message(ui, data: dict):
         raw = data.get("profiles", [])
         state.profiles = _normalize_profiles_list(raw)
         ui.refresh_profiles()
+
+    elif msg_type == "broadcasters_list":
+        state.broadcasters = list(data.get("broadcasters", []))
+        ui.refresh_broadcasters()
 
     elif msg_type == "anonymous_mode":
         state.anonymous_mode = bool(data.get("active", False))
@@ -536,6 +542,43 @@ class AdminUI:
         btn_add_prof.pack(fill="x", pady=(2, 8))
         btn_add_prof.bind("<Button-1>", lambda e: self._add_profile())
 
+        # Broadcasters : joueurs autorises a parler sur tous les canaux
+        # simultanement (PTT diffusion globale, flag audio 0x04). Liste
+        # tenue par l'admin via grant_broadcaster / revoke_broadcaster.
+        #
+        # Le serveur exige que le joueur soit connecte au moment du grant
+        # (le token est pushed via sa WS). On expose donc un dropdown des
+        # joueurs connectes (non deja broadcasters) directement dans le
+        # panneau, plutot qu'un dialog modal : moins de friction, et l'admin
+        # voit immediatement qui peut etre promu.
+        self._section(right, "BROADCASTERS")
+        self._broadcasters_frame = tk.Frame(right, bg=BG_PANEL)
+        self._broadcasters_frame.pack(fill="x", pady=2)
+        import tkinter.ttk as ttk
+        self._add_bc_frame = tk.Frame(right, bg=BG_PANEL)
+        self._add_bc_frame.pack(fill="x", pady=(4, 8))
+        self._add_bc_var = tk.StringVar(value="")
+        self._add_bc_combo = ttk.Combobox(
+            self._add_bc_frame,
+            textvariable=self._add_bc_var,
+            values=[],
+            state="disabled",
+            width=20,
+        )
+        self._add_bc_combo.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self._add_bc_btn = tk.Label(
+            self._add_bc_frame, text="Accorder",
+            bg=BORDER, fg=BLUE,
+            font=("Courier", 9, "bold"),
+            padx=8, pady=4, cursor="hand2",
+        )
+        self._add_bc_btn.pack(side="right")
+        self._add_bc_btn.bind(
+            "<Button-1>", lambda e: self._grant_selected_broadcaster()
+        )
+        # Initialise vide ; sera peuple par _refresh_add_broadcaster_dropdown()
+        # appele depuis refresh_players / refresh_broadcasters.
+
         # Token serveur en bas (info admin)
         self._section(right, "TOKEN JOUEUR")
         self._lbl_server_token = tk.Label(right, text="(non connecte)",
@@ -651,6 +694,7 @@ class AdminUI:
         self.refresh_players()
         self.refresh_channels()
         self.refresh_profiles()
+        self.refresh_broadcasters()
         self.refresh_anonymous()
         self._lbl_server_token.config(text=state.server_token or "(non recu)")
 
@@ -767,6 +811,38 @@ class AdminUI:
             "value":    bool(value),
         })
 
+    def refresh_broadcasters(self):
+        """Reconstruit le panneau BROADCASTERS a partir de state.broadcasters.
+        Mirroring exact de refresh_channels/refresh_profiles : meme structure
+        de rang BG_ROW + bouton ✕ pour retirer."""
+        def _do():
+            for w in self._broadcasters_frame.winfo_children():
+                w.destroy()
+            if not state.broadcasters:
+                tk.Label(self._broadcasters_frame,
+                         text="(aucun broadcaster)\nLes broadcasters peuvent\n"
+                              "parler sur tous les canaux\nsimultanement (PTT global).",
+                         bg=BG_PANEL, fg=MUTED, font=("Courier", 8),
+                         anchor="w", justify="left", padx=4).pack(fill="x")
+                return
+            for name in state.broadcasters:
+                row = tk.Frame(self._broadcasters_frame, bg=BG_ROW,
+                               pady=2, padx=6)
+                row.pack(fill="x", pady=1)
+                tk.Label(row, text=name, bg=BG_ROW, fg=BLUE,
+                         font=("Courier", 9, "bold"), anchor="w"
+                         ).pack(side="left", fill="x", expand=True)
+                btn_del = tk.Label(row, text="✕", bg=BG_ROW, fg=RED,
+                                   font=("Courier", 9, "bold"),
+                                   cursor="hand2", padx=4)
+                btn_del.pack(side="left")
+                btn_del.bind("<Button-1>",
+                             lambda e, n=name: self._remove_broadcaster(n))
+        self._safe_after(_do)
+        # Sync du dropdown : un broadcaster en plus / en moins change les
+        # candidats au grant.
+        self._refresh_add_broadcaster_dropdown()
+
     def refresh_players(self):
         def _do():
             # Synchroniser : ajouter les nouveaux, retirer les partis
@@ -784,6 +860,8 @@ class AdminUI:
                     self._build_player_row(name)
                 self._update_player_row(name)
         self._safe_after(_do)
+        # Un join/leave change les candidats au grant -> resync.
+        self._refresh_add_broadcaster_dropdown()
 
     def _build_player_row(self, name: str):
         row = tk.Frame(self._players_frame, bg=BG_ROW, pady=4, padx=8)
@@ -962,6 +1040,51 @@ class AdminUI:
                                f"Les joueurs assignes le perdront.",
                                parent=self.root):
             self._send_cmd({"cmd": "remove_profile", "name": name})
+
+    def _refresh_add_broadcaster_dropdown(self):
+        """Met a jour les valeurs du dropdown "Accorder broadcaster" :
+        joueurs connectes qui ne sont pas deja broadcasters. Appele depuis
+        refresh_players et refresh_broadcasters pour rester en sync avec
+        l'etat. Si la liste est vide, on disable le widget."""
+        if not hasattr(self, "_add_bc_combo"):
+            return
+        def _do():
+            already = set(state.broadcasters)
+            connected = sorted(n for n in state.players.keys()
+                               if n and n not in already)
+            try:
+                self._add_bc_combo["values"] = connected
+                if connected:
+                    self._add_bc_combo["state"] = "readonly"
+                    if self._add_bc_var.get() not in connected:
+                        self._add_bc_var.set(connected[0])
+                else:
+                    self._add_bc_combo["state"] = "disabled"
+                    self._add_bc_var.set("")
+            except Exception:
+                pass
+        self._safe_after(_do)
+
+    def _grant_selected_broadcaster(self):
+        """Clic sur le bouton 'Accorder'. Le dropdown ne propose que des
+        joueurs connectes non deja broadcasters, donc on n'a rien a
+        re-valider cote client : on envoie la commande au serveur, qui
+        push le token via la WS du joueur cible."""
+        name = (self._add_bc_var.get() or "").strip()
+        if not name:
+            return
+        self._send_cmd({"cmd": "grant_broadcaster", "name": name})
+
+    def _remove_broadcaster(self, name: str):
+        """Retire le role broadcaster. Effectif au prochain ticket du joueur
+        cible (~2 min). Pour revoquer immediatement, kick le joueur en plus."""
+        if messagebox.askyesno(
+            "Retirer broadcaster",
+            f"Retirer le role broadcaster a '{name}' ?\n"
+            f"Effectif a sa prochaine reconnexion (TTL ticket ≤ 2 min).",
+            parent=self.root,
+        ):
+            self._send_cmd({"cmd": "revoke_broadcaster", "name": name})
 
     def _toggle_anonymous(self):
         self._send_cmd({"cmd": "set_anonymous_mode",

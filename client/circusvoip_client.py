@@ -1769,8 +1769,8 @@ _CORE_MANAGED_CFG_KEYS = frozenset({
     "gamelog_path",
     # Mode RP
     "rp_mode",
-    # Hotkeys (8 raccourcis + 5 CircusPhone D4)
-    "radio_key", "profile_radio_key",
+    # Hotkeys (9 raccourcis + 5 CircusPhone D4)
+    "radio_key", "profile_radio_key", "broadcast_all_key",
     "mute_mic_key", "mute_prox_key", "mute_radio_key", "mute_all_key",
     "proximity_short_key", "cycle_channel_key",
     "phone_open_key", "phone_accept_key", "phone_decline_key",
@@ -2269,6 +2269,11 @@ else:
         last_radio_seen_ts: dict = {}
         profile_radio_key = None
         profile_radio_active = False
+        # [BROADCAST_ALL] PTT diffusion globale + capabilities serveur
+        broadcast_all_key    = None
+        broadcast_all_active = False
+        server_supports_broadcast_all = False
+        is_broadcaster                = False
         cycle_channel_key = None
         # Overlays
         overlays_show = False
@@ -2456,6 +2461,24 @@ class NetWorker(QObject):
                     except Exception:
                         pass
 
+                # [BROADCASTER_AUTH] Si on a un token broadcaster sauvegarde
+                # pour ce serveur, on le presente. Sinon champ vide : le
+                # serveur ne donne can_broadcast=True que si nom + token
+                # correspondent. Le token a ete pushed par broadcaster_token_granted
+                # (cf _handle_message) lors d'un grant precedent. Per-server :
+                # indexe par "host:port" de sorte qu'un meme client puisse
+                # avoir des roles differents sur plusieurs serveurs.
+                bcast_token = ""
+                if _CORE_AVAILABLE:
+                    try:
+                        bcast_token = _core._get_broadcaster_token(server_ip, SERVER_PORT)
+                    except Exception:
+                        bcast_token = ""
+                # On garde aussi en memoire la cle serveur pour les push
+                # ulterieurs (granted/revoked), evite de re-deviner ip/port.
+                self._server_key_ip = server_ip
+                self._server_key_port = SERVER_PORT
+
                 # Envoi du join. channel=None car 2a ne gere pas les canaux
                 # (sera ajoute en 2c).
                 await ws.send(json.dumps({
@@ -2463,6 +2486,7 @@ class NetWorker(QObject):
                     "name": name,
                     "token": token,
                     "channel": None,
+                    "broadcaster_token": bcast_token,
                 }))
 
                 # Bug fix 56 : marquer connected=True UNIQUEMENT apres
@@ -2537,6 +2561,46 @@ class NetWorker(QObject):
             if reason == "invalid_token":
                 self.sig_invalid_token.emit()
                 self._stop_requested = True
+            elif reason in ("name_in_use", "broadcaster_token_invalid"):
+                # Echec d'auth specifique : on log et on coupe. Pas de retry
+                # auto (l'utilisateur doit changer son setup : nom different,
+                # ou demander un re-grant a l'admin).
+                self._stop_requested = True
+            return
+
+        if msg_type == "broadcaster_token_granted":
+            # L'admin a accorde le role broadcaster a ce client. Le token clair
+            # est dans data["token"]. On le sauve indexe par le serveur courant
+            # pour qu'il soit represente automatiquement aux prochains join.
+            token = data.get("token", "") or ""
+            if token and _CORE_AVAILABLE:
+                try:
+                    ip = getattr(self, "_server_key_ip", "")
+                    port = getattr(self, "_server_key_port", SERVER_PORT)
+                    _core._set_broadcaster_token(ip, port, token)
+                    state.is_broadcaster = True
+                    self.sig_log.emit(
+                        "[NET] Role broadcaster accorde : token sauvegarde. "
+                        "Reconnecte-toi pour activer la touche."
+                    )
+                except Exception as e:
+                    self.sig_log.emit(f"[NET] broadcaster grant : sauvegarde KO : {e}")
+            return
+
+        if msg_type == "broadcaster_revoked":
+            # L'admin a revoque le role. On efface le token local pour eviter
+            # un join refuse a la prochaine reconnexion (le nom redevient
+            # libre cote serveur). La revocation est aussi appliquee au
+            # ticket actuel a la prochaine emission par le serveur.
+            if _CORE_AVAILABLE:
+                try:
+                    ip = getattr(self, "_server_key_ip", "")
+                    port = getattr(self, "_server_key_port", SERVER_PORT)
+                    _core._set_broadcaster_token(ip, port, "")
+                    state.is_broadcaster = False
+                    self.sig_log.emit("[NET] Role broadcaster revoque.")
+                except Exception as e:
+                    self.sig_log.emit(f"[NET] broadcaster revoke : nettoyage KO : {e}")
             return
 
         if msg_type == "welcome":
@@ -2580,6 +2644,13 @@ class NetWorker(QObject):
                 sb_allowed = bool(data.get("soundboard_allowed", False))
                 state.my_profile_soundboard_allowed = sb_allowed
                 self.sig_my_perm_changed.emit("soundboard_allowed", sb_allowed)
+                # [BROADCAST_ALL] Capabilities serveur + role broadcaster.
+                # Le client n'active sa touche PTT diffusion globale que si
+                # le serveur l'annonce dans server_caps ET que l'admin a
+                # accorde le role a ce joueur. Sinon : touche grisee.
+                server_caps = data.get("server_caps") or []
+                state.server_supports_broadcast_all = "broadcast_all" in server_caps
+                state.is_broadcaster = bool(data.get("is_broadcaster", False))
             except Exception as e:
                 if _CORE_AVAILABLE:
                     try:
@@ -12895,9 +12966,10 @@ class MainWindow(QMainWindow):
             parent_layout.addLayout(h)
             return val_lbl
 
-        self.lbl_radio_key      = _make_key_row(v_radio, "Radio canal (PTT) :",      "radio")
-        self.lbl_profile_key    = _make_key_row(v_radio, "Radio profil (PTT) :",     "profile")
-        self.lbl_mute_mic_key   = _make_key_row(v_radio, "Mute micro :",             "mute_mic")
+        self.lbl_radio_key         = _make_key_row(v_radio, "Radio canal (PTT) :",         "radio")
+        self.lbl_profile_key       = _make_key_row(v_radio, "Radio profil (PTT) :",        "profile")
+        self.lbl_broadcast_all_key = _make_key_row(v_radio, "Diffusion globale (PTT) :",   "broadcast_all")
+        self.lbl_mute_mic_key      = _make_key_row(v_radio, "Mute micro :",                "mute_mic")
         self.lbl_mute_prox_key  = _make_key_row(v_radio, "Mute audio proximite :",   "mute_prox")
         self.lbl_mute_radio_key = _make_key_row(v_radio, "Mute audio radio :",       "mute_radio")
         self.lbl_mute_all_key   = _make_key_row(v_radio, "Mute tout :",              "mute_all")
@@ -15368,20 +15440,21 @@ class MainWindow(QMainWindow):
             return
         # Liste de tuples (attr_label, attr_state)
         rows = [
-            ("lbl_radio_key",      "radio_key"),
-            ("lbl_profile_key",    "profile_radio_key"),
-            ("lbl_mute_mic_key",   "mute_mic_key"),
-            ("lbl_mute_prox_key",  "mute_prox_key"),
-            ("lbl_mute_radio_key", "mute_radio_key"),
-            ("lbl_mute_all_key",   "mute_all_key"),
-            ("lbl_prox_short_key", "proximity_short_key"),
-            ("lbl_cycle_ch_key",   "cycle_channel_key"),
+            ("lbl_radio_key",          "radio_key"),
+            ("lbl_profile_key",        "profile_radio_key"),
+            ("lbl_broadcast_all_key",  "broadcast_all_key"),
+            ("lbl_mute_mic_key",       "mute_mic_key"),
+            ("lbl_mute_prox_key",      "mute_prox_key"),
+            ("lbl_mute_radio_key",     "mute_radio_key"),
+            ("lbl_mute_all_key",       "mute_all_key"),
+            ("lbl_prox_short_key",     "proximity_short_key"),
+            ("lbl_cycle_ch_key",       "cycle_channel_key"),
             # CircusPhone (D4 etape 4)
-            ("lbl_phone_open_key",    "phone_open_key"),
-            ("lbl_phone_accept_key",  "phone_accept_key"),
-            ("lbl_phone_decline_key", "phone_decline_key"),
-            ("lbl_phone_mute_key",    "phone_mute_key"),
-            ("lbl_phone_speaker_key", "phone_speaker_key"),
+            ("lbl_phone_open_key",     "phone_open_key"),
+            ("lbl_phone_accept_key",   "phone_accept_key"),
+            ("lbl_phone_decline_key",  "phone_decline_key"),
+            ("lbl_phone_mute_key",     "phone_mute_key"),
+            ("lbl_phone_speaker_key",  "phone_speaker_key"),
         ]
         for lbl_attr, state_attr in rows:
             lbl = getattr(self, lbl_attr, None)
@@ -15661,13 +15734,14 @@ class MainWindow(QMainWindow):
             return
         # kind -> (label dialog, attribut state, cle config)
         kinds = {
-            "radio":         ("Radio canal (PTT)",     "radio_key",           "radio_key"),
-            "profile":       ("Radio profil (PTT)",    "profile_radio_key",   "profile_radio_key"),
-            "mute_mic":      ("Mute micro (toggle)",   "mute_mic_key",        "mute_mic_key"),
-            "mute_prox":     ("Mute audio proximite",  "mute_prox_key",       "mute_prox_key"),
-            "mute_radio":    ("Mute audio radio",      "mute_radio_key",      "mute_radio_key"),
-            "mute_all":      ("Mute tout",              "mute_all_key",        "mute_all_key"),
-            "prox_short":    ("Proximite 30m / 5m",    "proximity_short_key", "proximity_short_key"),
+            "radio":         ("Radio canal (PTT)",            "radio_key",           "radio_key"),
+            "profile":       ("Radio profil (PTT)",           "profile_radio_key",   "profile_radio_key"),
+            "broadcast_all": ("Diffusion globale (PTT)",      "broadcast_all_key",   "broadcast_all_key"),
+            "mute_mic":      ("Mute micro (toggle)",          "mute_mic_key",        "mute_mic_key"),
+            "mute_prox":     ("Mute audio proximite",         "mute_prox_key",       "mute_prox_key"),
+            "mute_radio":    ("Mute audio radio",             "mute_radio_key",      "mute_radio_key"),
+            "mute_all":      ("Mute tout",                    "mute_all_key",        "mute_all_key"),
+            "prox_short":    ("Proximite 30m / 5m",           "proximity_short_key", "proximity_short_key"),
             "cycle_channel": ("Cycle canal radio",     "cycle_channel_key",   "cycle_channel_key"),
             # CircusPhone (D4 etape 4)
             "phone_open":    ("Ouvrir / Fermer telephone", "phone_open_key",   "phone_open_key"),
@@ -18079,6 +18153,7 @@ class MainWindow(QMainWindow):
                     return k  # fallback : laisser la valeur brute
             state.radio_key            = _canon(core_cfg.get("radio_key"))
             state.profile_radio_key    = _canon(core_cfg.get("profile_radio_key"))
+            state.broadcast_all_key    = _canon(core_cfg.get("broadcast_all_key"))
             state.mute_mic_key         = _canon(core_cfg.get("mute_mic_key"))
             state.mute_prox_key        = _canon(core_cfg.get("mute_prox_key"))
             state.mute_radio_key       = _canon(core_cfg.get("mute_radio_key"))
@@ -18664,6 +18739,7 @@ class MainWindow(QMainWindow):
                             "zone_source",
                             "radio_key",
                             "profile_radio_key",
+                            "broadcast_all_key",
                             "mute_mic_key",
                             "mute_prox_key",
                             "mute_radio_key",

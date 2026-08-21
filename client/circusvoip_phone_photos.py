@@ -1,7 +1,28 @@
-"""CircusPhone - App "Photos" : galerie des cliches pris par la Camera.
+"""CircusPhone - App "Photos" : galerie a deux onglets.
 
-Lit le dossier des photos (screenshots/circusphoto_*.png), affiche une liste
-de vignettes navigable au D-pad, et permet d'ouvrir une photo en plein ecran.
+  - "Mes Photos"     : cliches pris par la Camera (screenshots/circusphoto_*)
+  - "Photos Recues"  : images recues en messagerie (circusphone_images/*_in.jpg)
+
+[PHOTOS 02/08/2026] Ajout de l'onglet "Photos Recues".
+
+Pourquoi cet onglet
+-------------------
+Une image recue est ecrite dans circusphone_images/ et referencee par une
+bulle "[img]<fichier>" du fil de messagerie. Or le fil est plafonne
+(PHONE_MAX_MESSAGES) : quand la bulle sort du fil, le fichier reste sur le
+disque mais PLUS RIEN n'y donne acces. Cet onglet est la seule porte
+d'entree permanente vers ces images.
+
+Ne sont listes que les "_in.jpg" (recus). Les "_out.jpg" sont des copies
+JPEG re-encodees de cliches deja presents dans screenshots/ : les afficher
+ferait doublon avec l'onglet "Mes Photos".
+
+Affichage
+---------
+Grille de DEUX colonnes, sans libelle sous les vignettes (decision du
+02/08). La navigation reprend la mecanique de l'ecran Appels : l'index -1
+designe la barre d'onglets, ou l'on remonte depuis la premiere ligne.
+
 App NON-jeu (CAPTURES_KEYBOARD = False) : navigation via handle_nav/handle_back.
 """
 
@@ -12,11 +33,17 @@ import os
 from PySide6.QtCore import Qt, QSize, QRectF
 from PySide6.QtGui import QPixmap, QColor, QPainter, QFont, QPen
 from PySide6.QtWidgets import (
-    QWidget, QLabel, QVBoxLayout, QHBoxLayout, QScrollArea, QFrame,
-    QStackedWidget, QSizePolicy,
+    QWidget, QLabel, QVBoxLayout, QGridLayout, QScrollArea,
+    QFrame, QStackedWidget, QSizePolicy,
 )
 
 from circusvoip_phone_apps import PhoneApp
+# Barre d'onglets partagee avec l'ecran Appels : on la REUTILISE plutot que
+# d'en redefinir une, pour que les deux ecrans ne divergent pas et pour
+# heriter du WA_StyledBackground qu'elle pose (sans lui, la surbrillance de
+# la barre ne se peint pas).
+# /!\ circusvoip_phone_annuaire DOIT figurer dans RELEASE_FILES.
+from circusvoip_phone_annuaire import _Onglets
 
 
 def _make_app_icon(size: int = 128):
@@ -101,45 +128,81 @@ def _list_photos() -> list:
     return [p for _mt, p in out]
 
 
-class _PhotoThumbRow(QFrame):
-    """Une ligne de la galerie : vignette + nom de fichier."""
+def _images_recues_dir() -> str:
+    """Cache des images de messagerie : ./circusphone_images.
 
-    def __init__(self, path: str, thumb_h: int, parent=None):
+    Meme dossier que PHONE_IMAGES_DIR cote client (les modules sont livres
+    a plat, cote a cote). On le recalcule ici au lieu de l'importer : ca
+    evite une dependance de plus vers circusvoip_client.
+    """
+    base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "circusphone_images")
+
+
+def _list_recues() -> list:
+    """Images RECUES, plus recentes d'abord.
+
+    Nommage pose a la reception : "<ts_ms>_<expediteur>_in.jpg". On trie sur
+    l'horodatage du NOM (pose par l'emetteur, stable) plutot que sur la date
+    du fichier, qui bouge a la moindre copie de dossier. Repli sur mtime si
+    le prefixe n'est pas lisible.
+    """
+    d = _images_recues_dir()
+    out = []
+    try:
+        for name in os.listdir(d):
+            low = name.lower()
+            if not low.endswith("_in.jpg"):
+                continue
+            full = os.path.join(d, name)
+            try:
+                ts = float(name.split("_", 1)[0])
+            except Exception:
+                try:
+                    ts = os.path.getmtime(full) * 1000.0
+                except Exception:
+                    ts = 0.0
+            out.append((ts, full))
+    except Exception:
+        pass
+    out.sort(reverse=True)
+    return [f for _ts, f in out]
+
+
+class _PhotoCell(QFrame):
+    """Une vignette de la grille. Pas de libelle : l'image seule."""
+
+    def __init__(self, path: str, cell_w: int, cell_h: int, parent=None):
         super().__init__(parent)
         self._path = path
-        self.setObjectName("PhotoThumbRow")
-        self.setStyleSheet(
-            "QFrame#PhotoThumbRow { background:transparent; "
-            "border-bottom:1px solid #eceef0; }")
-        h = QHBoxLayout(self)
-        h.setContentsMargins(12, 8, 12, 8)
-        h.setSpacing(12)
-
+        self.setObjectName("PhotoCell")
+        # Sans WA_StyledBackground, le cadre de selection ne se peint pas sur
+        # un QFrame stylise par feuille de style.
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setFixedSize(cell_w, cell_h)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(0)
         thumb = QLabel()
-        thumb.setFixedSize(int(thumb_h * 1.6), thumb_h)
         thumb.setAlignment(Qt.AlignCenter)
         thumb.setStyleSheet("background:#000000; border-radius:6px;")
+        lay.addWidget(thumb, 1)
         pix = QPixmap(path)
         if not pix.isNull():
-            pix = pix.scaled(thumb.size(), Qt.KeepAspectRatio,
-                             Qt.SmoothTransformation)
+            pix = pix.scaled(QSize(cell_w - 8, cell_h - 8),
+                             Qt.KeepAspectRatio, Qt.SmoothTransformation)
             thumb.setPixmap(pix)
-        h.addWidget(thumb, 0)
-
-        lbl = QLabel(os.path.basename(path))
-        lbl.setStyleSheet("color:#1a1a1a; font-size:10pt; "
-                          "background:transparent;")
-        lbl.setWordWrap(True)
-        h.addWidget(lbl, 1)
+        self.set_nav_selected(False)
 
     def path(self) -> str:
         return self._path
 
     def set_nav_selected(self, sel: bool):
         self.setStyleSheet(
-            "QFrame#PhotoThumbRow { background:%s; border-radius:8px; "
-            "border-bottom:1px solid #eceef0; }"
-            % ("rgba(47,111,237,0.14)" if sel else "transparent"))
+            "QFrame#PhotoCell { background:%s; border:2px solid %s; "
+            "border-radius:8px; }"
+            % (("rgba(47,111,237,0.14)", "#2f6fed") if sel
+               else ("transparent", "transparent")))
 
 
 class _LazyPolaroidIcon:
@@ -166,8 +229,12 @@ class PhotosApp(PhoneApp):
     def __init__(self, screen_w, screen_h, screen_radius, services,
                  parent=None):
         super().__init__(screen_w, screen_h, screen_radius, services, parent)
-        self._rows = []
+        self._cells = []
+        self._paths = []
+        # -1 = curseur sur la BARRE D'ONGLETS, >=0 = index dans la grille.
+        # Meme convention que _nav_historique de l'ecran Appels.
         self._nav_index = 0
+        self._tab = 0                # 0 = Mes Photos, 1 = Photos Recues
         self._view_path = None       # photo affichee en plein ecran (ou None)
 
         root = QVBoxLayout(self)
@@ -186,6 +253,9 @@ class PhotosApp(PhoneApp):
         title.setStyleSheet("color:#1a1a1a; font-size:15pt; font-weight:bold; "
                             "background:transparent; padding:14px 16px 8px 16px;")
         lv.addWidget(title)
+        self._onglets = _Onglets(["Mes Photos", "Photos Reçues"],
+                                 self._changer_onglet)
+        lv.addWidget(self._onglets)
         sep = QFrame()
         sep.setFixedHeight(1)
         sep.setStyleSheet("background:#eceef0; border:none;")
@@ -201,12 +271,16 @@ class PhotosApp(PhoneApp):
         self._list_layout = QVBoxLayout(self._host)
         self._list_layout.setContentsMargins(0, 0, 0, 0)
         self._list_layout.setSpacing(0)
-        self._lbl_empty = QLabel("Aucune photo.\nUtilise la Caméra pour en "
-                                 "prendre.")
+        self._lbl_empty = QLabel("Aucune photo.")
         self._lbl_empty.setAlignment(Qt.AlignCenter)
         self._lbl_empty.setStyleSheet("color:#9aa0a6; font-size:11pt; "
                                       "background:transparent; padding:40px;")
         self._list_layout.addWidget(self._lbl_empty)
+        self._grid_host = QWidget()
+        self._grid = QGridLayout(self._grid_host)
+        self._grid.setContentsMargins(8, 8, 8, 8)
+        self._grid.setSpacing(6)
+        self._list_layout.addWidget(self._grid_host)
         self._list_layout.addStretch(1)
         self._scroll.setWidget(self._host)
         lv.addWidget(self._scroll, 1)
@@ -230,36 +304,79 @@ class PhotosApp(PhoneApp):
         self._stack.addWidget(self._page_view)
 
     # --- cycle de vie ---
+    NB_COLS = 2
+
     def on_show(self):
         """(Re)construit la galerie a chaque ouverture (de nouvelles photos
-        ont pu etre prises entre-temps). Revient toujours a la liste."""
+        ont pu etre prises entre-temps). Revient toujours a la liste, et
+        TOUJOURS sur l'onglet "Mes Photos" (decision du 02/08) : l'app n'a
+        pas d'etat a retenir d'une ouverture a l'autre."""
         self._view_path = None
         self._stack.setCurrentWidget(self._page_list)
-        self._rebuild()
+        if self._onglets.courant() != 0:
+            self._onglets.selectionner(0)   # declenche _changer_onglet
+        else:
+            self._tab = 0
+            self._rebuild()
 
-    def _rebuild(self):
-        # Vider les anciennes lignes.
-        for r in self._rows:
-            r.setParent(None)
-            r.deleteLater()
-        self._rows = []
-        paths = _list_photos()
-        self._lbl_empty.setVisible(not paths)
-        thumb_h = max(48, int(self._screen_h * 0.13))
-        for i, p in enumerate(paths):
-            row = _PhotoThumbRow(p, thumb_h)
-            self._list_layout.insertWidget(i, row)
-            self._rows.append(row)
-        self._nav_index = 0
+    def _changer_onglet(self, i: int):
+        """Callback de la barre. Le curseur RESTE sur la barre (index -1).
+
+        C'est le comportement de _basculer_onglet cote Appels : reposer le
+        curseur dans le contenu empechait d'enchainer gauche/droite pour
+        revenir a l'onglet precedent.
+        """
+        self._tab = int(i)
+        self._nav_index = -1
+        self._rebuild(garder_curseur=True)
+
+    def _list_courante(self) -> list:
+        return _list_recues() if self._tab == 1 else _list_photos()
+
+    def _rebuild(self, garder_curseur: bool = False):
+        # Vider les anciennes cellules.
+        for c in self._cells:
+            c.setParent(None)
+            c.deleteLater()
+        self._cells = []
+        while self._grid.count():
+            it = self._grid.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+
+        self._paths = self._list_courante()
+        vide = not self._paths
+        self._lbl_empty.setText("Aucune photo reçue." if self._tab == 1
+                                else "Aucune photo.")
+        self._lbl_empty.setVisible(vide)
+        self._grid_host.setVisible(not vide)
+
+        # Cellule carree, deux par ligne, marges et espacement deduits.
+        dispo = max(80, self._screen_w - 16 - self._grid.spacing())
+        cell_w = int(dispo / self.NB_COLS)
+        cell_h = int(cell_w * 0.75)
+        for i, path in enumerate(self._paths):
+            cell = _PhotoCell(path, cell_w, cell_h)
+            self._grid.addWidget(cell, i // self.NB_COLS, i % self.NB_COLS)
+            self._cells.append(cell)
+
+        if not garder_curseur:
+            self._nav_index = 0 if self._paths else -1
+        if self._nav_index >= len(self._paths):
+            self._nav_index = len(self._paths) - 1 if self._paths else -1
         self._apply_highlight()
 
     def _apply_highlight(self):
         on_list = (self._stack.currentWidget() is self._page_list)
-        for i, r in enumerate(self._rows):
-            r.set_nav_selected(on_list and i == self._nav_index)
-        if on_list and self._rows:
+        sur_barre = (self._nav_index < 0)
+        self._onglets.set_nav_highlight(on_list and sur_barre)
+        for i, c in enumerate(self._cells):
+            c.set_nav_selected(on_list and not sur_barre
+                               and i == self._nav_index)
+        if on_list and not sur_barre and self._cells:
             try:
-                self._scroll.ensureWidgetVisible(self._rows[self._nav_index],
+                self._scroll.ensureWidgetVisible(self._cells[self._nav_index],
                                                  0, 8)
             except Exception:
                 pass
@@ -281,19 +398,57 @@ class PhotosApp(PhoneApp):
 
     # --- navigation D-pad ---
     def handle_nav(self, direction: str) -> bool:
+        """Grille a NB_COLS colonnes + barre d'onglets a l'index -1.
+
+        haut  : remonte d'une ligne ; depuis la 1re ligne -> barre d'onglets
+        bas   : descend d'une ligne ; depuis la barre -> 1re vignette.
+                Depuis l'avant-derniere ligne quand la derniere est
+                incomplete, on atterrit sur la DERNIERE vignette existante
+                plutot que dans le vide (cas du nombre impair de photos).
+        g/d   : sur la barre -> change d'onglet ; dans la grille -> change
+                de colonne. Volontairement SANS bouclage : aller a gauche
+                depuis la colonne de gauche ne fait rien, sinon un simple
+                deplacement horizontal changerait d'ecran par surprise.
+        """
         if self._stack.currentWidget() is self._page_view:
             # En vue plein ecran : seul Retour ferme (gere par handle_back).
             return True
-        if not self._rows:
-            return True
-        if direction in ("up", "left"):
-            self._nav_index = (self._nav_index - 1) % len(self._rows)
-            self._apply_highlight()
-        elif direction in ("down", "right"):
-            self._nav_index = (self._nav_index + 1) % len(self._rows)
-            self._apply_highlight()
+
+        n = len(self._cells)
+        cols = self.NB_COLS
+
+        if direction == "up":
+            if self._nav_index < 0:
+                return True                      # deja sur la barre
+            self._nav_index = (self._nav_index - cols
+                               if self._nav_index >= cols else -1)
+        elif direction == "down":
+            if self._nav_index < 0:
+                self._nav_index = 0 if n else -1
+            elif self._nav_index + cols < n:
+                self._nav_index += cols
+            elif self._nav_index < n - 1:
+                self._nav_index = n - 1          # derniere ligne incomplete
+        elif direction in ("left", "right"):
+            if self._nav_index < 0:
+                cible = 0 if direction == "left" else 1
+                if cible != self._onglets.courant():
+                    self._onglets.selectionner(cible)   # -> _changer_onglet
+                return True
+            if direction == "left" and self._nav_index % cols > 0:
+                self._nav_index -= 1
+            elif (direction == "right" and self._nav_index % cols < cols - 1
+                    and self._nav_index + 1 < n):
+                self._nav_index += 1
         elif direction == "enter":
-            path = self._rows[self._nav_index].path()
+            if self._nav_index < 0:
+                # Entree sur la barre : on descend dans la grille.
+                self._nav_index = 0 if n else -1
+                self._apply_highlight()
+                return True
+            if not (0 <= self._nav_index < n):
+                return True
+            path = self._cells[self._nav_index].path()
             # Priorite : afficher EN GRAND sur l'ecran de jeu (fenetre separee)
             # si l'overlay a fourni le hook. Sinon, repli : vue interne au
             # telephone.
@@ -305,6 +460,9 @@ class PhotosApp(PhoneApp):
                 except Exception:
                     pass
             self._open_view(path)
+            return True
+
+        self._apply_highlight()
         return True
 
     def handle_back(self) -> bool:

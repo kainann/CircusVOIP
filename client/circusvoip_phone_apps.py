@@ -237,6 +237,49 @@ class PhoneServices:
                                                     # separee) ; fourni par
                                                     # l'overlay a la galerie Photos
 
+    # --- [CONTACTS 31/07/2026] Telephonie par numero ---
+    # repertoire : carnet LOCAL (circusvoip_phone_contacts.Repertoire).
+    #              Source unique de la substitution nom/numero. L'annuaire
+    #              du serveur reste inaccessible aux joueurs.
+    # appeler    : lance un appel vers un NUMERO. L'overlay s'occupe de
+    #              l'ecran d'appel ; l'app ne fait que declencher.
+    # historique : [] des appels, du plus recent au plus ancien. Chaque
+    #              entree ne contient QUE le numero, jamais un nom : le
+    #              nom est substitue a l'affichage, donc ajouter un
+    #              contact renomme retroactivement toutes les lignes.
+    #              Format : {"numero", "sens" ("in"/"out"), "issue", "ts"}.
+    # photo_par_numero : bytes JPEG d'un correspondant identifie par son
+    #              NUMERO. Distinct de photo_of (qui prend un pseudo) :
+    #              on affiche une photo meme pour un numero absent du
+    #              carnet, sans jamais connaitre le pseudo derriere.
+    # ouvrir_ajout_contact : bascule vers l'app Contacts, onglet d'ajout,
+    #              numero pre-rempli. Sert au bouton "Ajouter" de
+    #              l'historique.
+    repertoire: object = None
+    appeler: Callable[[str], None] = None
+    historique: Callable[[], list] = None
+    photo_par_numero: Callable[[str], Optional[bytes]] = None
+    ouvrir_ajout_contact: Callable[[str], None] = None
+
+    # --- [MESSAGERIE 02/08/2026] ---
+    # conversations : [] des echanges existants, du plus recent au plus
+    #              ancien. {"numero", "non_lu"}. Seul le numero est
+    #              stocke ; le nom est substitue a l'affichage.
+    # ouvrir_conversation : ouvre l'ECRAN de conversation existant (bulles,
+    #              images, brouillon). L'app Messagerie ne fait que lister
+    #              et declencher : cet ecran n'est pas reecrit.
+    conversations: Callable[[], list] = None
+    ouvrir_conversation: Callable[[str], None] = None
+
+    # --- [TRAVAIL 10/08/2026] ---
+    # mon_numero : numero du joueur LOCAL, sous forme d'appelable.
+    #              Appelable et non valeur figee : le numero n'est connu
+    #              qu'apres le welcome, donc apres la construction des
+    #              services. Une valeur posee ici resterait vide pour
+    #              toute la session si le telephone est construit avant
+    #              la connexion.
+    mon_numero: Callable[[], str] = None
+
     def __post_init__(self):
         # Garantir que log() est toujours appelable : evite des getattr
         # defensifs dans chaque app. No-op si l'overlay n'a rien fourni.

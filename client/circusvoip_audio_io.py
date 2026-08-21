@@ -21,17 +21,74 @@ import threading
 import queue
 import time
 
+_t0_imp = time.monotonic()
 import numpy as np
+print(f"[AUDIO TIMING] import numpy : {time.monotonic() - _t0_imp:.2f}s",
+      flush=True)
 
+# [AUDIO TIMING 26/07/2026] L'import de sounddevice initialise PortAudio,
+# qui enumere TOUS les peripheriques audio du systeme. C'est le poste le
+# plus lent et le plus variable du demarrage : mesure entre 0,6 s et 3,6 s
+# sur la meme machine, sans cause identifiee. On chronometre donc l'import
+# lui-meme, puis chaque enumeration, pour pouvoir trancher la prochaine
+# fois que le lancement traine.
+# Les logs partent en print() : a ce stade le systeme de log du client
+# n'existe pas encore (on est au niveau module, avant QApplication).
+_SD_IMPORT_SEC = 0.0
 try:
+    _t0_sd = time.monotonic()
     import sounddevice as sd
+    _SD_IMPORT_SEC = time.monotonic() - _t0_sd
     _SD_AVAILABLE = True
     _SD_IMPORT_ERR = None
+    if _SD_IMPORT_SEC >= 1.0:
+        print(f"[AUDIO TIMING] import sounddevice LENT : "
+              f"{_SD_IMPORT_SEC:.2f}s (initialisation PortAudio)", flush=True)
+    else:
+        print(f"[AUDIO TIMING] import sounddevice : {_SD_IMPORT_SEC:.2f}s",
+              flush=True)
 except Exception as e:
     # On capture TOUTES les exceptions pas juste ImportError
     # (peut etre ImportError, mais aussi OSError si DLL manquante, etc.)
     _SD_AVAILABLE = False
     _SD_IMPORT_ERR = str(e)
+    print(f"[AUDIO TIMING] import sounddevice ECHEC : {e}", flush=True)
+
+
+def log_audio_inventory():
+    """[AUDIO TIMING] Inventaire complet des peripheriques audio.
+
+    A appeler une fois au demarrage. Sert a comparer deux lancements :
+    si les identifiants ou les API changent d'une fois sur l'autre, c'est
+    l'enumeration PortAudio qui est instable — cause suspectee du micro
+    qui bascule sur WDM-KS et refuse de s'ouvrir (PaErrorCode -9996).
+    """
+    if not _SD_AVAILABLE:
+        print(f"[AUDIO INVENTAIRE] sounddevice indisponible : {_SD_IMPORT_ERR}",
+              flush=True)
+        return
+    try:
+        t0 = time.monotonic()
+        devices = sd.query_devices()
+        dt = time.monotonic() - t0
+        try:
+            apis = {i: sd.query_hostapis(i)["name"]
+                    for i in range(len(sd.query_hostapis()))}
+        except Exception:
+            apis = {}
+        n_in = sum(1 for d in devices if d.get("max_input_channels", 0) > 0)
+        n_out = sum(1 for d in devices if d.get("max_output_channels", 0) > 0)
+        print(f"[AUDIO INVENTAIRE] query_devices en {dt:.2f}s : "
+              f"{len(devices)} peripheriques ({n_in} entrees, {n_out} sorties)",
+              flush=True)
+        for i, d in enumerate(devices):
+            if d.get("max_input_channels", 0) <= 0:
+                continue
+            ha = apis.get(d.get("hostapi"), "?")
+            print(f"[AUDIO INVENTAIRE]   in  id={i:<3} [{ha}] "
+                  f"{d.get('name', '?')}", flush=True)
+    except Exception as e:
+        print(f"[AUDIO INVENTAIRE] echec : {type(e).__name__}: {e}", flush=True)
 
 # Suppression de bruit (RNNoise via pyrnnoise). Optionnel : si pas
 # installe (cas des clients pendant la phase dev), la feature sera
@@ -39,23 +96,65 @@ except Exception as e:
 # en dev :
 #   pip install pyrnnoise
 # La version finale 0.1.0 fournira pyrnnoise via l'installateur.
-try:
-    from pyrnnoise import RNNoise as _PyRNNoise
-    NOISE_SUPPRESSION_AVAILABLE = True
-    _NS_IMPORT_ERR = None
-except Exception as e:
-    _PyRNNoise = None
-    NOISE_SUPPRESSION_AVAILABLE = False
-    _NS_IMPORT_ERR = str(e)
+# [CHARGEMENT DIFFERE 28/07/2026] pyrnnoise coute 2,49 s a l'import
+# (mesure du 28/07 : numpy 0,84 s, sounddevice 0,18 s, pyrnnoise 2,49 s,
+# rx_logger 0,01 s). Il bloquait donc l'affichage de la fenetre pendant
+# plus de deux secondes, pour un module dont on n'a besoin qu'au premier
+# frame audio — soit bien apres.
+# On le charge dans un thread de fond des l'import du module. Tout code
+# qui en depend appelle ns_ready() d'abord, ce qui attend la fin du
+# chargement si necessaire.
+_PyRNNoise = None
+NOISE_SUPPRESSION_AVAILABLE = False
+_NS_IMPORT_ERR = None
+_ns_import_sec = 0.0
 
-# Log audio RX detaille pour diagnostic crackling (ajout 02/06/2026).
-# Module autonome qui ecrit dans un CSV separe quand active via l'UI.
-# Si le module est absent (cas tres improbable, fichier manquant), on
-# laisse _audio_rx_logger = None et tous les appels seront no-op.
+
+def _ns_import_worker():
+    global _PyRNNoise, NOISE_SUPPRESSION_AVAILABLE, _NS_IMPORT_ERR
+    global _ns_import_sec
+    t0 = time.monotonic()
+    try:
+        from pyrnnoise import RNNoise as _R
+        _PyRNNoise = _R
+        NOISE_SUPPRESSION_AVAILABLE = True
+        _NS_IMPORT_ERR = None
+    except Exception as e:
+        _PyRNNoise = None
+        NOISE_SUPPRESSION_AVAILABLE = False
+        _NS_IMPORT_ERR = str(e)
+    _ns_import_sec = time.monotonic() - t0
+    print(f"[AUDIO TIMING] import pyrnnoise (fond) : {_ns_import_sec:.2f}s"
+          + ("" if NOISE_SUPPRESSION_AVAILABLE else f" ECHEC : {_NS_IMPORT_ERR}"),
+          flush=True)
+
+
+_ns_import_thread = threading.Thread(target=_ns_import_worker, daemon=True,
+                                     name="pyrnnoise-import")
+_ns_import_thread.start()
+
+
+def ns_ready(timeout: float = 10.0) -> bool:
+    """Attend la fin du chargement de pyrnnoise et renvoie sa disponibilite.
+
+    A appeler avant toute lecture de NOISE_SUPPRESSION_AVAILABLE ou tout
+    usage de _PyRNNoise. Sans cette attente, un lecteur trop precoce
+    verrait False et desactiverait la suppression de bruit alors qu'elle
+    est simplement en cours de chargement.
+    """
+    try:
+        _ns_import_thread.join(timeout)
+    except Exception:
+        pass
+    return NOISE_SUPPRESSION_AVAILABLE
+
+_t0_imp = time.monotonic()
 try:
     import circusvoip_audio_rx_logger as _audio_rx_logger
 except Exception:
     _audio_rx_logger = None
+print(f"[AUDIO TIMING] import rx_logger : {time.monotonic() - _t0_imp:.2f}s",
+      flush=True)
 
 
 def _ns_log(msg: str):
@@ -151,6 +250,35 @@ JITTER_BUFFER_ZERO_STREAK = 5
 # assez audible pour masquer le pop, assez attenue pour ne pas creer
 # une "doublure" perceptible si on repete la meme trame.
 PLC_GAIN = 0.5
+
+# [PLC OPUS 26/07/2026] Gain applique quand la trame de remplacement vient
+# du PLC natif d'Opus plutot que du rejeu de la derniere trame.
+# Le rejeu maison reprend un signal PASSE, qui ne raccorde pas avec ce qui
+# suit : l'attenuation a -6 dB sert a masquer la discontinuite. Opus, lui,
+# RECONSTRUIT une trame plausible en prolongeant l'enveloppe et la hauteur
+# de la voix a partir de l'etat du decodeur ; elle est faite pour etre
+# jouee telle quelle, et l'attenuer ajouterait un trou de volume.
+PLC_GAIN_OPUS = 1.0
+
+# [SONNERIE PROXIMITE 28/07/2026] Volume de la sonnerie telle qu'elle est
+# ENTENDUE PAR LES AUTRES, en fraction de la sonnerie locale.
+# Simule un telephone range dans l'inventaire, etouffe par le tissu.
+# Ce facteur s'applique PAR-DESSUS le volume choisi par le joueur
+# (_phone_ring_volume_factor) : baisser sa sonnerie la baisse aussi pour
+# les voisins. L'attenuation de la distance s'y ajoute ensuite
+# automatiquement (a 10 m, 0.50 x 0.64 = ~32 % ; a 20 m, ~8 %).
+# Pas de filtre passe-bas : attenuation pure, choix assume.
+# 31/07/2026 : passe de 0.70 a 0.50. Les 0.70 avaient ete valides au
+# mannequin, seul en cabine ; en session reelle, avec de la voix et du
+# bruit ambiant, les joueurs autour l'ont trouve trop fort.
+# [SONNERIE 06/08/2026] Abaisse de 0.50 a 0.05 : le plafond restait trop
+# fort a l'oreille, curseur du recepteur au maximum. Historique de la
+# valeur : 0.70 (28/07) -> 0.50 (31/07) -> 0.05 (06/08).
+PHONE_RING_TX_FACTOR = 0.05
+
+# [SONNERIE 06/08/2026] Suffixe de la cle de reception des sonneries.
+# \x00 est impossible dans un pseudo, donc aucune collision.
+RING_KEY_SUFFIX = "\x00ring"
 
 
 # ---------------------------------------------
@@ -664,6 +792,21 @@ def _filter_devices(devices, is_input: bool) -> list[tuple[int, str]]:
         "Core Audio":     0,
     }
 
+    # [WDM-KS 26/07/2026] L'API Windows WDM-KS (kernel streaming) est
+    # ecartee des ENTREES. Elle ouvre le peripherique en ACCES EXCLUSIF :
+    # elle fonctionne quand rien d'autre n'utilise le micro, et echoue
+    # avec "Invalid device [PaErrorCode -9996]" des qu'un autre programme
+    # le detient — typiquement le second client CircusVOIP lance sur la
+    # meme machine pour les tests, ou le jeu.
+    # Symptome vecu le 26/07 : micro muet de facon apparemment aleatoire,
+    # et comme _start_boot_threads() dependait de la capture, l'OCR ne
+    # demarrait pas non plus.
+    # Aucune perte : le meme materiel est expose par WASAPI, MME et
+    # DirectSound, sans exclusivite. On ne filtre que les entrees : une
+    # SORTIE en WDM-KS peut rester un choix legitime.
+    if is_input:
+        hostapi_priority.pop("Windows WDM-KS", None)
+
     # Mots-cles de devices a ignorer (virtuels, obsoletes, doublons systeme)
     blacklist_keywords = [
         # Windows
@@ -715,14 +858,74 @@ def _filter_devices(devices, is_input: bool) -> list[tuple[int, str]]:
     # Deduplication par cleaned name : on garde la meilleure priorite
     best_per_name = {}
     for cleaned, prio, idx, label in candidates:
+        # [WDM-KS] priorite absente = API ecartee pour ce sens
+        if is_input and prio == 99 and "WDM-KS" in label:
+            continue
         current = best_per_name.get(cleaned)
         if current is None or prio < current[0]:
             best_per_name[cleaned] = (prio, idx, label)
+
+    # [DEDUP PREFIXE 26/07/2026] MME tronque les noms de peripherique a
+    # 31 caracteres. Le meme micro apparait donc sous deux libelles :
+    #   "Microphone sur casque (CORSAIR"                        [MME]
+    #   "Microphone sur casque (CORSAIR VIRTUOSO SE Wireless…"  [WASAPI]
+    # La deduplication par egalite stricte ne les confond pas, et la
+    # liste affiche plusieurs fois le meme materiel — ce qui rend le
+    # choix de l'utilisateur arbitraire.
+    # Regle CIBLEE : on ne fusionne que si le nom court vient de MME ET
+    # fait au moins _MME_TRUNC caracteres, c'est-a-dire s'il porte la
+    # signature d'une troncature. Une regle de prefixe generale serait
+    # dangereuse sur un poste equipe d'une table de mixage : des
+    # peripheriques bien distincts y partagent souvent un debut de nom
+    # ("Voicemeeter Aux Out" / "Voicemeeter Aux Output B2"), et on
+    # ferait disparaitre le bon.
+    _MME_TRUNC = 29
+    noms = sorted(best_per_name.keys(), key=len)
+    fusionnes = set()
+    for i, court in enumerate(noms):
+        if court in fusionnes or len(court) < _MME_TRUNC:
+            continue
+        # Signature de troncature : nom long ET issu de MME
+        if "[MME]" not in best_per_name[court][2]:
+            continue
+        for long in noms[i + 1:]:
+            if long in fusionnes or long == court:
+                continue
+            if long.startswith(court):
+                p_court = best_per_name[court]
+                p_long = best_per_name[long]
+                garde, jette = ((court, long) if p_court[0] <= p_long[0]
+                                else (long, court))
+                fusionnes.add(jette)
+    for n in fusionnes:
+        best_per_name.pop(n, None)
 
     # Tri par nom pour un affichage stable
     result = [(idx, label) for _, idx, label in sorted(
         best_per_name.values(), key=lambda x: x[2].lower()
     )]
+
+    # [WDM-KS - GARDE-FOU] Si ecarter WDM-KS ne laisse AUCUNE entree,
+    # on le remet : mieux vaut une API capricieuse que pas de micro du
+    # tout. Cas possible sur une machine ou la seule carte son n'est
+    # exposee que par cette API.
+    if is_input and not result:
+        for i, d in enumerate(devices):
+            if d.get("max_input_channels", 0) <= 0:
+                continue
+            name = d.get("name", "")
+            if not name:
+                continue
+            try:
+                ha = sd.query_hostapis(d["hostapi"])["name"]
+            except Exception:
+                ha = "?"
+            result.append((i, f"{_clean_device_name(name)} [{ha}]"))
+        if result:
+            print("[AUDIO] Aucune entree hors WDM-KS : liste complete "
+                  "restauree (le micro peut refuser de s'ouvrir si un "
+                  "autre programme l'utilise)", flush=True)
+
     return result
 
 
@@ -800,7 +1003,9 @@ class _NoiseSuppressor:
 
     def __init__(self):
         self.enabled = False
-        self._available = NOISE_SUPPRESSION_AVAILABLE
+        # [CHARGEMENT DIFFERE] pyrnnoise est importe en tache de fond :
+        # on attend qu'il soit pret avant de decider s'il est disponible.
+        self._available = ns_ready()
         self._denoiser = None
         self._init_error = None
         # Compteurs de debug pour diagnostiquer si RNNoise tourne reellement
@@ -1043,6 +1248,19 @@ class AudioIO:
         self._beep_volume_factor       = 1.0
         self._soundboard_volume_factor = 1.0
         self._phone_ring_volume_factor = 1.0
+        # [SONNERIE 31/07/2026] Emettre la sonnerie SANS l'entendre
+        # localement. Sert au mannequin : entendre sa propre sonnerie a
+        # plein volume dans le meme casque que la version recue rendrait
+        # tout reglage de niveau illisible. Remplace le bricolage qui
+        # mettait _phone_ring_volume_factor a 0 -- devenu impossible
+        # maintenant que l'emission est relative a ce reglage.
+        self._phone_ring_tx_only = False
+        # [SONNERIE PROXIMITE 28/07/2026] Index de lecture DEDIE a
+        # l'emission reseau. Il doit etre distinct de _phone_ring_idx
+        # (lecture locale) : les deux avancent au meme rythme mais pas
+        # forcement en phase, et les faire partager un pointeur ferait
+        # sauter le motif de l'un ou de l'autre.
+        self._phone_ring_tx_idx = 0
 
         # Lecture
         self._output_stream = None
@@ -1056,12 +1274,22 @@ class AudioIO:
         # voix de proximite (pas celles recues en radio PTT, qui ont deja
         # leur propre effet talkie-walkie).
         self._remote_is_radio: dict[str, bool]       = {}
+        # Flag du dernier flux recu, pour cibler le bon decodeur Opus.
+        self._remote_last_flag: dict[str, int]      = {}
         # CircusPhone (D3) : flag "voix telephone" de la derniere trame
         # recue par sender. Quand True, la voix est routee vers mix_phone
         # dans _on_output_block : pas de filtre radio, pas d'echo grotte,
         # pas d'attenuation de distance (au telephone la distance physique
         # entre les 2 interlocuteurs n'existe pas).
         self._remote_is_phone: dict[str, bool]       = {}
+        # [SONNERIE 06/08/2026] Sonneries recues des joueurs autour, rangees
+        # sous une CLE DERIVEE "<pseudo>\x00ring". Toute la machinerie de
+        # reception (file, jitter buffer, PLC) est indexee par cle : deux
+        # flux du meme joueur sous la MEME cle se battent pour une file
+        # consommee a 50 trames/s, elle sature, et on entend un gresillement
+        # avec la voix hachee -- constate le 06/08. La cle derivee donne a
+        # la sonnerie sa propre file, sans dupliquer une ligne de code.
+        self._remote_is_ring: dict[str, bool]        = {}
         # Flag Mode RP : si True pour un sender, sa voix de proximite sera
         # traitee comme une radio (filtre applique localement en plus de son
         # routage normal). Ce flag est calcule par le CLIENT selon la regle :
@@ -1073,6 +1301,8 @@ class AudioIO:
         # zone grotte : container commencant par "rock01_" ou "sand01_").
         # Active/desactive par le client via set_cave_echo(True/False) en
         # fonction du container courant detecte par l'OCR.
+        # Compat : conserve pour les stats et les appelants historiques.
+        # La verite est dans _echo_profil.
         self._cave_echo_active = False
         # Reverb Schroeder compacte : 4 comb filters en parallele + 2 all-pass
         # en serie. Plus naturel que le simple delay precedent (qui donnait
@@ -1083,20 +1313,70 @@ class AudioIO:
         #   -> couleur "caverne naturelle", diffuse rapidement
         # Delays all-pass : 5ms, 1.7ms pour diffuser davantage sans ajouter
         # de queue (les all-pass ne changent pas l'enveloppe, seulement la phase)
-        self._cave_comb_delays = [1433, 1777, 1949, 2251]   # premiers entre eux
-        self._cave_comb_fbs    = [0.72, 0.70, 0.68, 0.66]   # feedback par comb
-        # Low-pass dans la boucle comb : simule l'absorption des aigus par
-        # les parois (coefficient 0 a 1, plus proche de 1 = plus de coupe)
-        self._cave_comb_damp   = 0.35
-        # Buffers des 4 combs + leur etat lowpass
-        self._cave_comb_bufs   = [np.zeros(d, dtype=np.float32) for d in self._cave_comb_delays]
+        # [ECHO HANGARS 13/08/2026] DEUX profils, pas un seul reglage.
+        #
+        # La reverb d'origine est calibree caverne. Appliquee telle quelle
+        # a un hangar, elle ne "sonne" pas grand : une caverne est un
+        # volume irregulier et absorbant, un hangar est une grande boite
+        # metallique ouverte. Trois parametres les separent :
+        #
+        #   - la TAILLE, donc les delais des combs. 30-47 ms evoquent une
+        #     salle ; 60-92 ms un volume de hangar. C'est le parametre qui
+        #     porte le plus la sensation d'espace.
+        #   - l'ABSORPTION des aigus (damp). La roche mange les hautes
+        #     frequences, le metal les renvoie : 0.35 en grotte, 0.12 en
+        #     hangar, ce qui donne la brillance metallique.
+        #   - le PRE-DELAI. Dans un grand volume, la premiere reflexion
+        #     arrive nettement apres la voix directe. C'est ce silence qui
+        #     dit "grand espace" a l'oreille ; sans lui, meme avec une
+        #     longue queue, on entend une petite piece reverberante.
+        #
+        # Le wet baisse en hangar (0.6 -> 0.40) : un hangar a une porte
+        # ouverte sur le vide, le son s'echappe au lieu d'envelopper.
+        #
+        # Delais toujours premiers entre eux, sinon les combs se
+        # synchronisent et produisent une resonance metallique parasite.
+        self._echo_profils = {
+            "grotte": {
+                "comb_delays": [1433, 1777, 1949, 2251],   # 30-47 ms
+                "comb_fbs":    [0.72, 0.70, 0.68, 0.66],
+                "comb_damp":   0.35,
+                "ap_delays":   [241, 83],                  # 5 ms, 1.7 ms
+                "ap_coef":     0.5,
+                "predelay":    0,
+                "wet":         0.6,
+            },
+            "hangar": {
+                "comb_delays": [2879, 3371, 3833, 4409],   # 60-92 ms
+                "comb_fbs":    [0.78, 0.76, 0.74, 0.72],
+                "comb_damp":   0.12,
+                "ap_delays":   [347, 113],                 # 7 ms, 2.4 ms
+                "ap_coef":     0.5,
+                "predelay":    1440,                       # 30 ms
+                "wet":         0.40,
+            },
+        }
+        # Profil courant : None = aucune reverb.
+        self._echo_profil = None
+        # Les buffers des DEUX profils sont alloues au demarrage. Les
+        # allouer au changement de lieu voudrait dire allouer depuis le
+        # callback audio, ou depuis un autre thread pendant qu'il lit --
+        # deux facons de produire un craquement ou pire. Le cout est de
+        # ~90 ko, sans commune mesure avec le risque.
+        self._echo_bufs = {}
+        for nom, p in self._echo_profils.items():
+            self._echo_bufs[nom] = {
+                "comb": [np.zeros(d, dtype=np.float32)
+                         for d in p["comb_delays"]],
+                "ap":   [np.zeros(d, dtype=np.float32)
+                         for d in p["ap_delays"]],
+                "pre":  (np.zeros(p["predelay"], dtype=np.float32)
+                         if p["predelay"] else None),
+            }
         self._cave_comb_idxs   = [0, 0, 0, 0]
         self._cave_comb_lp     = [0.0, 0.0, 0.0, 0.0]
-        # All-pass filters : delay + coefficient diffusion
-        self._cave_ap_delays   = [241, 83]   # ~5ms, 1.7ms
-        self._cave_ap_coef     = 0.5
-        self._cave_ap_bufs     = [np.zeros(d, dtype=np.float32) for d in self._cave_ap_delays]
         self._cave_ap_idxs     = [0, 0]
+        self._echo_pre_idx     = 0
         self._lock = threading.Lock()
 
         # Stats
@@ -1234,7 +1514,31 @@ class AudioIO:
         """
         self._on_capture = callback
 
+    def get_last_capture_error(self) -> str:
+        """Derniere erreur d'ouverture du micro, ou chaine vide.
+
+        [DIAG 06/08/2026] Permet a l'appelant d'afficher la RAISON plutot
+        que le seul nom du peripherique.
+        """
+        return getattr(self, "_last_capture_error", "") or ""
+
     def start_capture(self, device_id: int = None) -> bool:
+        # [AUDIO TIMING] chronometre + trace du peripherique reellement
+        # demande. Permet de reconstituer apres coup quel id a ete tente
+        # et combien de temps l'ouverture a pris avant de reussir ou
+        # d'echouer.
+        _t0_cap = time.monotonic()
+        try:
+            _nm = "?"
+            if _SD_AVAILABLE and device_id is not None:
+                _d = sd.query_devices(device_id)
+                _ha = sd.query_hostapis(_d["hostapi"])["name"]
+                _nm = f"{_d.get('name', '?')} [{_ha}]"
+            print(f"[AUDIO TIMING] start_capture id={device_id} -> {_nm}",
+                  flush=True)
+        except Exception as _e:
+            print(f"[AUDIO TIMING] start_capture id={device_id} "
+                  f"(nom illisible : {_e})", flush=True)
         """Demarre la capture du micro."""
         if not _SD_AVAILABLE:
             return False
@@ -1252,11 +1556,54 @@ class AudioIO:
             # Memoriser le device pour pouvoir relancer en cas de gel
             # (restart_streams() appele par le watchdog OCR apres un freeze)
             self._last_input_device = device_id
+            print(f"[AUDIO TIMING] start_capture OK en "
+                  f"{time.monotonic() - _t0_cap:.2f}s", flush=True)
             return True
         except Exception as e:
+            # [DIAG 06/08/2026] La raison est MEMORISEE, pas seulement
+            # imprimee. Elle ne sortait que sur stdout : lance sans
+            # console, on la perdait, et l'interface se contentait du nom
+            # du peripherique. Un "Invalid sample rate" parfaitement
+            # diagnostique par le code devenait ainsi invisible -- deux
+            # fois la meme journee du 06/08.
+            self._last_capture_error = str(e)
             print(f"[AUDIO] Erreur start_capture : {e}")
+            print(f"[AUDIO TIMING] start_capture ECHEC apres "
+                  f"{time.monotonic() - _t0_cap:.2f}s", flush=True)
             self._input_stream = None
             return False
+
+    def check_devices(self) -> str:
+        """[AUDIO 31/07/2026] Verifie que les flux ouverts vivent encore.
+
+        Retourne un message d'erreur, ou "" si tout va bien.
+
+        Motif : un casque USB debranche ou eteint en cours de session ne
+        leve rien de visible. PortAudio arrete le flux, le callback cesse
+        d'etre appele, et le joueur se retrouve muet ou sourd sans aucun
+        signal -- il croit que les autres se sont taus. On ne tente PAS
+        de rouvrir ici : cette methode est un capteur, appele depuis un
+        timer UI. La reouverture est une decision, pas un effet de bord.
+
+        Un flux jamais ouvert (None) n'est pas une erreur : c'est le cas
+        normal quand aucun peripherique n'a ete choisi, deja signale
+        ailleurs.
+        """
+        pannes = []
+        for flux, libelle in ((self._input_stream, "micro"),
+                              (self._output_stream, "sortie audio")):
+            if flux is None:
+                continue
+            try:
+                if not flux.active:
+                    pannes.append(libelle)
+            except Exception:
+                # L'objet lui-meme devient inutilisable quand le
+                # peripherique disparait : c'est aussi une panne.
+                pannes.append(libelle)
+        if not pannes:
+            return ""
+        return " et ".join(pannes)
 
     def stop_capture(self):
         if self._input_stream is not None:
@@ -1331,6 +1678,26 @@ class AudioIO:
                     elapsed_ms = (now - self._gate_last_open_t) * 1000.0
                     if elapsed_ms > self._gate_hold_ms:
                         self._gate_is_open = False
+
+            # [SONNERIE PROXIMITE 28/07/2026] La sonnerie est injectee ICI,
+            # avant la barriere du noise gate. Deux raisons :
+            #  - le gate coupe le callback quand on ne parle pas, donc une
+            #    injection plus loin (dans core) ne diffuserait la sonnerie
+            #    que pendant qu'on parle ;
+            #  - un telephone qui sonne est un evenement physique : il ne
+            #    depend ni du gate, ni de la reduction de bruit, ni du mute
+            #    micro.
+            # Micro coupe ou gate ferme : la voix est remplacee par du
+            # silence AVANT tout melange — sinon le mute fuirait le bruit
+            # de fond. Le melange lui-meme est fait par core, qui seul
+            # sait si un PTT est actif (la sonnerie ne doit pas partir sur
+            # la radio, le profil ou le telephone).
+            if self.is_ring_tx_active():
+                if self._capture_muted or not self._gate_is_open:
+                    mono = np.zeros_like(mono)
+                self._on_capture(mono)
+                self._frames_sent += 1
+                return
 
             # 4. Si gate ferme, on n'envoie rien (economie bande passante)
             if not self._gate_is_open:
@@ -1426,11 +1793,30 @@ class AudioIO:
             mix_prox  = np.zeros(frames, dtype=np.float32)
             mix_radio = np.zeros(frames, dtype=np.float32)
             mix_phone = np.zeros(frames, dtype=np.float32)
+            # [SONNERIE 06/08/2026] Mix dedie, sur le modele de mix_phone.
+            mix_ring  = np.zeros(frames, dtype=np.float32)
+            try:
+                _ring_slider = float(self._phone_ring_volume_factor)
+            except Exception:
+                _ring_slider = 1.0
             with self._lock:
                 for name, buf in self._remote_buffers.items():
-                    vol = self._remote_volumes.get(name, 1.0)
-                    mult = self._remote_multipliers.get(name, 1.0)
-                    final_vol = vol * mult
+                    # [SONNERIE 06/08/2026] Deux gains pour une sonnerie :
+                    #   - la DISTANCE, lue sur le volume du joueur reel (la
+                    #     cle derivee n'en a pas, la boucle de positions ne
+                    #     connait que le pseudo) ;
+                    #   - le curseur "Sonnerie tel." de CE client, pour que
+                    #     ce soit le RECEPTEUR qui decide, pas l'emetteur.
+                    _is_ring = self._remote_is_ring.get(name, False)
+                    if _is_ring:
+                        _base = name[:-len(RING_KEY_SUFFIX)]
+                        vol = self._remote_volumes.get(_base, 1.0)
+                        mult = self._remote_multipliers.get(_base, 1.0)
+                        final_vol = vol * mult * _ring_slider
+                    else:
+                        vol = self._remote_volumes.get(name, 1.0)
+                        mult = self._remote_multipliers.get(name, 1.0)
+                        final_vol = vol * mult
                     if final_vol <= 0.001:
                         # Vidons quand meme la file pour eviter l'accumulation
                         try:
@@ -1503,6 +1889,14 @@ class AudioIO:
                         # CircusPhone (D3) : voix telephone -> mix_phone
                         # direct. Court-circuite tout traitement radio /
                         # Mode RP / echo : la voix telephone est claire.
+                        if _is_ring:
+                            # Ni filtre radio, ni Mode RP, ni echo grotte :
+                            # une sonnerie ne se transforme pas.
+                            if len_frame >= frames:
+                                mix_ring += frame[:frames] * final_vol
+                            else:
+                                mix_ring[:len_frame] += frame * final_vol
+                            continue
                         if is_phone:
                             if len_frame >= frames:
                                 mix_phone += frame[:frames] * final_vol
@@ -1574,9 +1968,36 @@ class AudioIO:
                         if (_is_real_underrun
                                 and self._plc_last_frame.get(name) is not None
                                 and not self._plc_used.get(name, False)):
-                            _plc_frame = self._plc_last_frame[name]
+                            # [PLC OPUS 26/07/2026] On demande d'abord au
+                            # decodeur Opus de reconstruire la trame perdue.
+                            # Il n'y arrive que s'il a deja decode au moins
+                            # une trame de ce sender ; sinon on retombe sur
+                            # le rejeu maison, conserve comme filet.
+                            # Toute la logique alentour (anti-cascade,
+                            # routage phone/radio/prox, conditions
+                            # d'underrun reel) est inchangee : seule la
+                            # PROVENANCE de la trame change.
+                            _plc_frame = None
+                            _plc_from_opus = False
+                            try:
+                                import circusvoip_opus as _opus
+                                _flag_plc = self._remote_last_flag.get(name)
+                                try:
+                                    _raw = _opus.decode_lost(name, _flag_plc)
+                                except TypeError:
+                                    # Module Opus anterieur au 31/07.
+                                    _raw = _opus.decode_lost(name)
+                                if _raw:
+                                    _plc_frame = np.frombuffer(
+                                        _raw, dtype=np.float32)
+                                    _plc_from_opus = True
+                            except Exception:
+                                _plc_frame = None
+                            if _plc_frame is None:
+                                _plc_frame = self._plc_last_frame[name]
                             _plc_len = len(_plc_frame)
-                            _plc_vol = final_vol * PLC_GAIN
+                            _plc_vol = final_vol * (
+                                PLC_GAIN_OPUS if _plc_from_opus else PLC_GAIN)
                             # Routage identique au cas pop normal : telephone
                             # -> mix_phone, sinon mix_radio ou mix_prox selon
                             # is_radio. Le filtre radio (apply_radio_effect)
@@ -1631,15 +2052,35 @@ class AudioIO:
                 #   - Low-pass dans les combs : absorbe les aigus (effet paroi)
                 # Wet = 0.22 : reverb audible mais la voix directe reste en avant.
                 # Dry = 1.0 : on garde tout le signal original.
-                if self._cave_echo_active:
-                    wet = 0.6
-                    damp = self._cave_comb_damp
+                profil = self._echo_profil
+                if profil is not None:
+                    p = self._echo_profils[profil]
+                    bufs = self._echo_bufs[profil]
+                    wet = p["wet"]
+                    damp = p["comb_damp"]
+                    fbs = p["comb_fbs"]
+                    ap_coef = p["ap_coef"]
+                    comb_bufs = bufs["comb"]
+                    ap_bufs = bufs["ap"]
+                    pre_buf = bufs["pre"]
                     for i in range(frames):
                         inp = mix_prox[i]
+                        # --- pre-delai (hangar seulement) ---
+                        # La voix directe reste a l'heure ; seule l'entree
+                        # de la reverb est retardee. C'est ce decalage qui
+                        # fait entendre un grand volume plutot qu'une
+                        # petite piece reverberante.
+                        if pre_buf is not None:
+                            pidx = self._echo_pre_idx
+                            src = pre_buf[pidx]
+                            pre_buf[pidx] = inp
+                            self._echo_pre_idx = (pidx + 1) % len(pre_buf)
+                        else:
+                            src = inp
                         # --- 4 combs en parallele ---
                         comb_out = 0.0
                         for c in range(4):
-                            buf = self._cave_comb_bufs[c]
+                            buf = comb_bufs[c]
                             idx = self._cave_comb_idxs[c]
                             delayed = buf[idx]
                             # Low-pass dans la boucle feedback (one-pole)
@@ -1647,25 +2088,25 @@ class AudioIO:
                                 delayed * (1.0 - damp) + self._cave_comb_lp[c] * damp
                             )
                             # Ecrire : input + feedback * (signal retarde filtre)
-                            buf[idx] = inp + self._cave_comb_lp[c] * self._cave_comb_fbs[c]
+                            buf[idx] = src + self._cave_comb_lp[c] * fbs[c]
                             comb_out += delayed
                             self._cave_comb_idxs[c] = (idx + 1) % len(buf)
                         # Moyenne des 4 combs
                         sig = comb_out * 0.25
                         # --- 2 all-pass en serie ---
                         for a in range(2):
-                            buf = self._cave_ap_bufs[a]
+                            buf = ap_bufs[a]
                             idx = self._cave_ap_idxs[a]
                             delayed = buf[idx]
                             # y = -g*x + delayed + g*y ; forme compacte :
-                            out_ap = -self._cave_ap_coef * sig + delayed
-                            buf[idx] = sig + self._cave_ap_coef * out_ap
+                            out_ap = -ap_coef * sig + delayed
+                            buf[idx] = sig + ap_coef * out_ap
                             sig = out_ap
                             self._cave_ap_idxs[a] = (idx + 1) % len(buf)
                         # Mix dry + wet
                         mix_prox[i] = inp + wet * sig
 
-            mixed = mix_prox + mix_radio + mix_phone
+            mixed = mix_prox + mix_radio + mix_phone + mix_ring
             # Mixer le bip local (PTT feedback) si en cours.
             # Le bip est entendu par l'utilisateur lui-meme dans son casque,
             # ce n'est PAS envoye aux autres (juste pour le feedback PTT).
@@ -1706,7 +2147,10 @@ class AudioIO:
                     ring_buf = self._phone_ring_buffer
                     ring_len = len(ring_buf)
                     if ring_len > 0:
-                        factor = float(self._phone_ring_volume_factor)
+                        # [SONNERIE 31/07/2026] _phone_ring_tx_only :
+                        # emettre sans s'entendre (mannequin).
+                        factor = (0.0 if getattr(self, "_phone_ring_tx_only", False)
+                                  else float(self._phone_ring_volume_factor))
                         filled = 0
                         idx = self._phone_ring_idx
                         while filled < frames:
@@ -1829,38 +2273,56 @@ class AudioIO:
     #  Echo grotte (active/desactive par le client selon container courant)
     # -----------------------------------------
 
-    def set_cave_echo(self, active: bool):
-        """Active ou desactive la reverb des grottes sur le mix de proximite.
+    def set_echo_profile(self, profil):
+        """Choisit le profil de reverb du mix de proximite.
 
-        Appele par le client chaque fois que le container du joueur local
-        change : True si dans une grotte (rock01_*, sand01_*), False sinon.
-        A la desactivation, les buffers sont laisses tels quels mais ne
-        sont plus relus -> la queue de reverb s'eteint naturellement.
+        profil : "grotte", "hangar" ou None (aucune reverb).
+
+        Appele par le client a chaque changement de container. Le
+        changement de profil vide les buffers, pour la meme raison que
+        l'activation : la queue d'un lieu precedent n'a rien a faire
+        dans le nouveau, et passer d'un pre-delai a l'autre relirait des
+        echantillons sans rapport.
         """
+        if profil is not None and profil not in self._echo_profils:
+            print(f"[ECHO] profil inconnu : {profil!r}, ignore")
+            return
         with self._lock:
-            was_active = self._cave_echo_active
-            self._cave_echo_active = bool(active)
-            # A l'activation, vider tous les buffers pour eviter un echo
-            # "parasite" laisse par une grotte precedente. En mode desactive
-            # on n'ecrit plus dans les buffers donc pas besoin de reset.
-            if self._cave_echo_active and not was_active:
-                for b in self._cave_comb_bufs:
+            ancien = self._echo_profil
+            if ancien == profil:
+                return
+            self._echo_profil = profil
+            self._cave_echo_active = profil is not None
+            if profil is not None:
+                bufs = self._echo_bufs[profil]
+                for b in bufs["comb"]:
                     b.fill(0.0)
-                for b in self._cave_ap_bufs:
+                for b in bufs["ap"]:
                     b.fill(0.0)
+                if bufs["pre"] is not None:
+                    bufs["pre"].fill(0.0)
                 self._cave_comb_idxs = [0] * 4
                 self._cave_ap_idxs   = [0] * 2
                 self._cave_comb_lp   = [0.0] * 4
-        if was_active != self._cave_echo_active:
-            status = "ACTIVE" if self._cave_echo_active else "INACTIVE"
-            print(f"[CAVE ECHO] {status}")
+                self._echo_pre_idx   = 0
+        print(f"[ECHO] {ancien or 'aucun'} -> {profil or 'aucun'}")
+
+    def set_cave_echo(self, active: bool):
+        """Compat : active la reverb GROTTE, ou la coupe.
+
+        Conservee pour les appelants historiques et les forks. Le client
+        passe desormais par set_echo_profile(), qui sait aussi faire le
+        hangar.
+        """
+        self.set_echo_profile("grotte" if active else None)
 
     # -----------------------------------------
     #  Flux entrants
     # -----------------------------------------
 
     def feed_remote_frame(self, sender_name: str, frame_bytes: bytes,
-                          is_radio: bool = False, is_phone: bool = False):
+                          is_radio: bool = False, is_phone: bool = False,
+                          is_ring: bool = False):
         """
         Alimente le buffer de lecture avec une trame audio recue via WebSocket.
         frame_bytes : raw PCM float32 mono, longueur = BLOCK_SIZE * 4
@@ -1881,6 +2343,11 @@ class AudioIO:
             if len(frame) == 0:
                 return
 
+            # [SONNERIE 06/08/2026] Cle derivee : la sonnerie d'un joueur ne
+            # partage NI sa file NI son jitter buffer avec sa voix.
+            if is_ring:
+                sender_name = sender_name + RING_KEY_SUFFIX
+
             # Variables pour log audio RX detaille (si actif). Calculees au
             # fil du flow normal, consommees dans l'appel log_rx en fin de
             # methode. Cout negligeable meme si log inactif (juste qsize()
@@ -1900,6 +2367,19 @@ class AudioIO:
                 # (utilises au mix dans _on_output_block).
                 self._remote_is_radio[sender_name] = is_radio
                 self._remote_is_phone[sender_name] = is_phone
+                self._remote_is_ring[sender_name]  = is_ring
+                # [OPUS 31/07/2026] Flag du DERNIER flux recu de cet
+                # emetteur. Les decodeurs Opus sont desormais indexes sur
+                # (emetteur, flag) : sans cette memoire, le PLC
+                # demanderait une reconstruction a un decodeur inexistant
+                # et retomberait toujours sur le rejeu maison, perdant le
+                # benefice du PLC natif obtenu le 26/07.
+                # Approximation assumee : un emetteur qui alterne radio et
+                # proximite verra son PLC pointer sur le dernier des deux.
+                # C'est mieux que rien, et le cas est rare (les deux flux
+                # portent le meme contenu au meme instant).
+                self._remote_last_flag[sender_name] = (
+                    3 if is_phone else (1 if is_radio else 0))
 
             # Snapshot taille queue AVANT push (utile pour log_rx). On le
             # capture hors lock : qsize() est une operation atomique sur
@@ -2244,6 +2724,72 @@ class AudioIO:
         with self._lock:
             self._phone_ring_buffer = None
             self._phone_ring_idx = 0
+            self._phone_ring_tx_idx = 0
+
+    def set_phone_ring_tx_only(self, actif: bool):
+        """Emettre la sonnerie sans la jouer localement (mannequin)."""
+        with self._lock:
+            self._phone_ring_tx_only = bool(actif)
+
+    def _get_ring_tx_frame(self, n: int):
+        """Retourne n echantillons de sonnerie pour l'EMISSION, ou None.
+
+        Boucle sur le motif comme la lecture locale, avec son propre
+        pointeur de lecture.
+
+        [SONNERIE 31/07/2026] Le volume emis est RELATIF a celui que le
+        joueur a choisi : PHONE_RING_TX_FACTOR s'applique par-dessus
+        _phone_ring_volume_factor, et non a la place. Un joueur qui baisse
+        sa sonnerie a 50 % emet donc a 50 % x le facteur -- ce qui est le
+        comportement attendu : le telephone sonne moins fort, donc les
+        gens autour l'entendent moins fort. Avant, l'emission partait du
+        motif brut et ignorait le reglage : la sonnerie pouvait etre
+        discrete chez soi et forte pour les autres.
+
+        Appele depuis le callback de capture, deja sous verrou.
+        """
+        buf = self._phone_ring_buffer
+        if buf is None or len(buf) == 0 or n <= 0:
+            return None
+        out = np.zeros(n, dtype=np.float32)
+        idx = self._phone_ring_tx_idx
+        filled = 0
+        ln = len(buf)
+        while filled < n:
+            take = min(n - filled, ln - idx)
+            out[filled:filled + take] = buf[idx:idx + take]
+            filled += take
+            idx += take
+            if idx >= ln:
+                idx = 0
+        self._phone_ring_tx_idx = idx
+        try:
+            vol_local = float(self._phone_ring_volume_factor)
+        except Exception:
+            vol_local = 1.0
+        # Le mute local (_phone_ring_tx_only) ne doit PAS annuler
+        # l'emission : c'est le mode du mannequin, qui emet sans
+        # s'entendre. Il agit sur la lecture, pas ici.
+        return out * (vol_local * PHONE_RING_TX_FACTOR)
+
+    def pop_ring_tx_frame(self, n: int):
+        """Retourne n echantillons de sonnerie a diffuser, ou None.
+
+        Avance le pointeur : a n'appeler qu'une fois par trame, par
+        l'emetteur. C'est core qui decide de melanger ou non, selon qu'un
+        PTT est actif.
+        """
+        with self._lock:
+            return self._get_ring_tx_frame(n)
+
+    def is_ring_tx_active(self) -> bool:
+        """True si une sonnerie doit etre diffusee aux joueurs proches.
+
+        Permet a core de savoir qu'une trame doit partir MEME si le micro
+        est coupe : un telephone qui sonne ne depend pas du micro.
+        """
+        with self._lock:
+            return self._phone_ring_buffer is not None
 
     def is_phone_ringing(self) -> bool:
         """Retourne True si la sonnerie telephone est en cours de lecture."""
@@ -2319,16 +2865,35 @@ class AudioIO:
         return self._gate_is_open
 
     def remove_user(self, name: str):
-        """Supprime un utilisateur du buffer de lecture."""
+        """Supprime un utilisateur du buffer de lecture.
+
+        [SONNERIE 06/08/2026] Retire aussi sa cle de sonnerie : sinon un
+        joueur parti laisse une file orpheline que plus rien ne vide.
+        """
         with self._lock:
+            _kr = name + RING_KEY_SUFFIX
+            self._remote_buffers.pop(_kr, None)
+            self._remote_is_ring.pop(_kr, None)
+            self._jb_state.pop(_kr, None)
             self._remote_buffers.pop(name, None)
             self._remote_volumes.pop(name, None)
             self._remote_multipliers.pop(name, None)
             self._remote_is_radio.pop(name, None)
             self._remote_is_phone.pop(name, None)
+            self._remote_is_ring.pop(name, None)
             self._remote_force_radio.pop(name, None)
         # Nettoyer l'etat filtre radio (garde le module leger)
         reset_radio_filter(name)
+        # [OPUS] Liberer aussi le decodeur Opus de cet emetteur. Opus est
+        # un codec a etat : un decodeur par sender. Sans ce nettoyage le
+        # dict enflerait a chaque join/leave sur une longue session, et un
+        # joueur qui se reconnecte reprendrait un decodeur portant l'etat
+        # de sa session precedente.
+        try:
+            import circusvoip_opus as _opus
+            _opus.drop_sender(name)
+        except Exception:
+            pass
 
     def set_force_radio(self, sender_name: str, force: bool):
         """Active ou desactive le forcage radio sur un sender donne.
@@ -2354,8 +2919,11 @@ class AudioIO:
             self._remote_force_radio.clear()
 
     def list_users(self) -> list[str]:
+        """Pseudos en ecoute. Les cles de sonnerie sont exclues : ce sont
+        des flux, pas des joueurs."""
         with self._lock:
-            return list(self._remote_buffers.keys())
+            return [n for n in self._remote_buffers
+                    if not n.endswith(RING_KEY_SUFFIX)]
 
     # -----------------------------------------
     #  Stats
@@ -2365,7 +2933,8 @@ class AudioIO:
         return {
             "frames_sent"     : self._frames_sent,
             "frames_received" : self._frames_received,
-            "users_listening" : len(self._remote_buffers),
+            "users_listening" : len([n for n in self._remote_buffers
+                                     if not n.endswith(RING_KEY_SUFFIX)]),
         }
 
     def close(self):
@@ -2377,3 +2946,4 @@ class AudioIO:
             self._remote_multipliers.clear()
             self._remote_is_radio.clear()
             self._remote_is_phone.clear()
+            self._remote_is_ring.clear()

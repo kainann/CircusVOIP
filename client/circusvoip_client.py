@@ -238,7 +238,7 @@ _boot_log("apres _bootstrap_dependencies()")
 
 
 from PySide6.QtCore import (
-    Qt, QTimer, QObject, Signal, Slot, QThread, QPoint, QRect,
+    Qt, QTimer, QObject, QEvent, Signal, Slot, QThread, QPoint, QRect,
     QRectF, QPointF,
     QMetaObject, QPropertyAnimation, QEasingCurve,
 )
@@ -251,6 +251,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QStyledItemDelegate,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -448,10 +449,16 @@ QComboBox {{
 QComboBox:hover {{
     border: 1px solid {THEME_MUTED};
 }}
-QComboBox::drop-down {{
-    border: none;
-    width: 18px;
-}}
+/* [FLECHE COMBO 28/07/2026] La regle QComboBox::drop-down a ete
+   RETIREE. En Qt, styliser ce sous-controle desactive le rendu natif de
+   la fleche ; sans fournir en plus une image ::down-arrow, plus aucune
+   fleche n'etait dessinee. Consequence : tous les menus deroulants de
+   l'application (micro, sortie, canal, profil, historique serveurs)
+   ressemblaient a de simples champs de texte, et rien n'indiquait
+   qu'on pouvait les derouler.
+   Sans cette regle, Qt redessine sa fleche native. On perd le controle
+   de la largeur de la zone (18 px) et de sa bordure, ce qui est sans
+   consequence visuelle notable et bien preferable a une fleche absente. */
 QComboBox QAbstractItemView {{
     background-color: {THEME_BG_PANEL};
     color: {THEME_TEXT};
@@ -605,7 +612,7 @@ VERSION_FILE = _BASE_DIR / "circusvoip_version.json"
 # retirer un contact via le bouton "oublier").
 PHONE_ANNUAIRE_FILE = _BASE_DIR / "circusphone_annuaire.json"
 # CircusPhone (D4 etape 3) : conversations privees + brouillons. Stockage
-# local par contact : 10 envoyes + 10 recus (max 20 messages par contact),
+# local par contact : 50 messages au total, envoyes et recus confondus,
 # tronques aux plus recents quand la limite est atteinte. Les brouillons
 # (texte en cours de redaction quand on quitte l'ecran conversation) sont
 # stockes dans le meme fichier pour pouvoir etre repris a l'ouverture
@@ -614,6 +621,49 @@ PHONE_MESSAGES_FILE = _BASE_DIR / "circusphone_messages.json"
 # --- Images dans les MP (screenshots) ---
 PHONE_IMAGES_DIR   = _BASE_DIR / "circusphone_images"   # cache local
 PHONE_IMG_PREFIX   = "[img]"     # body special : "[img]<fichier>" = bulle image
+
+# [GROUPES 19/08/2026] Encadrement de l'AUTEUR dans une bulle de groupe.
+# L'ecran de conversation n'affiche pas l'auteur de chaque message : il
+# est donc ecrit DANS le corps a la reception. Ce sont des chevrons
+# doubles, absents des claviers courants, pour qu'un joueur ne puisse pas
+# imiter la marque en tapant son texte.
+PHONE_GRP_AUTEUR   = "\u00ab"
+PHONE_GRP_FIN      = "\u00bb"
+# Marqueur d'une ANNONCE du serveur dans un corps stocke. Il reste sur
+# disque : c'est lui qui dit a l'affichage de rendre la ligne en texte
+# centre, sans bulle et sans auteur -- une annonce n'est pas un message.
+PHONE_SYS_PREFIX   = "[sys]"
+
+# [GROUPES 19/08/2026] Regles PARTAGEES avec le serveur. Repli a None :
+# sans ce module, les groupes disparaissent mais la messagerie directe
+# continue de fonctionner. Un deploiement partiel ne doit jamais casser
+# ce qui marchait avant.
+try:
+    import circusvoip_phone_groupes as _GRP
+except Exception as _e_grp:
+    _GRP = None
+    # [GROUPES 19/08/2026] Le repli est BRUYANT, conformement au §5 ter du
+    # PROJET.md : un repli silencieux transforme un oubli de deploiement en
+    # comportement degrade indetectable. Ici, l'absence du module ferait
+    # disparaitre le bouton « Nouveau groupe » et rangerait les messages de
+    # groupe dans la conversation de leur EXPEDITEUR -- sans qu'aucune
+    # erreur n'apparaisse nulle part.
+    import sys as _sys_grp
+    try:
+        print("=" * 68, file=_sys_grp.stderr)
+        print("[GROUPES] *** MODULE DE REGLES ABSENT ***", file=_sys_grp.stderr)
+        print(f"[GROUPES] {_e_grp!r}", file=_sys_grp.stderr)
+        print("[GROUPES] Consequence : pas de creation de groupe, et les",
+              file=_sys_grp.stderr)
+        print("[GROUPES] messages de groupe atterriront dans la conversation",
+              file=_sys_grp.stderr)
+        print("[GROUPES] de leur expediteur, avec un corps prefixe [grp].",
+              file=_sys_grp.stderr)
+        print("[GROUPES] Deployer circusvoip_phone_groupes.py.",
+              file=_sys_grp.stderr)
+        print("=" * 68, file=_sys_grp.stderr, flush=True)
+    except Exception:
+        pass
 PHONE_MAX_IMG_B64  = 900_000     # taille max du base64 (frame WS < 1 Mo)
 # Limites de la messagerie (cf spec D4).
 PHONE_MAX_BODY_LEN  = 500   # taille max d'un message texte
@@ -625,7 +675,7 @@ PHONE_MAX_BODY_LEN  = 500   # taille max d'un message texte
 # des messages du contact "qui repondent a rien" dans le fil. Fix 23/05/2026
 # Kainan. La structure JSON est conservee (sent[] + received[] separes) pour
 # retrocompat, le cap est applique apres fusion logique via _phone_trim_convo.
-PHONE_MAX_MESSAGES  = 20    # nb total de messages conserves par contact
+PHONE_MAX_MESSAGES  = 50    # nb total de messages conserves par contact
 # Constantes obsoletes conservees temporairement comme alias (au cas ou du
 # code legacy / scripts de migration les utilise). A retirer apres v0.2.
 PHONE_MAX_SENT      = PHONE_MAX_MESSAGES  # deprecated
@@ -1365,7 +1415,7 @@ def _check_for_updates(server_ip: str) -> dict | None:
         return None
     try:
         import urllib.request
-        url = f"http://{server_ip}:{UPDATE_PORT}/manifest.json"
+        url = f"http://{_split_host_port(server_ip, SERVER_PORT)[0]}:{UPDATE_PORT}/manifest.json"
         req = urllib.request.Request(
             url, headers={"User-Agent": "CircusVOIP-Client"}
         )
@@ -1420,7 +1470,7 @@ def _download_update_file(server_ip: str, file_meta: dict, dest_dir: Path) -> bo
         return False
     try:
         import urllib.request
-        url = f"http://{server_ip}:{UPDATE_PORT}/files/{name}"
+        url = f"http://{_split_host_port(server_ip, SERVER_PORT)[0]}:{UPDATE_PORT}/files/{name}"
         req = urllib.request.Request(
             url, headers={"User-Agent": "CircusVOIP-Client"}
         )
@@ -1467,7 +1517,7 @@ def _download_pip_wheel(server_ip: str, pkg_meta: dict, dest_dir: Path) -> bool:
         return False
     try:
         import urllib.request
-        url = f"http://{server_ip}:{UPDATE_PORT}/pip_packages/{name}"
+        url = f"http://{_split_host_port(server_ip, SERVER_PORT)[0]}:{UPDATE_PORT}/pip_packages/{name}"
         req = urllib.request.Request(
             url, headers={"User-Agent": "CircusVOIP-Client"}
         )
@@ -1773,6 +1823,8 @@ _CORE_MANAGED_CFG_KEYS = frozenset({
     "radio_key", "profile_radio_key",
     "mute_mic_key", "mute_prox_key", "mute_radio_key", "mute_all_key",
     "proximity_short_key", "cycle_channel_key",
+    # [RACCOURCI MASQUE 28/07/2026]
+    "mask_toggle_key",
     "phone_open_key", "phone_accept_key", "phone_decline_key",
     "phone_mute_key", "phone_speaker_key",
     # Flag de migration one-shot des defauts F6-F10 (build 62). Doit etre
@@ -1784,6 +1836,25 @@ _CORE_MANAGED_CFG_KEYS = frozenset({
     # Parametres via _core._save_client_cfg ; sans ca, _save_cfg(self._cfg)
     # reecraserait au close avec la valeur du boot -> fond non sauvegarde).
     "phone_wallpaper", "phone_wallpaper_key",
+    # [DISCORD 30/07/2026] Ecrits par la liaison EN COURS de session.
+    # Sans ca, _save_cfg(self._cfg) au close les reecraserait avec la
+    # valeur du boot (absente) -> jeton perdu, et il faudrait repasser
+    # par Discord a chaque lancement.
+    "account_token", "account_pseudo", "account_numero",
+    # [CONTACTS 31/07/2026] Drapeau de purge one-shot des donnees
+    # CircusPhone anterieures. Ecrit en cours de session : sans cette
+    # declaration, _save_cfg au close le reecraserait avec la valeur du
+    # boot (absente) -> la purge rejouerait a CHAQUE demarrage et
+    # effacerait aussi les contacts crees depuis. Meme piege que
+    # phone_keys_defaults_applied au build 62.
+    "phone_data_purged_040",
+    # [HISTORIQUE 04/08/2026] Historique d'appels. Ecrit EN COURS de
+    # session par _save_call_history() via _core._save_client_cfg : sans
+    # cette declaration, _save_cfg(self._cfg) au close le reecrasait avec
+    # la valeur du boot -> tout appel recu ou passe pendant la session
+    # disparaissait a la fermeture du client. Visible pendant la session,
+    # perdu apres relance. Cinquieme occurrence du meme piege.
+    "call_history",
 })
 
 
@@ -1892,6 +1963,18 @@ def _phone_save_annuaire(annuaire: dict) -> bool:
 
 
 def _phone_enrich_annuaire(annuaire: dict, pseudos, my_name: str = "") -> bool:
+    """[CONTACTS 31/07/2026] NEUTRALISEE. Retourne toujours False.
+
+    Collectait les pseudos des joueurs vus connectes. Conservee pour ne
+    pas casser d'eventuels appelants, mais elle ne doit plus rien
+    ajouter : le carnet se remplit uniquement a la main, a partir de
+    numeros donnes en jeu (cf circusvoip_phone_contacts).
+    """
+    return False
+
+
+def _phone_enrich_annuaire_ancien(annuaire: dict, pseudos,
+                                  my_name: str = "") -> bool:
     """Enrichit l'annuaire avec une liste de pseudos vus connectes.
       - pseudo absent  -> ajoute (first_seen = last_seen = maintenant)
       - pseudo present -> last_seen mis a jour (en memoire seulement)
@@ -1946,7 +2029,7 @@ def _phone_forget_contact(annuaire: dict, pseudo: str) -> bool:
 #       ...
 #     }
 #   }
-# 10 envoyes + 10 recus par contact (cf spec). Le 'sent' est tronque
+# Cap global par contact (cf. PHONE_MAX_MESSAGES). Le 'sent' est tronque
 # par l'avant (on retire les plus anciens). 'received' idem. 'draft' est
 # vide par defaut, rempli quand on quitte l'ecran conversation avec du
 # texte non envoye, vide quand on envoie. 'unread' incremente a chaque
@@ -1957,7 +2040,7 @@ def _phone_load_messages() -> dict:
     forme {"conversations": {...}} (vide si fichier absent / illisible).
     Applique _phone_trim_convo sur chaque conversation chargee pour
     normaliser les fichiers anciens (cap 10+10) au nouveau cap global
-    (20 messages total). Pas d'ecriture disque ici : la normalisation
+    (cap PHONE_MAX_MESSAGES). Pas d'ecriture disque ici : la normalisation
     sera persistee au prochain save naturel (envoi/reception/draft)."""
     try:
         if PHONE_MESSAGES_FILE.exists():
@@ -1978,6 +2061,18 @@ def _phone_load_messages() -> dict:
                         _phone_trim_convo(convo)
                 return data
     except Exception as e:
+        # [CORRECTIF 19/08/2026] Le fichier existe mais est illisible : on
+        # le MET DE COTE avant de repartir a vide. Sans ca, la premiere
+        # sauvegarde l'ecrasait et le peu qui restait recuperable a la
+        # main disparaissait pour de bon.
+        try:
+            if PHONE_MESSAGES_FILE.exists():
+                secours = PHONE_MESSAGES_FILE.with_suffix(".corrompu.json")
+                os.replace(PHONE_MESSAGES_FILE, secours)
+                print(f"[PHONE] Fichier illisible mis de côté : {secours}",
+                      file=sys.stderr)
+        except Exception:
+            pass
         print(f"[PHONE] Echec lecture messages : {e}", file=sys.stderr)
     return {"conversations": {}}
 
@@ -1985,13 +2080,37 @@ def _phone_load_messages() -> dict:
 def _phone_save_messages(messages: dict) -> bool:
     """Sauvegarde les conversations dans PHONE_MESSAGES_FILE. Best-effort :
     retourne True si l'ecriture a reussi, False sinon."""
+    # [CORRECTIF 19/08/2026] Ecriture ATOMIQUE : fichier temporaire, puis
+    # os.replace() qui est atomique au niveau du systeme de fichiers.
+    #
+    # Un write_text() direct tronque le fichier AVANT d'ecrire. Une
+    # coupure au milieu -- crash, alt-F4, coupure de courant -- laissait
+    # un JSON invalide. Au demarrage suivant, _phone_load_messages()
+    # echouait, repartait sur un dictionnaire vide, et la premiere
+    # sauvegarde ECRASAIT le fichier abime : toutes les conversations
+    # perdues, sans recours.
+    #
+    # Il n'y a aucune autre copie : le serveur route les messages et ne
+    # les archive pas. C'est le meme mecanisme que GroupeStore._sauver()
+    # cote serveur, qui l'avait deja.
+    import tempfile
+    tmp = None
     try:
-        PHONE_MESSAGES_FILE.write_text(
-            json.dumps(messages, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        PHONE_MESSAGES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(PHONE_MESSAGES_FILE.parent),
+                                   suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(messages, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, PHONE_MESSAGES_FILE)
         return True
     except Exception as e:
+        # Ne pas laisser trainer le temporaire : au fil des echecs il en
+        # resterait un par tentative dans le dossier du client.
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
         print(f"[PHONE] Echec sauvegarde messages : {e}", file=sys.stderr)
         return False
 
@@ -2320,6 +2439,31 @@ def _compute_default_size(screen_w: int, screen_h: int) -> tuple[int, int]:
 # C'est l'equivalent Qt du couplage "ui.add_player()" du client1, mais
 # sans appel direct cross-thread.
 
+
+def _split_host_port(saisie: str, defaut: int) -> tuple[str, int]:
+    """Separe "ip:port" en (ip, port). Sans ":", renvoie (ip, defaut).
+
+    Tolerant : une partie port vide ou non numerique est ignoree au
+    profit du defaut, plutot que d'empecher la connexion. IPv6 non gere
+    (le projet est en IPv4) — une adresse entre crochets serait renvoyee
+    telle quelle.
+    """
+    s = (saisie or "").strip()
+    if s.startswith("["):          # IPv6 litteral : on ne touche pas
+        return s, defaut
+    if s.count(":") != 1:
+        return s, defaut
+    host, _, port = s.partition(":")
+    host = host.strip()
+    try:
+        p = int(port.strip())
+        if not (1 <= p <= 65535):
+            raise ValueError(p)
+    except Exception:
+        return host or s, defaut
+    return host, p
+
+
 class NetWorker(QObject):
     # Signaux UI <- worker (toujours emis depuis le thread worker)
     sig_status = Signal(bool, str)               # connected, message
@@ -2328,6 +2472,16 @@ class NetWorker(QObject):
     sig_player_pos = Signal(str, dict, float)    # name, pos, dist
     sig_player_offline = Signal(str, bool)       # name, offline?
     sig_players_reset = Signal(list)             # liste de noms (welcome)
+    # [HISTORIQUE SERVEURS 28/07/2026] Emis a la reception du welcome,
+    # c'est-a-dire apres un join ACCEPTE (token valide, serveur non plein,
+    # pas de ban). C'est le seul moment ou l'on sait que le couple
+    # adresse + mot de passe est bon.
+    # Passe par un signal parce que _handle_message vit dans NetWorker,
+    # qui n'a pas acces a l'UI : appeler directement une methode de
+    # MainWindow levait un AttributeError, avale en silence par un
+    # try/except — d'ou un historique qui restait vide sans erreur
+    # visible.
+    sig_join_accepted = Signal()
     sig_log = Signal(str)                        # ligne de log
     sig_invalid_token = Signal()                 # mauvais MDP serveur
     sig_anonymous_mode = Signal(bool)            # mode anonyme on/off (serveur)
@@ -2346,16 +2500,36 @@ class NetWorker(QObject):
     # CircusPhone (Feature 4, D1) : signaux du cycle de vie d'appel.
     # Tous emis depuis le thread worker WS, relies a des slots
     # MainWindow._on_phone_* via QueuedConnection (thread-safe).
-    sig_phone_ringing  = Signal(str, str)         # call_id, target
-    sig_phone_incoming = Signal(str, str)         # call_id, caller
-    sig_phone_accepted = Signal(str, str, str)    # call_id, caller, callee
+    # [RP 04/08/2026] Plus de pseudo dans ces signaux : uniquement des
+    # numeros. Seul sig_phone_accepted transporte encore deux pseudos, et
+    # sous le nom "audio_id" : ils servent au routage des trames de voix,
+    # jamais a l'affichage.
+    sig_phone_ringing  = Signal(str, str)         # call_id, numero
+    sig_phone_incoming = Signal(str, str)         # call_id, numero
+    sig_phone_accepted = Signal(str, str, str, str, str)
+    #   call_id, caller_numero, callee_numero, caller_audio_id, callee_audio_id
     sig_phone_declined = Signal(str)              # call_id
-    sig_phone_busy     = Signal(str, str)         # target, cause
-    sig_phone_missed   = Signal(str, str, str)    # call_id, caller, callee
+    sig_phone_busy     = Signal(str, str)         # target_numero, cause
+    # [QUEUE 05/08/2026] 4e argument : ts d'ORIGINE de l'appel.
+    # Il etait envoye par le serveur au rejeu mais jete ici, si bien
+    # qu'un appel manque rejoue s'inscrivait a l'heure de la
+    # RECONNEXION. Les messages et images differes le transportaient
+    # deja (cf. sig_phone_message_received) ; seul ce signal, ajoute
+    # en dernier, avait ete oublie. 0.0 = evenement temps reel.
+    sig_phone_missed   = Signal(str, str, str, float)  # + ts
     sig_phone_ended    = Signal(str, str)         # call_id, reason
     # CircusPhone (D4 etape 3) : reception d'un MP texte. Relaye au thread
     # Qt via slot _on_phone_message_received dans MainWindow.
     sig_phone_message_received = Signal(str, str, float)  # sender, body, ts
+    # [TRAVAIL 10/08/2026] Etat complet de l'app Travail, pousse par le
+    # serveur apres CHAQUE action. Un dict unique plutot que plusieurs
+    # signaux : l'ecran ne peut ainsi jamais etre a moitie a jour.
+    sig_travail_etat = Signal(dict)
+    sig_groupe_etat = Signal(dict)   # [GROUPES 19/08/2026]
+    sig_message_refuse = Signal(str, int)   # [CORRECTIF 19/08/2026]
+    sig_urgence_etat = Signal(dict)
+    sig_urgence_notif = Signal(str)
+    sig_travail_notif = Signal(str, str)   # genre, texte
     sig_phone_image_received = Signal(str, str, float)    # sender, b64, ts
     sig_phone_server_msg = Signal(dict)   # message mp_* (multijoueur) -> overlay
     # [D5] Reponse a un profile_photo_request. Champs : target, status,
@@ -2386,7 +2560,7 @@ class NetWorker(QObject):
             )
         except Exception as e:
             self.sig_log.emit(f"[NET] Erreur worker : {e}")
-            self.sig_status.emit(False, f"Erreur : {e}")
+            self.sig_status.emit(False, self._message_refus(e))
         finally:
             try:
                 if self._loop:
@@ -2426,7 +2600,12 @@ class NetWorker(QObject):
         # acceptable car l'auth client se fait ensuite via le token dans
         # le message "join" (compare_digest cote serveur, cf [P1]).
         from circusvoip_security import build_client_ssl_context_insecure
-        uri = f"wss://{server_ip}:{SERVER_PORT}"
+        # [PORTS CONFIGURABLES 26/07/2026] L'utilisateur peut saisir
+        # "ip:port" dans le champ Serveur. Sans ":", on garde le port
+        # historique. C'est le seul port que le client doit connaitre :
+        # celui du serveur audio lui est annonce dans le welcome.
+        _host, _port = _split_host_port(server_ip, SERVER_PORT)
+        uri = f"wss://{_host}:{_port}"
         _ssl_ctx = build_client_ssl_context_insecure()
         self.sig_log.emit(f"[NET] Connexion a {uri} (nom={name})...")
         try:
@@ -2458,11 +2637,22 @@ class NetWorker(QObject):
 
                 # Envoi du join. channel=None car 2a ne gere pas les canaux
                 # (sera ajoute en 2c).
+                # [DISCORD 30/07/2026] account_token : identifie le
+                # joueur aupres du serveur, qui repond avec le pseudo de
+                # la fiche et le numero. Absent = ancien client ou compte
+                # pas encore relie ; le serveur decide alors s'il accepte
+                # (REQUIRE_ACCOUNT cote serveur).
+                _acc_tok = ""
+                try:
+                    _acc_tok = str(_load_cfg().get("account_token", "") or "")
+                except Exception:
+                    _acc_tok = ""
                 await ws.send(json.dumps({
                     "type": "join",
                     "name": name,
                     "token": token,
                     "channel": None,
+                    "account_token": _acc_tok,
                 }))
 
                 # Bug fix 56 : marquer connected=True UNIQUEMENT apres
@@ -2499,8 +2689,10 @@ class NetWorker(QObject):
                         continue
                     self._handle_message(data, name)
         except Exception as e:
+            # Le log garde le texte BRUT : c'est lui qu'on relit pour
+            # diagnostiquer. Seul le bandeau est traduit.
             self.sig_log.emit(f"[NET] Connexion echouee : {e}")
-            self.sig_status.emit(False, f"Erreur : {e}")
+            self.sig_status.emit(False, self._message_refus(e))
             # Bug fix : avant, le finally en dessous emettait
             # sig_status(False, "") qui ECRASAIT le message d'erreur.
             # L'utilisateur voyait l'erreur 1ms puis "Deconnecte" sans
@@ -2521,6 +2713,66 @@ class NetWorker(QObject):
             self._error_status_emitted = False
             self.sig_log.emit("[NET] Deconnecte")
 
+    # ------------------------------------------------------------------
+    # Traduction des refus serveur
+    # ------------------------------------------------------------------
+    #
+    # [UX 10/08/2026] Le bandeau rouge affichait la cloture WebSocket
+    # brute :
+    #
+    #   Deconnecte (Erreur : received 1008 (policy violation)
+    #   account_unknown; then sent 1008 (policy violation) account_unknown)
+    #
+    # Illisible, et surtout ca ne dit pas QUOI FAIRE. Le motif utile --
+    # "account_unknown" -- est noye dans du vocabulaire de protocole, et
+    # repete deux fois parce que la cloture est bilaterale. Acceptable en
+    # dev ou l'on sait lire ; pas devant un joueur.
+    #
+    # On traduit donc les motifs connus en une phrase qui nomme la cause
+    # ET l'action a faire. Un motif inconnu retombe sur le texte brut :
+    # mieux vaut un message technique qu'un message faux, et ca laisse
+    # une prise pour diagnostiquer un cas non prevu.
+    _REFUS_CONNUS = {
+        "account_unknown":
+            "Votre compte n'est plus reconnu par ce serveur. "
+            "Cliquez sur \u00ab RELIER A NOUVEAU \u00bb pour le rattacher "
+            "a Discord : vous conservez votre pseudo, votre numero et "
+            "votre historique.",
+        "account_required":
+            "Ce serveur demande un compte relie a Discord. "
+            "Cliquez sur \u00ab RELIER A NOUVEAU \u00bb pour en creer un.",
+        "invalid_token":
+            "Mot de passe du serveur incorrect. "
+            "Verifiez le champ MDP, puis reconnectez-vous.",
+        "invalid_ticket":
+            "Session audio expiree. "
+            "Deconnectez-vous puis reconnectez-vous.",
+        "banned":
+            "Vous etes temporairement bloque par ce serveur. "
+            "Reessayez plus tard, ou contactez un administrateur.",
+        "kicked_by_admin":
+            "Vous avez ete deconnecte par un administrateur.",
+        "server_full":
+            "Le serveur est plein. Reessayez dans quelques minutes.",
+        "name_taken":
+            "Ce pseudo est deja utilise sur ce serveur. "
+            "Choisissez-en un autre dans le champ Nom.",
+    }
+
+    @classmethod
+    def _message_refus(cls, err) -> str:
+        """Transforme une erreur de connexion en phrase lisible.
+
+        Le motif est cherche PAR SOUS-CHAINE et non par egalite : le
+        texte de cloture le noie dans du vocabulaire de protocole et sa
+        forme exacte depend de la bibliotheque websockets.
+        """
+        brut = str(err)
+        for motif, phrase in cls._REFUS_CONNUS.items():
+            if motif in brut:
+                return phrase
+        return f"Erreur : {brut}"
+
     def _handle_message(self, data: dict, my_name: str):
         msg_type = data.get("type")
 
@@ -2531,6 +2783,17 @@ class NetWorker(QObject):
             self.sig_phone_server_msg.emit(data)
             return
 
+        # [DISCORD 30/07/2026] Refus lie au compte (pseudo pris, compte
+        # exige, jeton perime). Le serveur ferme juste apres, donc sans
+        # ce message le joueur ne verrait qu'une deconnexion muette.
+        if msg_type == "account_error":
+            reason = data.get("reason", "")
+            msg = data.get("message", "Compte refuse")
+            self.sig_log.emit(f"[COMPTE] Refus ({reason}) : {msg}")
+            self.sig_status.emit(False, msg)
+            self._stop_requested = True
+            return
+
         if msg_type == "error":
             reason = data.get("reason", "")
             self.sig_log.emit(f"[NET] error : {reason}")
@@ -2539,7 +2802,105 @@ class NetWorker(QObject):
                 self._stop_requested = True
             return
 
+        if msg_type == "urgence_etat":
+            self.sig_urgence_etat.emit(data)
+            return
+        if msg_type == "urgence_nouvelle":
+            self.sig_urgence_notif.emit(str(data.get("urgence_type") or ""))
+            return
+        if msg_type == "phone_message_refused":
+            # [CORRECTIF 19/08/2026] Le serveur emettait cette trame
+            # depuis toujours -- avec le commentaire « un refus
+            # silencieux laisserait l'emetteur croire qu'il a ete
+            # delivre » -- mais AUCUN client ne la traitait. Le refus
+            # etait donc silencieux quand meme, et pire : le message
+            # reste affiche dans la conversation comme envoye.
+            #
+            # Deux causes possibles cote serveur : limitation de debit
+            # (reason = refus/silence/kick/blocage) ou file du
+            # destinataire pleine (reason = undelivered).
+            self.sig_message_refuse.emit(
+                str(data.get("reason") or ""),
+                int(data.get("retry_in") or 0))
+            return
+
+        if msg_type == "groupe_etat":
+            # [GROUPES 19/08/2026] Etat COMPLET, renvoye apres chaque
+            # action ET pousse spontanement quand un autre joueur nous
+            # ajoute a un groupe.
+            self.sig_groupe_etat.emit(data)
+            return
+
+        if msg_type == "travail_etat":
+            self.sig_travail_etat.emit(data)
+            return
+
+        if msg_type == "travail_nouvelle":
+            self.sig_travail_notif.emit(
+                "nouvelle",
+                f"Nouvelle mission {data.get('metier', '')} : "
+                f"{data.get('titre', '')}")
+            return
+
+        if msg_type == "travail_abandon":
+            self.sig_travail_notif.emit(
+                "abandon",
+                f"Mission abandonnée : {data.get('titre', '')}")
+            return
+
         if msg_type == "welcome":
+            # [ROTATION 05/08/2026] Jeton local NEUF, emis par le serveur a
+            # chaque connexion acceptee. Ecrit sur disque IMMEDIATEMENT, en
+            # tout premier, avant toute autre lecture du welcome : le
+            # serveur a deja retrograde l'ancien jeton, qui ne vaut plus que
+            # le temps de sa fenetre de tolerance. Toute ligne executee
+            # avant cette ecriture est une ligne qui peut lever et nous
+            # faire perdre le jeton.
+            #
+            # On passe par _load_client_cfg/_save_client_cfg (le core) et
+            # NON par self._cfg : 'account_token' est dans
+            # _CORE_MANAGED_CFG_KEYS, donc _save_cfg au closeEvent relira le
+            # disque et ne l'ecrasera pas. Ecrire ici via le core est le
+            # chemin qui survit a la fermeture.
+            _tok_neuf = data.get("account_token", "") or ""
+            if _tok_neuf and _CORE_AVAILABLE:
+                try:
+                    _cfg_tok = _core._load_client_cfg()
+                    if _cfg_tok.get("account_token") != _tok_neuf:
+                        _cfg_tok["account_token"] = _tok_neuf
+                        _core._save_client_cfg(_cfg_tok)
+                except Exception as e:
+                    # Echec d'ecriture : l'ancien jeton reste sur disque et
+                    # reste accepte pendant la fenetre de tolerance cote
+                    # serveur -- c'est exactement le cas que cette fenetre
+                    # existe pour couvrir. On le dit fort : si ces lignes
+                    # apparaissent, la tolerance masque un vrai probleme
+                    # d'ecriture de config.
+                    print(f"[ROTATION] ECHEC d'ecriture du jeton neuf : {e!r}",
+                          file=sys.stderr, flush=True)
+                    try:
+                        _core._dbg_log(
+                            f"[ROTATION] ECHEC ecriture jeton neuf : {e!r}")
+                    except Exception:
+                        pass
+
+            # [PORTS CONFIGURABLES 26/07/2026] Le serveur annonce son port
+            # audio : le client n'a plus a le connaitre a l'avance. Cle
+            # absente = serveur v0.3, on garde le defaut historique.
+            if _CORE_AVAILABLE and "audio_port" in data:
+                try:
+                    _core.set_audio_port(data.get("audio_port"))
+                except Exception:
+                    pass
+
+            # [HISTORIQUE SERVEURS] Join accepte : la fenetre peut
+            # memoriser ce serveur et son mot de passe.
+            try:
+                self.sig_join_accepted.emit()
+            except Exception:
+                pass
+
+
             # Etat anonymous transmis au join (peut etre absent = False)
             try:
                 state.anonymous_mode = bool(data.get("anonymous_mode", False))
@@ -2573,6 +2934,12 @@ class NetWorker(QObject):
                 # reconnecte, on obtient un nouveau ticket et l'ancien est
                 # ecrase (l'ancien ne vaut plus rien cote serveur).
                 state.audio_ticket = data.get("audio_ticket", "") or ""
+                # [DISCORD 30/07/2026] Mon numero de telephone. None si le
+                # serveur tourne sans comptes : tout le reste fonctionne.
+                try:
+                    state.my_numero = data.get("my_numero")
+                except Exception:
+                    pass
                 # v0.2 alpha 035 : permissions du profil. Au welcome,
                 # le serveur envoie False par defaut (pas encore de profil
                 # assigne). Stocke pour usage UI + emet le signal pour
@@ -2888,30 +3255,69 @@ class NetWorker(QObject):
         # ─────────────────────────────────────────────
         # On relaie chaque message au thread Qt via un signal dedie.
         # MainWindow porte l'etat d'appel et l'UI de la page Phone Debug.
+        # [RP 04/08/2026] Les trames ne portent plus QUE le numero. Le
+        # pseudo a disparu cote serveur : il donnait deux sources pour la
+        # meme information, et l'ecran reconstruit depuis l'etat prenait la
+        # mauvaise. Cf. §5 ter du PROJET.md.
         if msg_type == "phone_call_ringing":
             self.sig_phone_ringing.emit(
-                data.get("call_id") or "", data.get("target") or "")
+                data.get("call_id") or "",
+                str(data.get("target_numero") or ""))
             return
         if msg_type == "phone_call_incoming":
             self.sig_phone_incoming.emit(
-                data.get("call_id") or "", data.get("caller") or "")
+                data.get("call_id") or "",
+                str(data.get("caller_numero") or ""))
             return
         if msg_type == "phone_call_accepted":
+            # Les *_audio_id portent le pseudo : ils ne servent QU'AU
+            # routage audio (le core filtre les trames 0x03 sur le pseudo
+            # emetteur). Ils ne doivent jamais atteindre un ecran.
             self.sig_phone_accepted.emit(
-                data.get("call_id") or "", data.get("caller") or "",
-                data.get("callee") or "")
+                data.get("call_id") or "",
+                str(data.get("caller_numero") or ""),
+                str(data.get("callee_numero") or ""),
+                str(data.get("caller_audio_id") or ""),
+                str(data.get("callee_audio_id") or ""))
             return
         if msg_type == "phone_call_declined":
             self.sig_phone_declined.emit(data.get("call_id") or "")
             return
         if msg_type == "phone_call_busy":
             self.sig_phone_busy.emit(
-                data.get("target") or "", data.get("cause") or "")
+                str(data.get("target_numero") or ""),
+                data.get("cause") or "")
             return
         if msg_type == "phone_call_missed":
+            # [QUEUE 03/08/2026] Messagerie differee : acquittement.
+            #
+            # Le serveur ne retire un evenement de la file QU'APRES cet ack.
+            # Une deconnexion en plein rejeu ne perd donc rien : la reprise se
+            # fera a la prochaine connexion.
+            #
+            # L'ack part DES la reception du message, avant que le slot Qt
+            # n'ait ecrit sur disque (signaux mis en file entre threads).
+            # La fenetre est d'un tour de boucle d'evenements ; un plantage
+            # pile dedans perdrait le message. Compromis assume : l'alternative
+            # -- acquitter depuis le slot -- ferait remonter la mecanique de
+            # file jusque dans l'interface.
+            _qid = data.get("queued_id")
+            if _qid:
+                try:
+                    _core._ws_send_safe({"type": "phone_queue_ack",
+                                         "ids": [str(_qid)]})
+                except Exception:
+                    pass
+
+            try:
+                _ts_missed = float(data.get("ts") or 0.0)
+            except Exception:
+                _ts_missed = 0.0
             self.sig_phone_missed.emit(
-                data.get("call_id") or "", data.get("caller") or "",
-                data.get("callee") or "")
+                data.get("call_id") or "",
+                str(data.get("caller_numero") or ""),
+                str(data.get("callee_numero") or ""),
+                _ts_missed)
             return
         if msg_type == "phone_call_ended":
             self.sig_phone_ended.emit(
@@ -2967,24 +3373,69 @@ class NetWorker(QObject):
             return
         # CircusPhone (D4 etape 3) : un MP texte est arrive.
         if msg_type == "phone_message_received":
-            sender = data.get("sender") or ""
             body   = data.get("body") or ""
             try:
                 ts = float(data.get("ts") or 0.0)
             except Exception:
                 ts = 0.0
-            self.sig_phone_message_received.emit(sender, body, ts)
+            # [CONTACTS 31/07/2026] On indexe la conversation sur le
+            # NUMERO de l'expediteur, pas son pseudo : c'est la seule
+            # identite que le destinataire est cense connaitre.
+            # [RP 04/08/2026] Le repli sur le pseudo a ete RETIRE : le
+            # serveur ne l'envoie plus du tout.
+            _num_exp = str(data.get("sender_numero") or "")
+            # [QUEUE 03/08/2026] Messagerie differee : acquittement.
+            #
+            # Le serveur ne retire un evenement de la file QU'APRES cet ack.
+            # Une deconnexion en plein rejeu ne perd donc rien : la reprise se
+            # fera a la prochaine connexion.
+            #
+            # L'ack part DES la reception du message, avant que le slot Qt
+            # n'ait ecrit sur disque (signaux mis en file entre threads).
+            # La fenetre est d'un tour de boucle d'evenements ; un plantage
+            # pile dedans perdrait le message. Compromis assume : l'alternative
+            # -- acquitter depuis le slot -- ferait remonter la mecanique de
+            # file jusque dans l'interface.
+            _qid = data.get("queued_id")
+            if _qid:
+                try:
+                    _core._ws_send_safe({"type": "phone_queue_ack",
+                                         "ids": [str(_qid)]})
+                except Exception:
+                    pass
+
+            self.sig_phone_message_received.emit(_num_exp, body, ts)
             return
 
         # Screenshots dans les MP : une image (base64) est arrivee.
         if msg_type == "phone_image_received":
-            sender = data.get("sender") or ""
             b64    = data.get("data") or ""
             try:
                 ts = float(data.get("ts") or 0.0)
             except Exception:
                 ts = 0.0
-            self.sig_phone_image_received.emit(sender, b64, ts)
+            _num_exp = str(data.get("sender_numero") or "")
+            # [QUEUE 03/08/2026] Messagerie differee : acquittement.
+            #
+            # Le serveur ne retire un evenement de la file QU'APRES cet ack.
+            # Une deconnexion en plein rejeu ne perd donc rien : la reprise se
+            # fera a la prochaine connexion.
+            #
+            # L'ack part DES la reception du message, avant que le slot Qt
+            # n'ait ecrit sur disque (signaux mis en file entre threads).
+            # La fenetre est d'un tour de boucle d'evenements ; un plantage
+            # pile dedans perdrait le message. Compromis assume : l'alternative
+            # -- acquitter depuis le slot -- ferait remonter la mecanique de
+            # file jusque dans l'interface.
+            _qid = data.get("queued_id")
+            if _qid:
+                try:
+                    _core._ws_send_safe({"type": "phone_queue_ack",
+                                         "ids": [str(_qid)]})
+                except Exception:
+                    pass
+
+            self.sig_phone_image_received.emit(_num_exp, b64, ts)
             return
 
         # [D5] Reponse a une demande de photo de profil.
@@ -3805,19 +4256,34 @@ class OverlayWindow(QWidget):
         hl.addWidget(self._drag_handle)
         hl.addStretch(1)
 
-        # Bouton activer (✓) ou retirer (✕) selon etat
+        # [OVERLAY 28/07/2026] Le symbole indique desormais l'ETAT COURANT
+        # et non l'action a venir : V vert quand l'overlay est actif,
+        # croix rouge quand il est inactif. Un clic bascule dans les deux
+        # cas. C'est plus lisible d'un coup d'oeil sur plusieurs overlays
+        # a la fois, ou l'ancienne convention obligeait a interpreter
+        # chaque icone a l'envers.
+        #
+        # Le caractere de croix etait "✕" (U+2715 MULTIPLICATION X),
+        # present dans peu de polices Windows : quand la police courante
+        # ne le fournit pas, Qt n'affiche rien du tout — d'ou une croix
+        # invisible alors que le "✓" (U+2713, bien mieux supporte)
+        # s'affichait normalement. On utilise "×" (U+00D7), present dans
+        # toutes les polices latines, agrandi pour compenser sa petite
+        # taille naturelle.
         if self._is_active:
-            btn = QLabel("✕")
-            btn.setStyleSheet(
-                "color: #ff6666; font-size: 11pt; font-weight: bold;"
-            )
-            btn.setCursor(QCursor(Qt.PointingHandCursor))
-            btn._target_active = False
-        else:
             btn = QLabel("✓")
             btn.setStyleSheet(
                 "color: #66dd66; font-size: 11pt; font-weight: bold;"
             )
+            btn.setToolTip("Overlay actif — cliquer pour le retirer")
+            btn.setCursor(QCursor(Qt.PointingHandCursor))
+            btn._target_active = False
+        else:
+            btn = QLabel("×")
+            btn.setStyleSheet(
+                "color: #ff6666; font-size: 16pt; font-weight: bold;"
+            )
+            btn.setToolTip("Overlay inactif — cliquer pour l'activer")
             btn.setCursor(QCursor(Qt.PointingHandCursor))
             btn._target_active = True
         btn.mousePressEvent = lambda e, b=btn: self._on_active_btn_clicked(b)
@@ -7044,6 +7510,7 @@ class MicLevelRow(QWidget):
         self._name.setMinimumWidth(0)
         h.addWidget(self._name, stretch=1)
 
+
     def set_level(self, rms: float):
         """RMS recu d'un sd.InputStream. Repaint si change significatif."""
         new = max(0.0, min(1.0, float(rms) * 6.0))  # boost x6 pour visibilite
@@ -7094,11 +7561,18 @@ class MicLevelRow(QWidget):
         r = int(c0.red()   * (1 - t) + c1.red()   * t)
         g = int(c0.green() * (1 - t) + c1.green() * t)
         b = int(c0.blue()  * (1 - t) + c1.blue()  * t)
-        pen_w = 1 + int(t * 2)  # 1px au repos, jusqu'a 3px au pic
+        # [LISIBILITE 26/07/2026] Epaisseur augmentee : 1->3px etait trop
+        # discret pour reperer d'un coup d'oeil quelle ligne pulse quand
+        # on parle, surtout sur un ecran 4K ou 1px est minuscule.
+        # Desormais 2px au repos, jusqu'a 6px au pic.
+        pen_w = 2 + int(t * 4)
         pen = QPen(QColor(r, g, b))
         pen.setWidth(pen_w)
         p.setPen(pen)
-        p.drawRect(0, 0, w - 1, h - 1)
+        # Le trait est centre sur le chemin : sans ce retrait, la moitie
+        # exterieure serait rognee et l'epaisseur reelle divisee par deux.
+        _m = pen_w // 2
+        p.drawRect(_m, _m, w - 1 - 2 * _m, h - 1 - 2 * _m)
         p.end()
 
 
@@ -8298,8 +8772,21 @@ class _PhoneIconLabel(QLabel):
                 a1 = math.radians(base_angle - tooth_half_deg)
                 a2 = math.radians(base_angle + tooth_half_deg)
                 # 4 sommets : 2 sur le cercle interne, 2 sur l'externe
+                #
+                # [CORRECTIF 19/08/2026] L'import LOCAL de QPointF a ete
+                # retire. En Python, un nom importe dans une fonction est
+                # local a TOUTE la fonction, y compris AVANT la ligne
+                # d'import : les QPointF() des branches precedentes de ce
+                # meme paintEvent cessaient de voir l'import global (en
+                # tete de fichier) et levaient
+                #   cannot access local variable 'QPointF'
+                # Les icones concernees retombaient alors sur le glyphe
+                # de secours, sans autre signe qu'une ligne de log.
+                #
+                # QPolygonF, lui, n'est PAS importe globalement : son
+                # import local reste necessaire et ne gene rien, aucune
+                # autre branche ne l'utilise.
                 from PySide6.QtGui import QPolygonF
-                from PySide6.QtCore import QPointF
                 poly = QPolygonF([
                     QPointF(cx + r_in * math.cos(a1), cy + r_in * math.sin(a1)),
                     QPointF(cx + r_out * math.cos(a1), cy + r_out * math.sin(a1)),
@@ -8334,246 +8821,8 @@ class _PhoneIconLabel(QLabel):
         p.end()
 
 
-class _PhoneContactRow(QWidget):
-    """Une ligne de contact dans l'ecran annuaire : pastille de statut,
-    [D5 optionnel : avatar rond si photo disponible], nom, et en bout de
-    ligne soit (telephone + lettre) si connecte, soit (croix "oublier") si
-    deconnecte."""
-
-    sig_call    = Signal(str)   # pseudo : clic sur l'icone telephone
-    sig_message = Signal(str)   # pseudo : clic sur l'icone lettre
-    sig_forget  = Signal(str)   # pseudo : clic sur la croix "oublier"
-
-    def __init__(self, pseudo: str, online: bool, row_h: int,
-                 unread: bool = False, photo_bytes=None, parent=None,
-                 mode: str = "full"):
-        super().__init__(parent)
-        # Sans cet attribut, un QWidget simple NE PEINT PAS le 'background'
-        # defini en stylesheet (la surbrillance de navigation resterait
-        # invisible). Indispensable pour le halo de selection en mode message.
-        self.setAttribute(Qt.WA_StyledBackground, True)
-        self._pseudo = pseudo
-        self._online = online
-        self._mode = mode          # "full" (tel+lettre) ou "message" (ligne)
-        self.setFixedHeight(row_h)
-        icon_sz = max(14, int(row_h * 0.55))
-        dot_sz  = max(7, int(row_h * 0.28))
-
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(8, 0, 8, 0)
-        lay.setSpacing(6)
-
-        # Pastille de statut (cercle plein dessine via QSS border-radius).
-        dot = QLabel()
-        dot.setFixedSize(dot_sz, dot_sz)
-        dot_col = _PHONE_DOT_ONLINE if online else _PHONE_DOT_OFFLINE
-        dot.setStyleSheet(
-            f"background:{dot_col}; border-radius:{dot_sz // 2}px;"
-        )
-        lay.addWidget(dot)
-
-        # [D5] Avatar : insere SEULEMENT si on a des bytes valides.
-        # Pas de photo -> rien (spec : on ne reserve pas d'emplacement).
-        self._avatar = None
-        if photo_bytes:
-            av_sz = max(20, int(row_h * 0.80))
-            self._avatar = _AvatarWidget(av_sz, self)
-            self._avatar.set_photo_bytes(photo_bytes)
-            if self._avatar.has_photo():
-                lay.addWidget(self._avatar)
-            else:
-                # Bytes corrompus : on ne montre rien.
-                self._avatar.deleteLater()
-                self._avatar = None
-
-        # Nom du contact.
-        name = QLabel(pseudo)
-        name_col = _PHONE_NAME_ONLINE if online else _PHONE_NAME_OFFLINE
-        weight = "600" if online else "400"
-        name.setStyleSheet(
-            f"color:{name_col}; font-size:10pt; font-weight:{weight}; "
-            "background:transparent;"
-        )
-        lay.addWidget(name, stretch=1)
-
-        # Actions en bout de ligne.
-        # Refs exposees pour la navigation clavier (D-pad). None si l'icone
-        # n'existe pas sur cette ligne (ex: contact deconnecte = pas
-        # d'icones phone/letter).
-        self._ic_phone = None
-        self._ic_letter = None
-        if self._mode == "message":
-            # Mode MESSAGERIE : aucune icone d'action. La LIGNE entiere est
-            # cliquable et ouvre la conversation avec ce contact (sig_message).
-            # On signale les non-lus par une pastille rouge en bout de ligne.
-            if unread:
-                badge = QLabel()
-                bsz = max(8, int(row_h * 0.26))
-                badge.setFixedSize(bsz, bsz)
-                badge.setStyleSheet(
-                    f"background:#e5484d; border-radius:{bsz // 2}px;")
-                lay.addWidget(badge)
-            self.setCursor(Qt.PointingHandCursor)
-        elif self._mode == "call":
-            # Onglet Appels > Menu : la LIGNE entiere appelle le contact (si
-            # connecte). Hors-ligne -> croix "oublier" (non appelable).
-            if online:
-                ic_phone = _PhoneIconLabel("phone", icon_sz, True, self)
-                ic_phone.sig_clicked.connect(
-                    lambda: self.sig_call.emit(self._pseudo))
-                lay.addWidget(ic_phone)
-                self._ic_phone = ic_phone
-                self.setCursor(Qt.PointingHandCursor)
-            else:
-                ic_forget = _PhoneIconLabel("forget", icon_sz, True, self)
-                ic_forget.sig_clicked.connect(
-                    lambda: self.sig_forget.emit(self._pseudo))
-                lay.addWidget(ic_forget)
-        elif online:
-            # Connecte : telephone + lettre, tous deux cliquables.
-            ic_phone = _PhoneIconLabel("phone", icon_sz, True, self)
-            ic_phone.sig_clicked.connect(
-                lambda: self.sig_call.emit(self._pseudo)
-            )
-            lay.addWidget(ic_phone)
-            self._ic_phone = ic_phone
-            ic_letter = _PhoneIconLabel("letter", icon_sz, True, self)
-            ic_letter.set_badge(bool(unread))
-            ic_letter.sig_clicked.connect(
-                lambda: self.sig_message.emit(self._pseudo)
-            )
-            lay.addWidget(ic_letter)
-            self._ic_letter = ic_letter
-        else:
-            # Deconnecte : seulement la croix "oublier".
-            ic_forget = _PhoneIconLabel("forget", icon_sz, True, self)
-            ic_forget.sig_clicked.connect(
-                lambda: self.sig_forget.emit(self._pseudo)
-            )
-            lay.addWidget(ic_forget)
-
-    def mousePressEvent(self, ev):
-        # Clic sur la ligne : ouvre la conversation (message) ou lance l'appel
-        # (call, si le contact est connecte).
-        if self._mode == "message":
-            try:
-                self.sig_message.emit(self._pseudo)
-            except Exception:
-                pass
-            ev.accept()
-            return
-        if self._mode == "call" and self._online:
-            try:
-                self.sig_call.emit(self._pseudo)
-            except Exception:
-                pass
-            ev.accept()
-            return
-        super().mousePressEvent(ev)
-
-    def pseudo(self) -> str:
-        """Pseudo du contact de cette ligne."""
-        return self._pseudo
-
-    def is_online(self) -> bool:
-        """True si le contact est connecte (donc navigable au D-pad)."""
-        return self._online
-
-    def set_nav_highlight(self, selected: bool, action: int = 0):
-        """Surbrillance navigation clavier.
-          selected : True si cette ligne est la ligne courante du D-pad.
-          action   : 0 = Appeler (phone), 1 = Message (letter). Ignore si
-                     la ligne n'est pas selectionnee.
-        En mode messagerie (pas d'icones), on surligne le FOND de la ligne.
-        Sinon halo sur l'icone de l'action ciblee. Ligne deconnectee : rien."""
-        if self._mode in ("message", "call"):
-            self.setStyleSheet(
-                "background:rgba(63,185,80,0.22); border-radius:8px;"
-                if selected else "background:transparent;")
-            return
-        if self._ic_phone is not None:
-            self._ic_phone.set_nav_selected(selected and action == 0)
-        if self._ic_letter is not None:
-            self._ic_letter.set_nav_selected(selected and action == 1)
 
 
-class _CallHistoryRow(QWidget):
-    """Une ligne du journal d'appels (onglet Appels > Historique) : fleche de
-    sens (sortant/entrant), nom du pair, issue + heure. Cliquable / navigable
-    pour rappeler le contact."""
-
-    sig_call = Signal(str)
-
-    def __init__(self, peer: str, direction: str, outcome: str, ts: float,
-                 row_h: int, parent=None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WA_StyledBackground, True)
-        self._peer = peer
-        self.setFixedHeight(row_h)
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(8, 0, 8, 0)
-        lay.setSpacing(8)
-
-        missed = outcome in ("missed", "declined", "busy", "offline")
-        arrow = "\u2197" if direction == "out" else "\u2199"  # ↗ sortant ↙ entrant
-        col = "#e5484d" if missed else "#3fb950"
-        ic = QLabel(arrow)
-        ic.setStyleSheet(
-            f"color:{col}; font-size:13pt; font-weight:700; "
-            "background:transparent;")
-        lay.addWidget(ic)
-
-        name = QLabel(peer or "?")
-        name.setStyleSheet(
-            f"color:{_PHONE_NAME_ONLINE}; font-size:10pt; font-weight:600; "
-            "background:transparent;")
-        lay.addWidget(name, stretch=1)
-
-        sub = QLabel(self._fmt(direction, outcome, ts))
-        sub.setStyleSheet(
-            "color:#9aa0a6; font-size:8pt; background:transparent;")
-        lay.addWidget(sub)
-        self.setCursor(Qt.PointingHandCursor)
-
-    @staticmethod
-    def _fmt(direction: str, outcome: str, ts: float) -> str:
-        lbl = {
-            "answered": "répondu",
-            "missed":   "sans réponse" if direction == "out" else "manqué",
-            "declined": "refusé",
-            "busy":     "occupé",
-            "offline":  "hors ligne",
-        }.get(outcome, outcome)
-        when = ""
-        try:
-            t = time.localtime(float(ts))
-            now = time.localtime()
-            hm = time.strftime("%H:%M", t)
-            if (t.tm_year, t.tm_yday) == (now.tm_year, now.tm_yday):
-                when = hm
-            else:
-                when = time.strftime("%d/%m", t) + " " + hm
-        except Exception:
-            pass
-        return f"{lbl} · {when}" if when else lbl
-
-    def pseudo(self) -> str:
-        return self._peer
-
-    def is_online(self) -> bool:
-        return True
-
-    def set_nav_highlight(self, selected: bool, action: int = 0):
-        self.setStyleSheet(
-            "background:rgba(63,185,80,0.22); border-radius:8px;"
-            if selected else "background:transparent;")
-
-    def mousePressEvent(self, ev):
-        try:
-            self.sig_call.emit(self._peer)
-        except Exception:
-            pass
-        ev.accept()
 
 
 class _ScreenshotRow(QWidget):
@@ -8754,6 +9003,28 @@ class _PhoneMessageBubble(QFrame):
         self._img_path = None        # chemin absolu si bulle image (sinon None)
         self._bubble_frame = None    # QFrame stylise (pour la surbrillance nav)
         self._bubble_base_qss = ""   # style de base (restaure a la deselection)
+
+        # [GROUPES 19/08/2026] Annonce du serveur : texte centre, gris,
+        # sans bulle ni horodatage. Une annonce n'est pas un message --
+        # la rendre comme tel laissait croire que quelqu'un avait ecrit
+        # « a quitté le groupe », et l'alignait a gauche comme un propos.
+        #
+        # _bubble_frame reste None : la navigation clavier passe donc
+        # au-dessus sans jamais la selectionner, ce qui est correct
+        # puisqu'il n'y a rien a en faire.
+        self._systeme = (isinstance(body, str)
+                         and body.startswith(PHONE_SYS_PREFIX))
+        if self._systeme:
+            lbl = QLabel(body[len(PHONE_SYS_PREFIX):].strip())
+            lbl.setWordWrap(True)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setStyleSheet(
+                "background:transparent; color:#9aa0a6; font-size:9pt;")
+            lay = QHBoxLayout(self)
+            lay.setContentsMargins(12, 6, 12, 6)
+            lay.addWidget(lbl, stretch=1)
+            return
+
         # On utilise un QHBoxLayout exterieur pour pousser la bulle a
         # gauche ou a droite via un stretch sur l'autre cote.
         outer = QHBoxLayout(self)
@@ -9131,8 +9402,12 @@ class _PhoneNavKeyListener:
     def __init__(self, on_nav, is_text_field=None,
                  on_game_key=None, is_game_active=None,
                  on_camera_key=None, is_camera_active=None,
-                 is_viewer_active=None, on_viewer_close=None):
+                 is_viewer_active=None, on_viewer_close=None,
+                 is_field_empty=None):
         self._on_nav = on_nav
+        # True quand le champ de saisie courant est vide : decide si le
+        # retour arriere efface ou ressort du champ.
+        self._is_field_empty = is_field_empty or (lambda: False)
         # Predicat thread-safe (lecture d'un bool) : True quand un champ de
         # saisie texte du telephone a le focus (composeur de message). Sert a
         # NE PAS detourner Retour arriere (edition) ni le supprimer cote OS.
@@ -9196,7 +9471,14 @@ class _PhoneNavKeyListener:
                 # handlers en aval. Dans un champ de saisie, on laisse le
                 # QTextEdit effacer (ne pas detourner).
                 if norm == "backspace":
-                    if self._is_text_field():
+                    # [CONTACTS 02/08/2026] Dans un champ NON VIDE, on
+                    # laisse le champ effacer -- c'est le role naturel de
+                    # cette touche. Dans un champ VIDE, il n'y a plus rien
+                    # a effacer : elle reprend son role de "retour" et
+                    # ressort du champ. Sans cette nuance, la touche etait
+                    # avalee ici et n'atteignait jamais handle_nav : on ne
+                    # pouvait plus sortir d'un champ vide au clavier.
+                    if self._is_text_field() and not self._is_field_empty():
                         return
                     norm = "esc"
                 elif norm == "esc":
@@ -9398,31 +9680,9 @@ class PhoneOverlayWindow(QWidget):
         self._anim: QPropertyAnimation | None = None
         self._visible_state = False   # True quand l'overlay est "ouvert"
 
-        # --- Navigation clavier D-pad (ecran contacts uniquement) ---
-        # _nav_index : index dans la liste des lignes navigables (contacts
-        #   connectes uniquement, car eux seuls ont les actions phone/letter).
-        # _nav_action : 0 = Appeler (phone), 1 = Message (letter).
-        # _nav_rows : refs des _PhoneContactRow navigables, reconstruites a
-        #   chaque refresh_contacts. Liste vide => rien a naviguer.
-        self._nav_index = 0
-        self._nav_action = 0
-        self._nav_rows = []
-        # [build 61] Comme l'app Blueprints : le curseur n'est pas materialise
-        # a l'ouverture de l'ecran. Le PREMIER up/down doit REVELER la
-        # selection sur la ligne courante (index 0 = contact au message le
-        # plus recent, en haut) au lieu de sauter (bas -> 2e ligne, ou
-        # haut -> derniere ligne via le modulo).
-        self._nav_shown = False
-        # Mode de l'ecran contacts selon l'icone d'accueil qui l'a ouvert :
-        #   "full"    = ecran Appels (lignes avec tel + lettre)  [defaut]
-        #   "message" = ecran Messagerie (ligne entiere -> conversation)
-        self._contacts_mode = "full"
-        self._last_contacts_args = None
-        # Onglet Appels courant ("menu" | "historique"), cache de l'historique
-        # d'appels recu de MainWindow, et lignes navigables de l'historique.
-        self._appels_tab = "menu"
-        self._call_history_cache = []
-        self._history_rows = []
+        # [NETTOYAGE 02/08/2026] L'etat de navigation de l'ecran natif
+        # contacts/appels a ete retire avec lui : chaque app porte
+        # desormais sa propre selection (cf circusvoip_phone_annuaire).
         # Navigation D-pad ecran conversation : 3 cibles cyclables.
         #   _convo_nav_index : 0 = fleche Retour, 1 = champ texte,
         #     2 = Trombone (screenshots), 3 = Envoyer
@@ -9433,13 +9693,18 @@ class PhoneOverlayWindow(QWidget):
         self._convo_in_field = False
         self._nav_listener = _PhoneNavKeyListener(
             on_nav=lambda d: self.sig_nav_key.emit(d),
-            is_text_field=lambda: self._convo_in_field,
+            # [CONTACTS 31/07/2026] Inclut les champs des APPS : quand on
+            # est entre dans un champ, le D-pad ne doit pas etre capte,
+            # les fleches appartiennent au curseur de saisie.
+            is_text_field=lambda: (self._convo_in_field
+                                   or self._app_dans_champ()),
             on_game_key=lambda k: self.sig_game_key.emit(k),
             is_game_active=self._is_game_active,
             on_camera_key=lambda k: self.sig_camera_key.emit(k),
             is_camera_active=self._is_camera_active,
             is_viewer_active=self._is_photo_viewer_active,
             on_viewer_close=lambda: self.sig_viewer_close.emit(),
+            is_field_empty=self._app_champ_vide,
         )
         self.sig_nav_key.connect(self._on_nav_key)
         self.sig_game_key.connect(self._on_game_key)
@@ -9501,14 +9766,12 @@ class PhoneOverlayWindow(QWidget):
         self._row_h = max(30, int(self._screen_h * 0.082))
 
         # Build chacun des 6 ecrans (ordre = ordre d'index dans le stack).
-        self._page_contacts = self._build_screen_contacts()
         self._page_outgoing = self._build_screen_outgoing()
         self._page_incoming = self._build_screen_incoming()
         self._page_in_call  = self._build_screen_in_call()
         self._page_convo    = self._build_screen_conversation()
         self._page_settings = self._build_screen_settings()
         self._page_shots    = self._build_screen_screenshots()
-        self._stack.addWidget(self._page_contacts)   # idx 0
         self._stack.addWidget(self._page_outgoing)   # idx 1
         self._stack.addWidget(self._page_incoming)   # idx 2
         self._stack.addWidget(self._page_in_call)    # idx 3
@@ -9520,12 +9783,12 @@ class PhoneOverlayWindow(QWidget):
         # Ajoute APRES les ecrans natifs (le switch se fait par widget, donc
         # l'ordre d'index ne compte pas). Devient l'ecran par defaut.
         self._build_phone_home()
+        # [NETTOYAGE 02/08/2026] Plus de repli sur l'ecran natif : il a
+        # ete supprime. Si _page_home est absent, le telephone n'a de
+        # toute facon plus rien a afficher -- mieux vaut un ecran vide
+        # qu'un ecran qui listerait les joueurs croises.
         if self._page_home is not None:
             self._stack.setCurrentWidget(self._page_home)
-        else:
-            # Repli : modules phone_apps absents -> comportement v0.2
-            # (demarrage direct sur Contacts).
-            self._stack.setCurrentWidget(self._page_contacts)
 
     # ------------------------------------------------------------------
     # [v0.3] Home (grille d'apps) + lazy-load + cycle de vie des apps
@@ -9549,6 +9812,44 @@ class PhoneOverlayWindow(QWidget):
                 from circusvoip_phone_registry import PHONE_GAMES
             except Exception:
                 PHONE_GAMES = []
+            # [CONTACTS 31/07/2026] Apps Appels (clavier + historique) et
+            # Contacts (carnet local). Elles remplacent l'ecran natif
+            # "Appels", qui listait les JOUEURS CONNECTES et permettait
+            # de les appeler par pseudo -- incompatible avec la decision
+            # du 30/07 : l'annuaire est reserve a l'administration.
+            # [AUDIT 02/08/2026] Import SANS repli. Le repli precedent
+            # retombait sur l'ancien ecran natif quand l'import echouait :
+            # au lieu d'un message d'erreur, le joueur voyait un ecran
+            # "Annuaire vide" et croyait a un bug fonctionnel. Or ces
+            # modules sont livres par l'updater comme les autres -- s'ils
+            # manquent, le telephone est casse de toute facon, et il vaut
+            # mieux le dire.
+            # [TRAVAIL 10/08/2026] App Travail. Import SEPARE de celui de
+            # l'annuaire : une erreur dans le module Travail ne doit pas
+            # priver le joueur des Appels et des Contacts, qui sont le
+            # coeur du telephone. Le regrouper dans le try ci-dessous
+            # ferait tomber les quatre apps d'un coup.
+            try:
+                from circusvoip_phone_travail_app import TravailApp
+            except Exception as _e_trav:
+                TravailApp = None
+                print(f"[PHONE] App Travail indisponible ({_e_trav}).",
+                      file=sys.stderr)
+                if _CORE_AVAILABLE:
+                    try: _core._dbg_log(f"[PHONE] app Travail KO : {_e_trav}")
+                    except Exception: pass
+
+            try:
+                from circusvoip_phone_annuaire import (
+                    AppelsApp, ContactsApp, MessagerieApp)
+            except Exception as _e_ann:
+                AppelsApp = ContactsApp = MessagerieApp = None
+                print(f"[PHONE] ERREUR : apps Appels/Contacts indisponibles "
+                      f"({_e_ann}). Le CircusPhone sera incomplet.",
+                      file=sys.stderr)
+                if _CORE_AVAILABLE:
+                    try: _core._dbg_log(f"[PHONE] apps annuaire KO : {_e_ann}")
+                    except Exception: pass
         except Exception as e:
             if _CORE_AVAILABLE:
                 try: _core._dbg_log(f"[PHONE HOME] modules absents : {e}")
@@ -9567,6 +9868,37 @@ class PhoneOverlayWindow(QWidget):
             photo_of=(lambda p: self._photo_provider(p)
                       if self._photo_provider else None),
         )
+        # [CONTACTS 31/07/2026] Telephonie par numero. Poses en setattr
+        # et non dans le constructeur : un circusvoip_phone_apps.py qui
+        # n'aurait pas encore ces champs leverait une TypeError et
+        # casserait tout le telephone, comme pour my_name.
+        for _nom, _val in (
+            ("repertoire", self._mw._phone_repertoire()),
+            ("appeler", self._mw._phone_appeler_numero),
+            ("historique", self._mw._phone_historique),
+            ("photo_par_numero", self._mw._phone_photo_par_numero),
+            ("ouvrir_ajout_contact", self._ouvrir_ajout_contact),
+            ("conversations", self._mw._phone_conversations),
+            ("ouvrir_conversation", self._ouvrir_conversation),
+            # [GROUPES 19/08/2026] Les deux services attendus par
+            # MessagerieApp. Leur ABSENCE masque le bouton « Nouveau
+            # groupe » : un ecran de creation qui ne peut rien envoyer
+            # ferait croire a une panne.
+            ("groupes", self._mw._phone_groupes_liste),
+            ("creer_groupe", self._mw._phone_creer_groupe),
+            # [TRAVAIL 10/08/2026] MON numero. L'app Travail en a besoin
+            # comme IDENTITE : c'est lui qui signe une mission publiee et
+            # qui identifie celui qui la prend. Pousse en setattr comme
+            # les autres, pour ne pas casser le telephone si le module
+            # phone_apps deploye n'a pas encore le champ.
+            ("mon_numero",
+             (lambda: str(getattr(state, "my_numero", "") or "")
+              if _CORE_AVAILABLE else (lambda: ""))),
+        ):
+            try:
+                setattr(self._phone_services, _nom, _val)
+            except Exception:
+                pass
         # Pseudo local pousse APRES construction (setattr), pour rester
         # compatible avec un circusvoip_phone_apps.py qui n'aurait pas encore
         # le champ my_name (evite une TypeError qui casserait tout le tel).
@@ -9613,12 +9945,32 @@ class PhoneOverlayWindow(QWidget):
 
         # 2 icones ecrans natifs : Appels et Messagerie pointent sur l'ecran
         # contacts unifie, avec l'action D-pad par defaut pre-reglee.
-        entries = [
-            HomeEntry("calls", "Appels", _icon("calls", "\u260E"),
-                      lambda: self._open_native_contacts(action=0)),
-            HomeEntry("msg", "Messagerie", _icon("msg", "\u2709"),
-                      lambda: self._open_native_contacts(action=1)),
-        ]
+        entries = []
+        if AppelsApp is not None and ContactsApp is not None:
+            # Appels : clavier + historique. Contacts : carnet local.
+            # Deux apps distinctes, comme sur un vrai telephone : sans
+            # clavier, un numero donne de vive voix serait inutilisable.
+            entries.append(HomeEntry(
+                AppelsApp.APP_ID, AppelsApp.APP_NAME,
+                _icon("calls", "\u260E"),
+                (lambda C: (lambda: self._launch_app(C)))(AppelsApp)))
+            entries.append(HomeEntry(
+                ContactsApp.APP_ID, ContactsApp.APP_NAME,
+                _icon("contacts", "\U0001F4C7"),
+                (lambda C: (lambda: self._launch_app(C)))(ContactsApp)))
+        if MessagerieApp is not None:
+            entries.append(HomeEntry(
+                MessagerieApp.APP_ID, MessagerieApp.APP_NAME,
+                _icon("msg", "\u2709"),
+                (lambda C: (lambda: self._launch_app(C)))(MessagerieApp)))
+        # [TRAVAIL 10/08/2026] Tableau d'annonces entre joueurs. Placee
+        # apres la Messagerie : c'est une app sociale, elle a sa place
+        # avec les trois autres plutot qu'au milieu des jeux.
+        if TravailApp is not None:
+            entries.append(HomeEntry(
+                TravailApp.APP_ID, TravailApp.APP_NAME,
+                _icon("travail", TravailApp.APP_ICON),
+                (lambda C: (lambda: self._launch_app(C)))(TravailApp)))
         # Apps v0.3 (lazy-load via la fabrique _launch_app).
         entries += build_app_entries(
             PHONE_APPS, lambda C: (lambda: self._launch_app(C))
@@ -9639,11 +9991,65 @@ class PhoneOverlayWindow(QWidget):
                 SETTINGS_APP.APP_ICON,
                 (lambda C: (lambda: self._launch_app(C)))(SETTINGS_APP)))
 
+        # [HOME 19/08/2026] Ordre EXPLICITE de la grille d'accueil.
+        #
+        # Choisi par l'utilisateur, pas deduit d'une regle : ni
+        # alphabetique, ni par frequence. Il regroupe d'abord les quatre
+        # apps de communication, puis les outils, puis les images.
+        #
+        # C'est la SEULE source de l'ordre. Les positions choisies
+        # ailleurs -- dans le registre ou par l'ordre des append()
+        # ci-dessus -- n'ont plus d'effet : inutile d'aller les modifier,
+        # et surtout inutile de les considerer comme des decisions.
+        #
+        # Une app absente de cette liste (nouvelle app, ou identifiant
+        # renomme) se place JUSTE AVANT Parametres plutot que de
+        # disparaitre : une icone manquante sans message serait un bug
+        # tres difficile a relier a ce tri.
+        _ORDRE_HOME = (
+            "appels", "contacts", "messagerie", "wallet", "blueprints",
+            "games", "photo", "travail", "urgence", "photos", "settings",
+        )
+        _rang = {aid: n for n, aid in enumerate(_ORDRE_HOME)}
+        # Les inconnues prennent le rang de Parametres moins un epsilon :
+        # elles se rangent donc avant lui, dans leur ordre d'origine.
+        _defaut = _rang["settings"] - 0.5
+        entries = sorted(
+            entries,
+            key=lambda e: _rang.get(getattr(e, "entry_id", ""), _defaut))
+
         self._page_home = PhoneHome(
             self._screen_w, self._screen_h, self._screen_rad, entries,
             self._load_phone_wallpaper(),
         )
         self._stack.addWidget(self._page_home)
+
+    def set_home_badge(self, app_id: str, on: bool):
+        """Allume/eteint le badge d'UNE app, sans toucher aux autres.
+
+        [BADGE 11/08/2026] set_badges() du home prend l'ENSEMBLE des
+        badges et remplace tout. Chaque appelant qui lui passait son seul
+        identifiant effacait donc les autres : allumer Travail eteignait
+        Messagerie, et le message suivant rallumait Messagerie en
+        eteignant Travail. Avec deux apps notifiantes, l'un des deux
+        badges etait toujours faux.
+
+        L'overlay tient donc l'ensemble et le pousse en entier -- un etat
+        partage doit avoir un seul proprietaire.
+        """
+        home = getattr(self, "_page_home", None)
+        if home is None or not hasattr(home, "set_badges"):
+            return
+        actifs = set(getattr(self, "_badges_actifs", set()) or set())
+        if on:
+            actifs.add(app_id)
+        else:
+            actifs.discard(app_id)
+        self._badges_actifs = actifs
+        try:
+            home.set_badges(actifs)
+        except Exception:
+            pass
 
     def set_home_msg_badge(self, on: bool):
         """[build 61] Allume/eteint le badge de notification (rond rouge)
@@ -9655,7 +10061,21 @@ class PhoneOverlayWindow(QWidget):
         if home is None or not hasattr(home, "set_badges"):
             return
         try:
-            home.set_badges({"msg"} if on else set())
+            # [BADGE 04/08/2026] L'identifiant etait code en dur a "msg",
+            # celui de l'ECRAN NATIF Messagerie supprime au build 68. Les
+            # entrees du home portent desormais APP_ID -- "messagerie" --
+            # donc le badge ne correspondait plus a aucune case et rien
+            # n'etait dessine. Sequelle du nettoyage des 826 lignes.
+            #
+            # On lit la constante au lieu de la reecrire : un prochain
+            # renommage d'APP_ID ne pourra plus casser le badge en
+            # silence.
+            try:
+                from circusvoip_phone_annuaire import MessagerieApp as _MsgApp
+                _mid = _MsgApp.APP_ID
+            except Exception:
+                _mid = "messagerie"
+            self.set_home_badge(_mid, on)
         except Exception:
             pass
 
@@ -9819,130 +10239,42 @@ class PhoneOverlayWindow(QWidget):
         except Exception:
             pass
 
-    def _open_native_contacts(self, action: int = 0):
-        """Ouvre l'ecran contacts depuis le home.
-          action 0 = icone Appels    -> mode "call" + onglets Menu/Historique
-          action 1 = icone Messagerie -> mode "message" (ligne -> conversation)."""
-        self._current_app = None
-        is_msg = (action == 1)
-        self._contacts_mode = "message" if is_msg else "call"
-        self._nav_action = 0
-        self._nav_index = 0
-        # [build 61] curseur re-masque : le 1er up/down le revelera sur la
-        # 1re ligne (message le plus recent) au lieu de sauter.
-        self._nav_shown = False
+
+
+
+    def _ouvrir_conversation(self, numero: str):
+        """Ouvre l'ECRAN de conversation existant pour un numero.
+
+        [MESSAGERIE 02/08/2026] L'app Messagerie ne reecrit pas cet
+        ecran : bulles, envoi d'images, brouillon et visionneuse
+        fonctionnent deja. On quitte simplement l'app pour l'afficher.
+        """
         try:
-            self._contacts_title.setText("Messages" if is_msg else "Appels")
-        except Exception:
-            pass
-        # Barre d'onglets uniquement en mode Appels.
-        self._appels_tabbar.setVisible(not is_msg)
-        if is_msg:
-            self._history_scroll.setVisible(False)
-            self._lbl_history_empty.setVisible(False)
-            self._rebuild_contacts()
-        else:
-            self._appels_tab = "menu"
-            self._rebuild_contacts()
-            self._set_appels_tab("menu")
-        self._stack.setCurrentWidget(self._page_contacts)
-        try:
-            self._apply_nav_highlight()
+            mw = self._mw
+            self._current_app = None
+            mw._phone_open_conversation(str(numero or ""))
         except Exception:
             pass
 
-    def _rebuild_contacts(self):
-        """Reconstruit la liste des contacts avec les derniers arguments connus
-        (utilise quand on bascule Appels <-> Messagerie sans nouvelle donnee)."""
-        args = self._last_contacts_args
-        if not args:
+    def _ouvrir_ajout_contact(self, numero: str):
+        """Ouvre l'app Contacts sur l'onglet d'ajout, numero pre-rempli.
+
+        Appele par le bouton « Ajouter » de l'historique, qui vit dans
+        une AUTRE app. Passer d'une app a l'autre en transportant une
+        donnee n'existait pas : _launch_app ouvre toujours une app a son
+        etat par defaut. D'ou le prefixage APRES l'ouverture.
+        """
+        try:
+            from circusvoip_phone_annuaire import ContactsApp
+        except Exception:
             return
         try:
-            self.refresh_contacts(**args)
+            self._launch_app(ContactsApp)
+            inst = self._app_cache.get(ContactsApp.APP_ID)
+            if inst is not None and hasattr(inst, "prefixer_numero"):
+                inst.prefixer_numero(str(numero or ""))
         except Exception:
             pass
-
-    def _set_appels_tab(self, tab: str):
-        """Bascule l'onglet Appels (Menu / Historique). On garde TOUJOURS une
-        zone scrollable visible (stretch=1) pour que la barre d'onglets reste
-        en haut (sinon le layout se recentre)."""
-        self._appels_tab = "historique" if tab == "historique" else "menu"
-        self._nav_index = 0
-        self._nav_shown = False
-        is_hist = (self._appels_tab == "historique")
-        self._contacts_scroll.setVisible(not is_hist)
-        self._history_scroll.setVisible(is_hist)
-        self._lbl_history_empty.setVisible(False)   # message gere DANS le scroll
-        if is_hist:
-            self._lbl_empty.setVisible(False)
-            self._rebuild_call_history()
-            self._nav_rows = list(self._history_rows)
-        else:
-            self._rebuild_contacts()      # repose _nav_rows = contacts
-        self._nav_index = 0
-        self._update_tab_styles()
-        try:
-            self._apply_nav_highlight()
-        except Exception:
-            pass
-
-    def _update_tab_styles(self):
-        for btn, key in ((self._tab_menu_btn, "menu"),
-                         (self._tab_hist_btn, "historique")):
-            active = (self._appels_tab == key)
-            color = _PHONE_DOT_ONLINE if active else "#9aa0a6"
-            border = (f"border-bottom:2px solid {_PHONE_DOT_ONLINE};"
-                      if active else "border-bottom:2px solid transparent;")
-            btn.setStyleSheet(
-                "QPushButton { border:none; padding:5px 0; font-size:10pt; "
-                f"font-weight:700; background:transparent; color:{color}; "
-                f"{border} }}")
-
-    def refresh_call_history(self, history):
-        """Recoit l'historique d'appels de MainWindow ; met a jour le cache et
-        rafraichit l'onglet Historique s'il est affiche."""
-        self._call_history_cache = list(history or [])
-        if self._contacts_mode == "call" and self._appels_tab == "historique":
-            self._rebuild_call_history()
-            self._history_scroll.setVisible(True)
-            self._lbl_history_empty.setVisible(False)
-            self._nav_rows = list(self._history_rows)
-            if self._nav_rows:
-                self._nav_index = max(
-                    0, min(self._nav_index, len(self._nav_rows) - 1))
-            try:
-                self._apply_nav_highlight()
-            except Exception:
-                pass
-
-    def _rebuild_call_history(self):
-        """(Re)construit les lignes de l'historique depuis le cache (plus
-        recent en haut)."""
-        while self._history_layout.count() > 1:
-            item = self._history_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-        rows = []
-        for e in reversed(self._call_history_cache[-50:]):
-            if not isinstance(e, dict):
-                continue
-            row = _CallHistoryRow(
-                e.get("peer", ""), e.get("dir", "out"),
-                e.get("outcome", ""), e.get("ts", 0.0), self._row_h)
-            row.sig_call.connect(self.sig_call)
-            self._history_layout.insertWidget(len(rows), row)
-            rows.append(row)
-        self._history_rows = rows
-        if not rows:
-            # Liste vide : message centre DANS la zone scrollable (garde la
-            # zone visible -> barre d'onglets en haut).
-            lbl = QLabel("Aucun appel\nrécent.")
-            lbl.setAlignment(Qt.AlignCenter)
-            lbl.setStyleSheet(
-                "color:#9aa0a6; font-size:9pt; background:transparent; "
-                "padding-top:24px;")
-            self._history_layout.insertWidget(0, lbl)
 
     def _launch_app(self, AppClass):
         """Lance une app : instancie en lazy au 1er appel, l'ajoute au stack,
@@ -10034,7 +10366,33 @@ class PhoneOverlayWindow(QWidget):
                         inst.set_selected_key((cfg or {}).get("phone_wallpaper_key", ""))
                     except Exception:
                         pass
+                # [NUMERO 05/08/2026] Numero du joueur dans l'app
+                # Parametres. Deux sources dans cet ordre : state.my_numero
+                # (arrive dans le welcome, donc a jour) puis la config
+                # (memorisee par _remember_numero, donc disponible avant
+                # meme la connexion). Le repli evite une case vide entre le
+                # lancement et le welcome, sans jamais afficher une valeur
+                # inventee : si les deux manquent, l'app n'affiche rien.
+                if hasattr(inst, "set_mon_numero"):
+                    try:
+                        _num_moi = ""
+                        if _CORE_AVAILABLE:
+                            _num_moi = str(getattr(state, "my_numero", "") or "")
+                        if not _num_moi:
+                            _num_moi = str(
+                                (self._cfg or {}).get("account_numero", "") or "")
+                        inst.set_mon_numero(_num_moi)
+                    except Exception:
+                        pass
             self._current_app = inst
+            # [BADGE 11/08/2026] Ouvrir une app eteint SON badge : le
+            # joueur vient de voir ce qu'il avait a voir. Le laisser
+            # allume le rendrait vite decoratif -- on cesse de regarder un
+            # voyant qui ne s'eteint jamais.
+            try:
+                self.set_home_badge(getattr(AppClass, "APP_ID", ""), False)
+            except Exception:
+                pass
             self._stack.setCurrentWidget(inst)
             # Rafraichit le pseudo local dans les services (au cas ou ils
             # auraient ete construits avant la connexion au serveur).
@@ -10241,136 +10599,7 @@ class PhoneOverlayWindow(QWidget):
         self._app_origin = None
         if self._page_home is not None:
             self._stack.setCurrentWidget(self._page_home)
-        else:
-            self._stack.setCurrentWidget(self._page_contacts)
 
-    # ------------------------------------------------------------------
-    # Construction des 4 ecrans
-    # ------------------------------------------------------------------
-    def _build_screen_contacts(self) -> QWidget:
-        """Ecran par defaut : titre 'Contacts' + liste annuaire.
-        D5 a venir : bouton engrenage en haut a droite (reglages profil)."""
-        page = QWidget()
-        page.setStyleSheet("background:transparent;")
-        v = QVBoxLayout(page)
-        v.setContentsMargins(0, 10, 0, 10)
-        v.setSpacing(0)
-
-        # Header : titre centre + engrenage a droite (D5 reglages profil).
-        # Layout horizontal a 3 zones : spacer-gauche, titre centre, engrenage-droite.
-        # Le spacer gauche a la meme largeur que l'engrenage pour que le titre
-        # reste reellement centre visuellement.
-        header = QWidget()
-        header.setStyleSheet("background:transparent;")
-        h = QHBoxLayout(header)
-        h.setContentsMargins(8, 0, 8, 0)
-        h.setSpacing(0)
-        gear_size = 18
-        # Spacer gauche (meme largeur que l'engrenage pour centrer le titre)
-        spacer_left = QWidget()
-        spacer_left.setFixedSize(gear_size, gear_size)
-        spacer_left.setStyleSheet("background:transparent;")
-        h.addWidget(spacer_left)
-        # Titre centre
-        title = QLabel("Contacts")
-        self._contacts_title = title
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet(
-            f"color:{_PHONE_SCREEN_TXT}; font-size:12pt; font-weight:700; "
-            "background:transparent; padding-bottom:6px;"
-        )
-        h.addWidget(title, stretch=1)
-        # Engrenage cliquable (D5 : ouvre la popup Reglages profil)
-        gear = _PhoneIconLabel("gear", gear_size, True, header)
-        gear.sig_clicked.connect(self._open_profile_settings_from_contacts)
-        h.addWidget(gear)
-        v.addWidget(header)
-
-        # Barre d'onglets (visible uniquement en mode Appels) : Menu | Historique.
-        self._appels_tabbar = QWidget()
-        self._appels_tabbar.setStyleSheet("background:transparent;")
-        tb = QHBoxLayout(self._appels_tabbar)
-        tb.setContentsMargins(10, 0, 10, 4)
-        tb.setSpacing(6)
-        self._tab_menu_btn = QPushButton("Menu")
-        self._tab_hist_btn = QPushButton("Historique")
-        for b in (self._tab_menu_btn, self._tab_hist_btn):
-            b.setCursor(Qt.PointingHandCursor)
-            b.setFlat(True)
-            tb.addWidget(b, stretch=1)
-        self._tab_menu_btn.clicked.connect(
-            lambda: self._set_appels_tab("menu"))
-        self._tab_hist_btn.clicked.connect(
-            lambda: self._set_appels_tab("historique"))
-        self._appels_tabbar.setVisible(False)
-        v.addWidget(self._appels_tabbar)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("color:#e3e5e8; background:#e3e5e8; max-height:1px;")
-        v.addWidget(sep)
-
-        # Zone scrollable de la liste.
-        self._contacts_scroll = QScrollArea()
-        self._contacts_scroll.setWidgetResizable(True)
-        self._contacts_scroll.setFrameShape(QFrame.NoFrame)
-        self._contacts_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarAlwaysOff
-        )
-        self._contacts_scroll.setStyleSheet(
-            "QScrollArea { background:transparent; }"
-            "QScrollBar:vertical { width:6px; background:transparent; }"
-            "QScrollBar::handle:vertical { background:#d0d3d7; "
-            "  border-radius:3px; }"
-        )
-        self._contacts_host = QWidget()
-        self._contacts_host.setStyleSheet("background:transparent;")
-        self._contacts_layout = QVBoxLayout(self._contacts_host)
-        self._contacts_layout.setContentsMargins(0, 4, 0, 4)
-        self._contacts_layout.setSpacing(2)
-        self._contacts_layout.addStretch(1)
-        self._contacts_scroll.setWidget(self._contacts_host)
-        v.addWidget(self._contacts_scroll, stretch=1)
-
-        # Liste de l'historique des appels (onglet Historique) : meme style,
-        # cachee par defaut (affichee quand on bascule sur l'onglet).
-        self._history_scroll = QScrollArea()
-        self._history_scroll.setWidgetResizable(True)
-        self._history_scroll.setFrameShape(QFrame.NoFrame)
-        self._history_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._history_scroll.setStyleSheet(
-            "QScrollArea { background:transparent; }"
-            "QScrollBar:vertical { width:6px; background:transparent; }"
-            "QScrollBar::handle:vertical { background:#d0d3d7; "
-            "  border-radius:3px; }"
-        )
-        self._history_host = QWidget()
-        self._history_host.setStyleSheet("background:transparent;")
-        self._history_layout = QVBoxLayout(self._history_host)
-        self._history_layout.setContentsMargins(0, 4, 0, 4)
-        self._history_layout.setSpacing(2)
-        self._history_layout.addStretch(1)
-        self._history_scroll.setWidget(self._history_host)
-        self._history_scroll.setVisible(False)
-        v.addWidget(self._history_scroll, stretch=1)
-        self._lbl_history_empty = QLabel("Aucun appel\nrécent.")
-        self._lbl_history_empty.setAlignment(Qt.AlignCenter)
-        self._lbl_history_empty.setStyleSheet(
-            "color:#9aa0a6; font-size:9pt; background:transparent;")
-        self._lbl_history_empty.setVisible(False)
-        v.addWidget(self._lbl_history_empty)
-
-        # Etat "liste vide" affiche quand l'annuaire n'a aucun contact.
-        self._lbl_empty = QLabel(
-            "Annuaire vide.\nLes joueurs croises\napparaitront ici."
-        )
-        self._lbl_empty.setAlignment(Qt.AlignCenter)
-        self._lbl_empty.setStyleSheet(
-            "color:#9aa0a6; font-size:9pt; background:transparent;"
-        )
-        self._lbl_empty.setVisible(False)
-        v.addWidget(self._lbl_empty)
-        return page
 
     def _build_screen_outgoing(self) -> QWidget:
         """Ecran 'Appel sortant' : ca sonne chez la cible, on attend.
@@ -11201,46 +11430,58 @@ class PhoneOverlayWindow(QWidget):
             self._apply_avatar(self._av_incoming, pseudo)
         if self._current_in_call_peer == pseudo:
             self._apply_avatar(self._av_in_call, pseudo)
-        # Ecran contacts : on doit reconstruire la ligne concernee. Pour
-        # rester simple, on demande a MainWindow de refresh tous les
-        # contacts (couteux mais rare).
+        # Une app affichee doit reconstruire sa liste pour montrer la
+        # nouvelle photo. on_show() le fait deja.
         try:
-            mw = self._mw
-            if (mw is not None
-                    and self._stack.currentWidget() is self._page_contacts):
-                if hasattr(mw, "_phone_refresh_overlay_contacts"):
-                    mw._phone_refresh_overlay_contacts()
+            app = self._current_app
+            if app is not None and hasattr(app, "on_show"):
+                app.on_show()
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
-    # API publique : changement d'ecran
-    # ------------------------------------------------------------------
-    def show_screen_contacts(self):
-        """Bascule sur l'ecran par defaut (annuaire)."""
-        self._stack.setCurrentWidget(self._page_contacts)
-        # Sortir proprement du mode frappe conversation et effacer sa
-        # surbrillance, puis re-appliquer celle des contacts.
-        self._convo_in_field = False
-        self._apply_convo_nav_highlight()
-        self._apply_nav_highlight()
 
-    def show_screen_calls(self):
-        """Affiche l'ecran APPELS (mode 'call' : onglets Menu/Historique).
-        Utilise au retour d'un appel, pour ne jamais retomber sur l'ancien
-        ecran 'full' (tel+lettre titre 'Contacts') quand l'utilisateur n'a pas
-        ouvert Appels lui-meme."""
-        self._open_native_contacts(0)
+    def revenir_apres_appel(self):
+        """[CONTACTS 02/08/2026] Retour d'ecran a la fin d'un appel.
+
+        Si une APP etait ouverte (Appels ou Contacts), on y revient. Sinon
+        on retombe sur l'ecran natif comme avant.
+
+        Sans ca, la fin d'un appel basculait le stack sur l'ancien ecran
+        natif "Appels" -- celui qui listait les joueurs croises -- meme
+        quand l'appel avait ete lance depuis la nouvelle app. L'utilisateur
+        se retrouvait devant un ecran "Annuaire vide" qui n'a plus de
+        raison d'exister.
+        """
+        app = self._current_app
+        if app is not None:
+            try:
+                self._stack.setCurrentWidget(app)
+                fn = getattr(app, "on_show", None)
+                if fn is not None:
+                    fn()
+                return
+            except Exception:
+                pass
+        # Aucune app ouverte (appel entrant recu depuis l'accueil) : on
+        # revient a l'ACCUEIL et non a l'ecran natif "Appels", qui listait
+        # les joueurs croises et affiche desormais "Annuaire vide" -- un
+        # ecran qui n'a plus de raison d'exister.
+        try:
+            if getattr(self, "_page_home", None) is not None:
+                self.show_screen_home()
+                return
+        except Exception:
+            pass
+        # L'ecran natif a ete supprime : s'il n'y a ni app ni accueil,
+        # on ne bascule sur rien plutot que sur un ecran inexistant.
+
 
     def show_screen_home(self):
-        """[v0.3] Bascule sur l'ecran d'accueil (home). Repli sur Contacts si
-        le home n'existe pas (modules phone_apps absents)."""
+        """Bascule sur l'ecran d'accueil (home)."""
         self._convo_in_field = False
         self._current_app = None
         if self._page_home is not None:
             self._stack.setCurrentWidget(self._page_home)
-        else:
-            self._stack.setCurrentWidget(self._page_contacts)
 
     def show_screen_outgoing(self, peer: str):
         """Bascule sur l'ecran appel sortant. peer = nom de la cible."""
@@ -11273,7 +11514,17 @@ class PhoneOverlayWindow(QWidget):
           draft : brouillon a restaurer dans le champ (vide par defaut)
         Le widget memorise le pseudo en cours pour les signaux."""
         self._convo_pseudo = pseudo or ""
-        self._convo_title.setText(pseudo or "")
+        # [CONTACTS 31/07/2026] La conversation est indexee par NUMERO ;
+        # le titre affiche le nom du carnet si le numero y figure. Passe
+        # par le MainWindow, seul detenteur du repertoire.
+        _titre_convo = pseudo or ""
+        try:
+            _mw = getattr(self, "_mw", None)
+            if _mw is not None and hasattr(_mw, "_phone_afficher"):
+                _titre_convo = _mw._phone_afficher(pseudo)
+        except Exception:
+            pass
+        self._convo_title.setText(_titre_convo)
         self._apply_avatar(self._av_convo, pseudo or "")
         # Restaure le brouillon SANS declencher sig_draft_changed (sinon
         # boucle : reload -> draft -> save -> reload). Le widget input
@@ -11290,8 +11541,6 @@ class PhoneOverlayWindow(QWidget):
         except Exception:
             pass
         self._apply_convo_nav_highlight()
-        # Effacer toute surbrillance residuelle de l'ecran contacts.
-        self._apply_nav_highlight()
 
     def show_screen_settings(self):
         """[D5+] Bascule sur l'ecran Reglages profil. MainWindow doit
@@ -11299,11 +11548,6 @@ class PhoneOverlayWindow(QWidget):
         l'affichage avec la photo et le zoom courants."""
         self._stack.setCurrentWidget(self._page_settings)
 
-    def _open_profile_settings_from_contacts(self):
-        """Roue dentee de l'en-tete Contacts : ouvre les Reglages profil ;
-        le retour reviendra a Contacts."""
-        self._settings_origin = "contacts"
-        self.sig_settings_clicked.emit()
 
     def _open_profile_settings_from_app(self):
         """App Parametres -> 'Photo de profil' : ouvre le MEME ecran Reglages
@@ -11318,6 +11562,14 @@ class PhoneOverlayWindow(QWidget):
         inst = self._app_cache.get("settings")
         if inst is not None:
             self._current_app = inst
+            # [BADGE 11/08/2026] Ouvrir une app eteint SON badge : le
+            # joueur vient de voir ce qu'il avait a voir. Le laisser
+            # allume le rendrait vite decoratif -- on cesse de regarder un
+            # voyant qui ne s'eteint jamais.
+            try:
+                self.set_home_badge(getattr(AppClass, "APP_ID", ""), False)
+            except Exception:
+                pass
             self._stack.setCurrentWidget(inst)
             try:
                 inst.on_show()
@@ -11363,158 +11615,64 @@ class PhoneOverlayWindow(QWidget):
         if hasattr(self, "_lbl_sp_shortcut"):
             self._lbl_sp_shortcut.setText(s)
 
-    # ------------------------------------------------------------------
-    # Rafraichissement de la liste des contacts
-    # ------------------------------------------------------------------
-    def refresh_contacts(self, annuaire: dict, online_names,
-                         my_name: str = "", unread_set=None,
-                         photo_provider=None, last_msg_ts_map=None):
-        """Reconstruit la liste des contacts a partir de l'annuaire et de
-        l'ensemble des joueurs actuellement en ligne.
-          annuaire     : dict {"contacts": {pseudo: {...}}}
-          online_names : iterable des pseudos connectes maintenant
-          my_name      : mon pseudo, exclu de la liste
-          unread_set   : iterable des pseudos qui ont des MP non lus (D4
-                         etape 3). L'enveloppe de ces contacts affiche
-                         un badge rouge.
-          photo_provider : callable optionnel (pseudo) -> bytes|None.
-                         [D5] Fournit les bytes JPEG d'un pair s'ils
-                         sont en cache. Si absent ou None retourne, la
-                         ligne ne montre pas d'avatar (spec : vide).
-          last_msg_ts_map : dict optionnel {pseudo: float ts}. Pour chaque
-                         contact qui a une conversation active, le ts du
-                         dernier message echange (sent OU received, le
-                         plus recent). Les pseudos absents du dict ou
-                         avec ts <= 0 sont consideres "sans conversation".
-                         Ajout 24/05/2026 Kainan.
-        Tri (24/05/2026) : 2 groupes (connectes en haut, deconnectes en
-        bas). DANS chaque groupe, contacts avec une conversation tries
-        par ts du dernier message (recent en haut), puis contacts sans
-        conversation tries alphabetiquement. Style messagerie type
-        WhatsApp/Telegram, mais en conservant la separation connecte /
-        deconnecte (pastille verte/grise reste lisible)."""
-        online = set(online_names or [])
-        unread = set(unread_set or [])
-        ts_map = last_msg_ts_map or {}
-        contacts = (annuaire or {}).get("contacts", {})
-        # Memorise les derniers arguments pour pouvoir reconstruire la liste
-        # sans nouvelle donnee (ex. quand on bascule Appels <-> Messagerie).
-        self._last_contacts_args = dict(
-            annuaire=annuaire, online_names=online, my_name=my_name,
-            unread_set=unread, photo_provider=photo_provider,
-            last_msg_ts_map=ts_map,
-        )
 
-        # Vider les lignes existantes (tout sauf le stretch final).
-        while self._contacts_layout.count() > 1:
-            item = self._contacts_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-
-        # Construire les 2 groupes, en excluant mon propre pseudo.
-        names = [n for n in contacts.keys() if n and n != my_name]
-
-        def _sort_group(pseudos):
-            """Tri intra-groupe : convos par ts du dernier message (recent
-            en haut), puis sans-convo par ordre alpha."""
-            with_convo = []
-            without_convo = []
-            for p in pseudos:
-                ts = float(ts_map.get(p, 0.0) or 0.0)
-                if ts > 0:
-                    with_convo.append((ts, p))
-                else:
-                    without_convo.append(p)
-            # ts desc (plus recent en haut), tie-break alpha
-            with_convo.sort(key=lambda x: (-x[0], x[1].lower()))
-            without_convo.sort(key=str.lower)
-            return [p for _, p in with_convo] + without_convo
-
-        connected = _sort_group([n for n in names if n in online])
-        disconnected = _sort_group([n for n in names if n not in online])
-
-        on_hist = (self._contacts_mode == "call"
-                   and self._appels_tab == "historique")
-        if not connected and not disconnected:
-            if not on_hist:
-                self._contacts_scroll.setVisible(False)
-                self._lbl_empty.setVisible(True)
-            return
-        if not on_hist:
-            self._contacts_scroll.setVisible(True)
-            self._lbl_empty.setVisible(False)
-
-        def _photo(p):
-            if photo_provider is None:
-                return None
-            try:
-                return photo_provider(p)
-            except Exception:
-                return None
-
-        mode = self._contacts_mode
-        idx = 0
-        nav_rows = []
-        for pseudo in connected:
-            row = _PhoneContactRow(
-                pseudo, True, self._row_h, unread=(pseudo in unread),
-                photo_bytes=_photo(pseudo), mode=mode,
-            )
-            row.sig_call.connect(self.sig_call)
-            row.sig_message.connect(self.sig_message)
-            self._contacts_layout.insertWidget(idx, row)
-            idx += 1
-            nav_rows.append(row)
-        for pseudo in disconnected:
-            row = _PhoneContactRow(
-                pseudo, False, self._row_h, unread=(pseudo in unread),
-                photo_bytes=_photo(pseudo), mode=mode,
-            )
-            if mode == "message":
-                # Messagerie : la ligne (meme hors-ligne) ouvre la conversation
-                # et est navigable au D-pad.
-                row.sig_message.connect(self.sig_message)
-                nav_rows.append(row)
-            else:
-                row.sig_forget.connect(self.sig_forget)
-            self._contacts_layout.insertWidget(idx, row)
-            idx += 1
-
-        # Reconstruire l'etat de navigation D-pad : seules les lignes
-        # connectees (avec phone+letter) sont navigables. On clampe l'index
-        # courant et on re-applique la surbrillance.
-        # Sur l'onglet Historique, la navigation porte sur les lignes
-        # d'historique : on ne remplace PAS _nav_rows par les contacts (mais on
-        # a quand meme reconstruit les lignes pour le retour sur l'onglet Menu).
-        if not on_hist:
-            self._nav_rows = nav_rows
-            if not nav_rows:
-                self._nav_index = 0
-            else:
-                self._nav_index = max(0, min(self._nav_index, len(nav_rows) - 1))
-            self._nav_action = (0 if self._nav_action not in (0, 1)
-                                else self._nav_action)
-        self._apply_nav_highlight()
-
-    # ------------------------------------------------------------------
-    # Navigation clavier D-pad (ecran contacts : Appeler / Message)
-    # ------------------------------------------------------------------
-    def _apply_nav_highlight(self):
-        """Re-applique la surbrillance sur toutes les lignes navigables
-        selon _nav_index / _nav_action. Ne fait rien hors ecran contacts
-        (la surbrillance reste posee mais invisible tant qu'on n'est pas
-        sur cet ecran ; on l'efface quand meme pour rester propre)."""
-        on_contacts = (self._stack.currentWidget() is self._page_contacts)
-        for i, row in enumerate(self._nav_rows):
-            try:
-                sel = (on_contacts and self._nav_shown
-                       and i == self._nav_index)
-                row.set_nav_highlight(sel, self._nav_action)
-            except Exception:
-                pass
 
     @Slot(str)
+    def _app_champ_vide(self) -> bool:
+        """True si le champ de saisie courant est VIDE.
+
+        Sert au listener : dans un champ NON VIDE le retour arriere
+        efface, dans un champ VIDE il ressort.
+
+        [CORRECTIF 02/08/2026] L'ecran CONVERSATION etait exclu de cette
+        regle. Consequence : apres l'envoi d'un message, le champ est
+        vide, le retour arriere n'avait plus rien a effacer et n'etait
+        pas transmis non plus -- on ne pouvait plus sortir du champ, donc
+        plus quitter la conversation. Seule la vraie touche Echap
+        fonctionnait encore, ce que rien n'indique a l'ecran.
+        La regle est donc la meme partout.
+        """
+        if self._convo_in_field:
+            try:
+                return not self._convo_input.toPlainText().strip()
+            except Exception:
+                return False
+        app = self._current_app
+        try:
+            fn = getattr(app, "champ_courant_vide", None)
+            return bool(fn is not None and fn())
+        except Exception:
+            return False
+
+    def _app_dans_champ(self) -> bool:
+        """True quand l'app courante a donne le focus a un champ texte.
+
+        Meme role que _convo_in_field pour l'ecran conversation : tant
+        qu'on tape, le D-pad n'est pas capte et les fleches restent au
+        curseur. Lu depuis le thread pynput : simple lecture de booleen.
+        """
+        app = self._current_app
+        return bool(app is not None and getattr(app, "dans_champ", None)
+                    and app.dans_champ())
+
+    def entrer_dans_champ(self, widget):
+        """Donne le focus clavier a un champ d'une app.
+
+        Reprend exactement ce que fait l'ecran conversation : la fenetre
+        overlay porte le flag Qt.Tool, un setFocus() seul ne suffit donc
+        PAS a lui donner le focus clavier systeme. Il faut d'abord forcer
+        la fenetre au premier plan Windows, sinon les frappes partent
+        dans Star Citizen. C'est ce que Windows fait tout seul quand on
+        clique dans le champ ; ici on le declenche au clavier.
+        """
+        try:
+            self._win32_force_foreground()
+            self.activateWindow()
+            self.raise_()
+            widget.setFocus(Qt.OtherFocusReason)
+        except Exception:
+            pass
+
     def _is_game_active(self) -> bool:
         """True quand l'app courante est un jeu qui capture le clavier. Sert
         au listener pour router les touches vers le jeu (event synthetique) et
@@ -11556,7 +11714,7 @@ class PhoneOverlayWindow(QWidget):
 
     def _on_nav_key(self, direction: str):
         """Slot main-thread : route une touche D-pad selon l'ecran courant.
-        Ecran contacts -> _nav_contacts ; ecran conversation -> _nav_convo.
+        Ecran conversation -> _nav_convo ; app -> handle_nav.
         Les autres ecrans ne sont pas navigables au clavier (scope actuel)."""
         try:
             cur = self._stack.currentWidget()
@@ -11613,12 +11771,7 @@ class PhoneOverlayWindow(QWidget):
                             pass
                         self._arm_game_confirm_later(self._current_app)
                 return
-            if cur is self._page_contacts:
-                if direction == "esc":
-                    self._go_home()
-                    return
-                self._nav_contacts(direction)
-            elif cur is self._page_convo:
+            if cur is self._page_convo:
                 self._nav_convo(direction)
             elif cur is self._page_shots:
                 self._nav_shots(direction)
@@ -11632,48 +11785,6 @@ class PhoneOverlayWindow(QWidget):
                 try: _core._dbg_log(f"[PHONE NAV] route KO : {e}")
                 except Exception: pass
 
-    def _nav_contacts(self, direction: str):
-        """Navigation D-pad ecran contacts.
-          up/down  : change de ligne (contact connecte)
-          left/right : bascule l'action Appeler <-> Message
-          enter    : declenche l'action sur la ligne courante
-        Ignore si rien a naviguer."""
-        try:
-            # Mode Appels : gauche/droite basculent l'onglet Menu/Historique
-            # (independamment du contenu de la liste courante).
-            if self._contacts_mode == "call" and direction in ("left", "right"):
-                self._set_appels_tab(
-                    "menu" if direction == "left" else "historique")
-                return
-            n = len(self._nav_rows)
-            if n == 0:
-                return
-            if direction == "up":
-                if not self._nav_shown:
-                    self._nav_shown = True   # 1er appui : revele, ne bouge pas
-                else:
-                    self._nav_index = (self._nav_index - 1) % n
-                self._ensure_nav_visible()
-            elif direction == "down":
-                if not self._nav_shown:
-                    self._nav_shown = True
-                else:
-                    self._nav_index = (self._nav_index + 1) % n
-                self._ensure_nav_visible()
-            elif direction == "enter":
-                self._nav_shown = True
-                row = self._nav_rows[self._nav_index]
-                pseudo = row.pseudo()
-                if self._contacts_mode == "message":
-                    self.sig_message.emit(pseudo)   # ouvre la conversation
-                else:                                # mode "call"
-                    self.sig_call.emit(pseudo)       # Menu/Historique -> appel
-                return  # l'action peut changer d'ecran : pas de re-highlight
-            self._apply_nav_highlight()
-        except Exception as e:
-            if _CORE_AVAILABLE:
-                try: _core._dbg_log(f"[PHONE NAV] contacts KO : {e}")
-                except Exception: pass
 
     def _nav_convo(self, direction: str):
         """Navigation D-pad ecran conversation. 4 cibles : Retour (0),
@@ -11894,15 +12005,6 @@ class PhoneOverlayWindow(QWidget):
         except Exception:
             pass
 
-    def _ensure_nav_visible(self):
-        """Scroll l'aire de contacts pour que la ligne selectionnee reste
-        visible (le scroll est dans self._contacts_scroll)."""
-        try:
-            if 0 <= self._nav_index < len(self._nav_rows):
-                row = self._nav_rows[self._nav_index]
-                self._contacts_scroll.ensureWidgetVisible(row)
-        except Exception:
-            pass
 
     # ------------------------------------------------------------------
     # Dessin du chassis (corps noir + bandeau "CircusPhone")
@@ -12008,11 +12110,8 @@ class PhoneOverlayWindow(QWidget):
         self._anim.setEndValue(final)
         self._anim.setEasingCurve(QEasingCurve.OutCubic)
         self._anim.start()
-        # Navigation clavier : on (re)part de la 1ere ligne, action Appeler,
-        # et on demarre le listener D-pad (arrete a la fermeture).
-        self._nav_index = 0
-        self._nav_action = 0
-        self._apply_nav_highlight()
+        # Navigation clavier : demarrage du listener D-pad (arrete a la
+        # fermeture). La selection est geree par l'app affichee.
         try:
             self._nav_listener.start()
         except Exception:
@@ -12100,6 +12199,71 @@ class _GameLogFeed(QObject):
         return self._path
 
 
+# ---------------------------------------------
+#  [HISTORIQUE SERVEURS 28/07/2026] Suppression d'une entree
+# ---------------------------------------------
+# Une croix est dessinee au bout de chaque ligne de la liste deroulante.
+# Une QComboBox n'affichant que du texte, il faut un delegue pour la
+# peindre et un filtre d'evenements pour intercepter le clic — sinon le
+# clic sur la croix serait interprete comme une selection.
+
+class _ServerHistoryDelegate(QStyledItemDelegate):
+    """Peint le libelle habituel, plus une croix a droite."""
+
+    CROSS_W = 24
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        r = option.rect
+        painter.save()
+        painter.setPen(QColor("#ff6666"))
+        f = painter.font()
+        f.setBold(True)
+        painter.setFont(f)
+        painter.drawText(
+            QRect(r.right() - self.CROSS_W, r.top(), self.CROSS_W, r.height()),
+            Qt.AlignCenter, "\u00d7",
+        )
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        s = super().sizeHint(option, index)
+        s.setWidth(s.width() + self.CROSS_W)
+        return s
+
+
+class _ServerHistoryClickFilter(QObject):
+    """Intercepte le clic sur la croix avant qu'il ne devienne une selection.
+
+    Rendre l'evenement consomme (True) est indispensable : sans cela la
+    liste se refermerait en selectionnant l'entree qu'on vient de
+    supprimer.
+    """
+
+    def __init__(self, combo, on_delete, parent=None):
+        super().__init__(parent)
+        self._combo = combo
+        self._on_delete = on_delete
+
+    def eventFilter(self, obj, ev):
+        try:
+            if ev.type() == QEvent.MouseButtonPress:
+                view = self._combo.view()
+                try:
+                    pos = ev.position().toPoint()
+                except Exception:
+                    pos = ev.pos()
+                idx = view.indexAt(pos)
+                if idx.isValid():
+                    r = view.visualRect(idx)
+                    if pos.x() >= r.right() - _ServerHistoryDelegate.CROSS_W:
+                        self._on_delete(idx.row())
+                        return True
+        except Exception:
+            pass
+        return False
+
+
 class MainWindow(QMainWindow):
     # Signal interne pour declencher run_connect dans le worker thread
     _sig_start_connect = Signal(str, str, str)
@@ -12172,6 +12336,26 @@ class MainWindow(QMainWindow):
         # [v0.3] Feed Game.log partage : le tail (c2-gamelog-tail-smart) y
         # pousse chaque ligne, les apps CircusPhone s'y abonnent (Portefeuille).
         self._gamelog_feed = _GameLogFeed()
+        # [CONTACTS 31/07/2026] Purge one-shot AVANT tout chargement :
+        # l'ancien annuaire s'auto-remplissait de PSEUDOS sans numeros,
+        # et les conversations sont indexees par pseudo. Rien de tout
+        # cela n'est exploitable dans le modele par numero.
+        try:
+            from circusvoip_phone_contacts import purge_donnees_0_4_0
+            if purge_donnees_0_4_0(_BASE_DIR, cfg, log=print):
+                if _CORE_AVAILABLE:
+                    _core_cfg = _core._load_client_cfg()
+                    _core_cfg["phone_data_purged_040"] = True
+                    # L'historique d'appels vit DANS la config : le
+                    # retirer du dict en memoire ne suffit pas, car
+                    # _load_call_history relit le fichier sur disque.
+                    _core_cfg.pop("call_history", None)
+                    _core._save_client_cfg(_core_cfg)
+                else:
+                    _save_cfg(cfg)
+        except Exception as _e_purge:
+            print(f"[PURGE] ignoree : {_e_purge}", file=sys.stderr)
+
         self._phone_annuaire = _phone_load_annuaire()
         # CircusPhone (D4 etape 3) : conversations privees + brouillons,
         # charges du fichier au boot. Tout passe par les fonctions
@@ -12219,7 +12403,30 @@ class MainWindow(QMainWindow):
         # Titre dynamique : lit _VERSION_STRING qui vient de circusvoip_version.json
         # (format "0.1.2 alpha 035"). Avant, la version etait hardcodee en
         # "0.1" et ne refletait jamais la version reelle.
-        self.setWindowTitle(f"CircusVOIP Client — {_VERSION_STRING}")
+        # [TITRE 28/07/2026] Format explicite "0.4.0 Alpha Build 64" :
+        # le canal en toute lettre et le numero de build sans zeros de
+        # remplissage, plus lisible qu'un "0.4.0 alpha 064" quand un
+        # testeur envoie une capture d'ecran.
+        # Le canal 'stable' n'expose pas le build (cf.
+        # _format_version_string) : on garde alors la version seule.
+        try:
+            _vi = _VERSION_INFO or {}
+            _v = _vi.get("version", "?")
+            _ch = (_vi.get("channel") or "").strip()
+            if _ch and _ch.lower() != "stable":
+                _titre = f"{_v} {_ch.capitalize()} Build {int(_vi.get('build', 0))}"
+            else:
+                # [TITRE 31/07/2026] Le build s'affiche AUSSI quand le
+                # canal est vide ou 'stable'. Avant, on retombait sur la
+                # version seule ("0.4.0") : impossible de savoir, sur la
+                # capture d'ecran d'un testeur, quel build il fait
+                # tourner -- alors que c'est la premiere question qu'on
+                # se pose quand un bug remonte.
+                _b = int(_vi.get("build", 0) or 0)
+                _titre = f"{_v} Build {_b}" if _b else _v
+        except Exception:
+            _titre = _VERSION_STRING
+        self.setWindowTitle(f"CircusVOIP Client — {_titre}")
         # Appliquer le theme sombre global. On le met sur la
         # QApplication pour que toutes les dialogs creees plus tard
         # (QMessageBox, QFileDialog, etc.) heritent automatiquement.
@@ -12246,9 +12453,18 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        # [BOOT TIMING 28/07/2026] Reperes fins dans le constructeur.
+        # Il a ete mesure a 4,35 s sur un lancement lent alors qu'il en
+        # prend 0,4 s habituellement, sans qu'on puisse dire quelle etape
+        # etait en cause : la mesure precedente s'arretait au niveau du
+        # constructeur entier.
+        _boot_log("MainWindow: avant _build_ui")
         self._build_ui()
+        _boot_log("MainWindow: apres _build_ui")
         self._build_worker()
+        _boot_log("MainWindow: apres _build_worker")
         self._apply_initial_geometry()
+        _boot_log("MainWindow: apres geometrie")
 
         # Charge les sons du soundboard en cache. Cette etape lit les
         # .wav du dossier du script et les decode en numpy float32 ;
@@ -12256,6 +12472,7 @@ class MainWindow(QMainWindow):
         # rendus dans la console du client. Non bloquant : si un
         # fichier manque, c'est juste logue.
         self._load_soundboard_sounds()
+        _boot_log("MainWindow: apres soundboard")
 
         # QTimer pour suivre l'etat de lecture du soundboard.
         # Interroge audio_io.is_soundboard_playing() toutes les 100ms et
@@ -12413,6 +12630,37 @@ class MainWindow(QMainWindow):
         )
         h_top.addWidget(self.lbl_audio_status)
 
+        # [MICRO VISIBLE 28/07/2026] Indicateur d'echec de capture.
+        # Jusqu'ici, un micro qui refusait de s'ouvrir ne se signalait que
+        # par une ligne discrete dans le journal : le joueur parlait sans
+        # que personne ne l'entende, et rien a l'ecran ne distinguait
+        # "mon micro est HS" de "personne ne me repond".
+        # Masque tant que tout va bien : un indicateur permanent de plus
+        # dans une barre deja chargee serait du bruit.
+        # [AUDIO 31/07/2026] Perte d'un peripherique EN COURS de session
+        # (casque debranche ou eteint). Affiche en rouge dans la barre du
+        # haut, sans rien bloquer : le joueur reste connecte, garde sa
+        # position, son telephone et sa radio -- seul l'audio est muet.
+        # Sans ce message, il croit simplement que plus personne ne parle.
+        self.lbl_audio_lost = QLabel("")
+        self.lbl_audio_lost.setStyleSheet(
+            f"color: {THEME_RED}; font-weight: bold;")
+        self.lbl_audio_lost.setVisible(False)
+
+        self.lbl_mic_status = QLabel("MICRO INDISPONIBLE")
+        self.lbl_mic_status.setStyleSheet(
+            f"color: {THEME_RED}; padding: 2px 6px; font-size: 10pt; "
+            "font-weight: bold;"
+        )
+        self.lbl_mic_status.setToolTip(
+            "Le peripherique de capture n'a pas pu etre ouvert.\n"
+            "Vous entendez les autres, mais personne ne vous entend.\n"
+            "Choisissez un autre micro dans les Parametres."
+        )
+        self.lbl_mic_status.setVisible(False)
+        h_top.addWidget(self.lbl_audio_lost)
+        h_top.addWidget(self.lbl_mic_status)
+
         h_top.addStretch(1)
 
         self.btn_settings = QPushButton("PARAMETRES")
@@ -12448,9 +12696,43 @@ class MainWindow(QMainWindow):
         self.ed_name.setMaxLength(20)
 
         lbl_ip = QLabel("Serveur :")
-        self.ed_ip = QLineEdit(self._cfg.get("server_ip", DEFAULT_IP))
-        self.ed_ip.setMaximumWidth(180)
+        # [HISTORIQUE SERVEURS 28/07/2026] Liste deroulante editable a la
+        # place du champ simple : elle memorise les serveurs auxquels on
+        # s'est REELLEMENT connecte (join accepte), avec leur mot de
+        # passe, pour eviter de tout retaper a chaque bascule entre le
+        # serveur de dev et la prod.
+        # self.ed_ip pointe sur le champ de saisie interne du combo :
+        # tout le code existant (text(), setEchoMode, bouton oeil)
+        # continue de fonctionner sans modification.
+        # NOTE : le mot de passe est stocke EN CLAIR dans la config
+        # client, comme l'etait deja le champ "token". Acceptable pour un
+        # serveur prive partage entre joueurs ; a revoir si le mot de
+        # passe devient un secret personnel.
+        self.cb_server = QComboBox()
+        self.cb_server.setEditable(True)
+        # [LARGEUR 28/07/2026] 180px ne laissait voir que "178.104" : une
+        # adresse avec port ("178.104.207.46:5746") ou un nom d'hote font
+        # une vingtaine de caracteres, sans compter la fleche du combo.
+        self.cb_server.setMinimumWidth(260)
+        self.cb_server.setMaximumWidth(320)
+        self.cb_server.setInsertPolicy(QComboBox.NoInsert)
+        self.ed_ip = self.cb_server.lineEdit()
         self.ed_ip.setEchoMode(QLineEdit.Password)  # masque par defaut
+        self._reload_server_history()
+        _cur = self._cfg.get("server_ip", DEFAULT_IP)
+        self.ed_ip.setText(_cur)
+        # Selectionner une entree remplit le mot de passe associe.
+        self.cb_server.activated.connect(self._on_server_history_pick)
+        # [HISTORIQUE SERVEURS 28/07/2026] Croix de suppression sur chaque
+        # ligne de la liste (cf. _ServerHistoryDelegate plus haut).
+        self.cb_server.setItemDelegate(_ServerHistoryDelegate(self.cb_server))
+        self._srv_hist_filter = _ServerHistoryClickFilter(
+            self.cb_server, self._delete_server_history_entry, self
+        )
+        self.cb_server.view().viewport().installEventFilter(
+            self._srv_hist_filter
+        )
+
         # Style minimaliste pour les boutons oeil (line-art, pas d'emoji).
         # Surclasse le QSS global qui donnerait un fond bleu vif :checked.
         _eye_btn_qss = (
@@ -12492,7 +12774,10 @@ class MainWindow(QMainWindow):
         lbl_pw = QLabel("MDP :")
         self.ed_pw = QLineEdit(self._cfg.get("token", ""))
         self.ed_pw.setEchoMode(QLineEdit.Password)
-        self.ed_pw.setMaximumWidth(160)
+        # [LARGEUR 28/07/2026] Elargi de 160 a 220 : un mot de passe de
+        # 12 caracteres masques depassait deja.
+        self.ed_pw.setMinimumWidth(200)
+        self.ed_pw.setMaximumWidth(260)
         self.btn_show_pw = QPushButton()
         self.btn_show_pw.setIcon(self._icon_eye_closed)
         self.btn_show_pw.setCheckable(True)
@@ -12518,15 +12803,42 @@ class MainWindow(QMainWindow):
         form.addWidget(self.ed_name)
         form.addSpacing(8)
         form.addWidget(lbl_ip)
-        form.addWidget(self.ed_ip)
+        form.addWidget(self.cb_server)
         form.addWidget(self.btn_show_ip)
         form.addSpacing(8)
         form.addWidget(lbl_pw)
         form.addWidget(self.ed_pw)
         form.addWidget(self.btn_show_pw)
+        # [DISCORD 30/07/2026] Etat du compte + bouton de liaison. Place
+        # sur l'ecran de connexion parce que c'est le seul moment ou la
+        # question se pose : sans compte, on ne peut pas jouer (cf
+        # REQUIRE_ACCOUNT cote serveur), et avec compte on ne revoit
+        # jamais Discord.
+        self.lbl_account = QLabel("")
+        self.lbl_account.setStyleSheet(f"color: {THEME_MUTED};")
+        self.btn_discord = QPushButton("COMPTE DISCORD")
+        self.btn_discord.setMinimumWidth(150)
+        self.btn_discord.setStyleSheet("padding: 6px;")
+        self.btn_discord.clicked.connect(self._on_link_discord)
+
         form.addStretch(1)
         form.addWidget(self.btn_toggle)
+
+        # Ligne compte Discord, AU-DESSUS de Nom/Serveur/MDP. A part
+        # plutot que dans la ligne des champs, qui etait deja saturee :
+        # le label d'etat venait s'y coincer entre le champ MDP et les
+        # boutons. Au-dessus parce que c'est l'ordre reel des
+        # operations -- on relie son compte avant de se connecter.
+        acc_row = QHBoxLayout()
+        acc_row.setContentsMargins(0, 0, 0, 6)
+        acc_row.setSpacing(10)
+        acc_row.addWidget(QLabel("Compte :"))
+        acc_row.addWidget(self.lbl_account)
+        acc_row.addWidget(self.btn_discord)
+        acc_row.addStretch(1)
+        v_main_header.addLayout(acc_row)
         v_main_header.addLayout(form)
+        self._refresh_account_label()
 
         # Note: lbl_status est cree dans la barre du haut maintenant
         # (compact, a cote du statut audio). Plus de ligne pleine largeur.
@@ -12556,6 +12868,7 @@ class MainWindow(QMainWindow):
         self._phone_state   = "idle"
         self._phone_call_id = None
         self._phone_peer    = None
+        self._phone_peer_numero = None
         # Historique des appels (persistant) + suivi des appels en cours pour
         # determiner l'issue (repondu / manque / refuse).
         #   entree : {"peer":str, "dir":"in"|"out", "outcome":str, "ts":float}
@@ -12903,6 +13216,7 @@ class MainWindow(QMainWindow):
         self.lbl_mute_all_key   = _make_key_row(v_radio, "Mute tout :",              "mute_all")
         self.lbl_prox_short_key = _make_key_row(v_radio, "Proximite 30m / 5m :",     "prox_short")
         self.lbl_cycle_ch_key   = _make_key_row(v_radio, "Cycle canal radio :",      "cycle_channel")
+        self.lbl_mask_toggle_key = _make_key_row(v_radio, "Masque DisplayInfo :",     "mask_toggle")
 
         v_left.addWidget(gb_radio)
 
@@ -12952,8 +13266,10 @@ class MainWindow(QMainWindow):
         # self.btn_check_update ; les supprimer leverait AttributeError), mais
         # ils ne sont plus ajoutes au layout donc invisibles.
         # POUR REACTIVER (build de dev) : decommenter les deux lignes.
-        # v_upd.addWidget(self.btn_check_update)
-        # v_left.addWidget(gb_upd)
+        # [DEV 26/07/2026] REACTIVE pour les builds de test v0.4.
+        # A RECOMMENTER avant toute release stable destinee aux joueurs.
+        v_upd.addWidget(self.btn_check_update)
+        v_left.addWidget(gb_upd)
 
         v_left.addStretch(1)
         cols.addWidget(col_left, stretch=1)
@@ -13211,7 +13527,8 @@ class MainWindow(QMainWindow):
         propre UI via _phone_refresh_overlay_buttons et _phone_set_state."""
         pass
 
-    def _phone_set_state(self, new_state: str, peer=None, call_id=None):
+    def _phone_set_state(self, new_state: str, peer=None, call_id=None,
+                         numero=None):
         """Centralise les mutations d'etat d'appel + refresh UI.
         Synchronise aussi l'etat d'appel cote core (state.phone_in_call /
         state.phone_peer) : c'est ce que lisent _on_audio_captured (pour
@@ -13224,7 +13541,15 @@ class MainWindow(QMainWindow):
                         self._phone_state == "in_call"
 
         self._phone_state   = new_state
+        # [RP 04/08/2026] DEUX champs, et il faut les distinguer :
+        #   _phone_peer        = pseudo, pour le ROUTAGE AUDIO seulement
+        #                        (le core filtre les trames 0x03 dessus).
+        #                        None hors appel decroche.
+        #   _phone_peer_numero = numero, pour TOUT ce qui s'affiche.
+        # Melanger les deux est ce qui faisait apparaitre le pseudo sur
+        # l'ecran d'appel entrant. Cf. §5 ter du PROJET.md.
         self._phone_peer    = peer
+        self._phone_peer_numero = numero
         self._phone_call_id = call_id
         self._phone_refresh_ui()
         # --- Sync core (D3 : audio bidirectionnel) ---
@@ -13345,6 +13670,291 @@ class MainWindow(QMainWindow):
     # --- Slots : reception des signaux du NetWorker (thread Qt) ---
 
     # ---- Historique des appels (onglet Appels > Historique) --------------
+    # ------------------------------------------------------------------
+    #  [CONTACTS 31/07/2026] Telephonie par numero
+    # ------------------------------------------------------------------
+
+    def _phone_retour_messagerie(self, accueil: bool = False):
+        """Retour d'ecran apres une conversation ou les reglages.
+
+        Rouvre l'app Messagerie, ou l'accueil du telephone si elle est
+        indisponible. Ne retombe JAMAIS sur l'ecran natif : il listait
+        les joueurs croises du serveur, ce que la decision du 30/07
+        interdit, et il n'est plus accessible depuis l'accueil.
+        """
+        ov = self._phone_overlay
+        if ov is None:
+            return
+        try:
+            if not accueil:
+                from circusvoip_phone_annuaire import MessagerieApp
+                ov._launch_app(MessagerieApp)
+                return
+        except Exception:
+            pass
+        try:
+            ov._current_app = None
+            ov.show_screen_home()
+        except Exception:
+            pass
+
+    def _phone_conversations(self) -> list:
+        """[MESSAGERIE 02/08/2026] Conversations existantes, du plus
+        recent au plus ancien.
+
+        Alimente l'app Messagerie. Les cles sont des NUMEROS depuis le
+        passage au routage par numero ; les conversations heritees
+        (indexees par pseudo) restent listees telles quelles jusqu'a la
+        purge, plutot que de disparaitre sans explication.
+        """
+        out = []
+        try:
+            convos = (self._phone_messages or {}).get("conversations", {})
+            for cle, convo in convos.items():
+                if not cle or not isinstance(convo, dict):
+                    continue
+                dernier = 0.0
+                for champ in ("sent", "received"):
+                    for m in (convo.get(champ) or []):
+                        try:
+                            ts = float(m.get("ts", 0.0))
+                        except Exception:
+                            ts = 0.0
+                        if ts > dernier:
+                            dernier = ts
+                out.append({
+                    "numero": str(cle),
+                    "non_lu": int(convo.get("unread", 0) or 0) > 0,
+                    "ts": dernier,
+                })
+        except Exception:
+            return []
+
+        # [GROUPES 19/08/2026] Un groupe existe des sa creation, AVANT
+        # tout message. Sans ce complement il n'apparaitrait nulle part :
+        # la boucle ci-dessus ne liste que les conversations ayant deja du
+        # contenu, et l'app ne peut decorer que des lignes qui existent.
+        #
+        # Le symptome etait trompeur -- creation acceptee par le serveur,
+        # etat renvoye, et rien a l'ecran.
+        try:
+            if _GRP is not None:
+                # Index par cle : on doit pouvoir COMPLETER une entree
+                # deja produite par la boucle ci-dessus, pas seulement en
+                # ajouter de nouvelles. Cf. le commentaire sur le ts.
+                deja = {e["numero"]: e for e in out}
+                for g in self._phone_groupes_liste():
+                    cle = _GRP.cle_conversation(g.get("id"))
+                    cree = float(g.get("cree_le", 0.0) or 0.0)
+                    e = deja.get(cle)
+                    if e is None:
+                        # Groupe sans aucun message : absent du stockage,
+                        # donc absent de la boucle principale.
+                        out.append({"numero": cle, "non_lu": False,
+                                    "ts": cree})
+                        continue
+                    # Le groupe EST dans le stockage mais sans message :
+                    # son ts vaut 0 et il tomberait en bas de liste.
+                    #
+                    # Ce cas arrive des qu'on OUVRE la conversation :
+                    # _phone_get_convo() la cree a vide au passage. Le
+                    # groupe changeait donc de place a sa premiere
+                    # ouverture, et l'ordre de la liste bougeait sans
+                    # raison visible.
+                    if not e.get("ts"):
+                        e["ts"] = cree
+                # Conversations de groupe ORPHELINES : la cle est bien
+                # celle d'un groupe, mais aucun groupe connu ne lui
+                # correspond. Ca arrive pour les groupes quittes AVANT
+                # que la purge de _on_groupe_etat existe, ou si l'etat
+                # n'est pas encore arrive du serveur.
+                #
+                # On les masque au lieu de les effacer : l'etat peut
+                # simplement etre en retard a la connexion, et effacer
+                # sur cette base perdrait une conversation vivante. Un
+                # groupe reellement quitte sera purge par
+                # _on_groupe_etat a la premiere reponse du serveur.
+                connus = {_GRP.cle_conversation(g.get("id"))
+                          for g in self._phone_groupes_liste()}
+                out = [e for e in out
+                       if not _GRP.est_cle_groupe(e["numero"])
+                       or e["numero"] in connus]
+        except Exception:
+            pass
+
+        out.sort(key=lambda e: e.get("ts", 0.0), reverse=True)
+        return out
+
+    def _phone_open_conversation(self, numero: str):
+        """Ouvre l'ecran de conversation existant pour un numero."""
+        self._on_phone_overlay_message(str(numero or ""))
+
+    def _phone_repertoire(self):
+        """Carnet LOCAL, cree a la demande.
+
+        Source unique de la substitution nom/numero. Rien a voir avec
+        l'annuaire du serveur, qui reste reserve a l'administration.
+        """
+        rep = getattr(self, "_repertoire", None)
+        if rep is None:
+            try:
+                from circusvoip_phone_contacts import Repertoire
+                rep = Repertoire(_BASE_DIR / "circusphone_contacts.json")
+            except Exception as e:
+                self._on_log(f"[CONTACTS] répertoire indisponible : {e}")
+                rep = None
+            self._repertoire = rep
+        return rep
+
+    def _phone_items_groupe(self, items):
+        """Substitue le NOM du carnet a l'auteur de chaque bulle.
+
+        Le corps stocke porte le NUMERO -- « le nom n'est stocke nulle
+        part » est la regle du projet, et elle protege les conversations
+        d'un contact renomme. La substitution appartient donc a
+        l'affichage, exactement comme pour le titre de l'ecran.
+
+        C'est fait ICI plutot que dans la bulle parce que la bulle ne
+        connait pas le carnet : elle recoit une chaine et l'affiche.
+        """
+        if _GRP is None:
+            return items
+        out = []
+        for ts, body, is_me in items:
+            if isinstance(body, str):
+                sys_pfx = ""
+                reste = body
+                if reste.startswith(PHONE_SYS_PREFIX):
+                    sys_pfx = PHONE_SYS_PREFIX
+                    reste = reste[len(PHONE_SYS_PREFIX):]
+                if reste.startswith(PHONE_GRP_AUTEUR):
+                    fin = reste.find(PHONE_GRP_FIN)
+                    if fin > 0:
+                        num = reste[len(PHONE_GRP_AUTEUR):fin]
+                        nom = self._phone_afficher(num)
+                        reste = (f"{PHONE_GRP_AUTEUR}{nom}"
+                                 f"{reste[fin:]}")
+                body = sys_pfx + reste
+            out.append((ts, body, is_me))
+        return out
+
+    def _phone_afficher(self, numero) -> str:
+        """Nom du contact si connu, numero sinon. Jamais vide.
+
+        [GROUPES 19/08/2026] Une cle de conversation de groupe ("G:<id>")
+        n'est pas un numero : le carnet ne la connait pas et la rendait
+        telle quelle. Le titre de la conversation affichait donc
+        « G:bbb222 » au lieu du nom du groupe.
+
+        Ce point est le SEUL a corriger parce qu'il est le seul endroit
+        ou une cle de conversation devient un libelle : le titre de
+        l'ecran de conversation passe par ici.
+        """
+        if _GRP is not None and _GRP.est_cle_groupe(numero):
+            g = self._phone_groupe_par_cle(numero)
+            if g is not None:
+                return str(g.get("nom") or "Groupe")
+            # Groupe quitte, ou etat pas encore recu : la conversation
+            # reste lisible, mais son nom n'est plus connu de personne --
+            # afficher la cle brute serait pire que ce libelle neutre.
+            return "Groupe"
+        rep = self._phone_repertoire()
+        if rep is None:
+            return str(numero or "?")
+        try:
+            return rep.afficher(numero)
+        except Exception:
+            return str(numero or "?")
+
+    def _phone_appeler_numero(self, numero):
+        """Lance un appel vers un NUMERO.
+
+        Un numero hors ligne ou inexistant fait sonner dans le vide
+        jusqu'a expiration : les deux cas sont indistinguables cote
+        serveur, ce qui rend le balayage de numeros sans interet.
+        """
+        if self._phone_state != "idle":
+            self._phone_log("Appel ignoré : un appel est déjà en cours")
+            return
+        num = str(numero or "").strip()
+        if not num:
+            return
+        try:
+            ok = _core._ws_send_safe({
+                "type": "phone_call_request",
+                "target_numero": num,
+            })
+        except Exception:
+            ok = False
+        if ok:
+            # Repli si le serveur ne renvoie pas target_numero.
+            self._dernier_numero_compose = num
+            self._phone_log(f"→ phone_call_request (numéro={num})")
+            ov = self._phone_overlay
+            if ov is not None and ov.is_open():
+                try:
+                    ov.show_screen_outgoing(self._phone_afficher(num))
+                except Exception:
+                    pass
+        else:
+            self._phone_log("Échec envoi phone_call_request")
+
+    def _phone_historique(self) -> list:
+        """Historique pour l'app Appels, du plus recent au plus ancien.
+
+        Les entrees anterieures au 31/07 n'ont pas de numero : on les
+        garde en repli sur le pseudo, sans quoi elles disparaitraient de
+        l'historique du joueur sans explication.
+
+        [QUEUE 05/08/2026] Tri sur 'ts', et non plus sur l'ordre
+        d'insertion. Les deux coincidaient tant que tout arrivait en
+        temps reel ; la messagerie differee a casse l'equivalence. Un
+        appel manque de samedi, rejoue au retour, s'INSERE en dernier :
+        avec le seul reversed() il se retrouvait en tete de liste,
+        presente comme le plus recent. Corriger l'heure affichee sans
+        corriger l'ordre aurait produit pire que le bug d'origine -- une
+        ligne datee de samedi tronant au-dessus des appels de lundi.
+        Les entrees sans 'ts' (versions tres anciennes) sont renvoyees en
+        fin de liste plutot que datees de 1970.
+        """
+        def _cle_ts(e):
+            try:
+                v = float(e.get("ts") or 0.0)
+            except Exception:
+                v = 0.0
+            return v
+
+        _hist = sorted(list(self._call_history or []),
+                       key=_cle_ts, reverse=True)
+        out = []
+        for e in _hist:
+            num = e.get("numero") or e.get("peer") or ""
+            # Entrees enregistrees avant le 02/08 : le pseudo de
+            # remplacement d'un numero inattribue s'ecrit "#<numero>".
+            # On retire le prefixe pour que la substitution par le carnet
+            # fonctionne aussi sur l'historique deja constitue.
+            num = str(num).lstrip("#")
+            out.append({
+                "numero": str(num),
+                "sens": e.get("dir", "out"),
+                "issue": e.get("outcome", ""),
+                "ts": e.get("ts"),
+            })
+        return out
+
+    def _phone_photo_par_numero(self, numero):
+        """Photo d'un correspondant identifie par son NUMERO.
+
+        Le serveur resout le numero en interne et repond avec le numero
+        en cle : le pseudo ne transite jamais. On affiche donc une photo
+        meme pour un numero inconnu du carnet -- le RP protege le nom,
+        pas le visage.
+        """
+        try:
+            return self._profile_photos.get_peer_photo_bytes(str(numero))
+        except Exception:
+            return None
+
     def _load_call_history(self):
         """Charge l'historique d'appels persiste (max 50 entrees)."""
         try:
@@ -13366,34 +13976,53 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _record_call(self, peer, direction, outcome):
+    def _record_call(self, peer, direction, outcome, numero=None,
+                     ts_origine=None):
         """Ajoute une entree a l'historique, persiste, et rafraichit l'onglet
         Historique si l'overlay l'affiche.
           direction : "in" (entrant) | "out" (sortant)
-          outcome   : "answered" | "missed" | "declined" | "busy" | "offline"."""
-        if not peer:
+          outcome   : "answered" | "missed" | "declined" | "busy" | "offline".
+
+        [CONTACTS 31/07/2026] `numero` est ce qui compte desormais : le nom
+        affiche est SUBSTITUE a la lecture depuis le carnet local, jamais
+        stocke ici. Consequence voulue : ajouter un contact renomme
+        retroactivement TOUTES les lignes de ce numero, et le supprimer les
+        fait redevenir des numeros -- sans rien avoir a mettre a jour.
+        `peer` reste ecrit pour les entrees existantes et le repli.
+        """
+        if not (peer or numero):
             return
         try:
+            # [QUEUE 05/08/2026] 'ts' impose : un evenement REJOUE depuis la
+            # file differee doit s'inscrire a l'heure de l'appel, pas a
+            # l'heure de la reconnexion. time.time() ne vaut que pour le
+            # temps reel. Un ts nul ou absurde (horloge serveur decalee,
+            # champ manquant) retombe sur l'heure locale plutot que de
+            # produire une ligne datee de 1970.
+            _ts = time.time()
+            try:
+                if ts_origine and float(ts_origine) > 0.0:
+                    _ts = float(ts_origine)
+            except Exception:
+                pass
             self._call_history.append({
                 "peer": peer, "dir": direction,
-                "outcome": outcome, "ts": time.time(),
+                "numero": str(numero) if numero else None,
+                "outcome": outcome, "ts": _ts,
             })
             self._call_history = self._call_history[-50:]
             self._save_call_history()
-            ov = self._phone_overlay
-            if ov is not None and hasattr(ov, "refresh_call_history"):
-                try:
-                    ov.refresh_call_history(self._call_history)
-                except Exception:
-                    pass
+            # [NETTOYAGE 02/08/2026] L'app Appels reconstruit son
+            # historique dans on_show : plus besoin de pousser la liste
+            # vers l'ecran natif, qui n'existe plus.
         except Exception:
             pass
 
-    def _call_track_start(self, call_id, peer, direction):
+    def _call_track_start(self, call_id, peer, direction, numero=None):
         """Memorise un appel qui demarre (pour determiner l'issue a la fin)."""
         if call_id:
             self._call_track[call_id] = {
-                "peer": peer, "dir": direction,
+                "peer": peer, "dir": direction, "numero": numero,
                 "ts": time.time(), "answered": False,
             }
 
@@ -13404,13 +14033,22 @@ class MainWindow(QMainWindow):
         if info is None:
             return
         outcome = "answered" if info.get("answered") else default_outcome
-        self._record_call(info.get("peer"), info.get("dir", "out"), outcome)
+        self._record_call(info.get("peer"), info.get("dir", "out"), outcome,
+                          numero=info.get("numero"))
 
     @Slot(str, str)
-    def _on_phone_ringing(self, call_id: str, target: str):
-        self._phone_set_state("ringing_out", peer=target, call_id=call_id)
-        self._call_track_start(call_id, target, "out")
-        self._phone_log(f"← phone_call_ringing : ça sonne chez {target} "
+    def _on_phone_ringing(self, call_id: str, numero: str = ""):
+        # [RP 04/08/2026] Le serveur n'envoie plus que le numero. Repli
+        # sur le numero compose localement : c'est nous qui l'avons saisi,
+        # donc on le connait de toute facon.
+        numero = numero or getattr(self, "_dernier_numero_compose", "")
+        affiche = self._phone_afficher(numero)
+        # peer=None : aucune voix ne circule pendant la sonnerie, le core
+        # n'a donc rien a filtrer.
+        self._phone_set_state("ringing_out", peer=None, call_id=call_id,
+                              numero=numero)
+        self._call_track_start(call_id, affiche, "out", numero=numero)
+        self._phone_log(f"← phone_call_ringing : ça sonne chez {affiche} "
                         f"(call_id={call_id})")
         # Appelant : on lance le bip d'appel en boucle.
         self._phone_play_ring("dial")
@@ -13419,13 +14057,22 @@ class MainWindow(QMainWindow):
         # la poche") - juste le bip d'appel audible.
         ov = self._phone_overlay
         if ov is not None and ov.is_open():
-            ov.show_screen_outgoing(target or "")
+            ov.show_screen_outgoing(affiche)
 
     @Slot(str, str)
-    def _on_phone_incoming(self, call_id: str, caller: str):
-        self._phone_set_state("ringing_in", peer=caller, call_id=call_id)
-        self._call_track_start(call_id, caller, "in")
-        self._phone_log(f"← phone_call_incoming : {caller} vous appelle "
+    def _on_phone_incoming(self, call_id: str, numero: str = ""):
+        # [CONTACTS 31/07/2026] On affiche le NUMERO, jamais le pseudo :
+        # le nom n'apparait que si le joueur a lui-meme enregistre ce
+        # numero dans son carnet.
+        # [RP 04/08/2026] Le pseudo n'arrive plus du tout. Il n'y a donc
+        # plus qu'UNE source d'affichage, et plus de branche pouvant
+        # prendre la mauvaise.
+        affiche = self._phone_afficher(numero) if numero else "?"
+        # peer=None : la voix ne circule qu'apres decrochage.
+        self._phone_set_state("ringing_in", peer=None, call_id=call_id,
+                              numero=numero)
+        self._call_track_start(call_id, affiche, "in", numero=numero)
+        self._phone_log(f"← phone_call_incoming : {affiche} vous appelle "
                         f"(call_id={call_id})")
         # Destinataire : on lance la sonnerie en boucle.
         self._phone_play_ring("ring")
@@ -13436,10 +14083,12 @@ class MainWindow(QMainWindow):
         # d'affichage de la spec).
         ov = self._phone_overlay
         if ov is not None and ov.is_open():
-            ov.show_screen_incoming(caller or "")
+            ov.show_screen_incoming(affiche)
 
-    @Slot(str, str, str)
-    def _on_phone_accepted(self, call_id: str, caller: str, callee: str):
+    @Slot(str, str, str, str, str)
+    def _on_phone_accepted(self, call_id: str, caller_num: str,
+                           callee_num: str, caller_aid: str = "",
+                           callee_aid: str = ""):
         # Defense : on ignore les messages qui concerneraient un autre
         # appel que celui qu'on connait. Cas tordu mais possible
         # (message tardif apres reco rapide, ou serveur incoherent).
@@ -13449,13 +14098,18 @@ class MainWindow(QMainWindow):
                 f"!= courant={self._phone_call_id})"
             )
             return
-        # L'autre partie = celle qui n'est pas nous.
+        # L'autre partie = celle qui n'est pas nous. On se reconnait sur
+        # l'audio_id (pseudo), parce que c'est lui que le core comparera
+        # ensuite aux trames de voix.
         my = state.my_name if _CORE_AVAILABLE else None
-        peer = callee if caller == my else caller
-        self._phone_set_state("in_call", peer=peer, call_id=call_id)
+        peer_aid = callee_aid if caller_aid == my else caller_aid
+        peer_num = callee_num if caller_aid == my else caller_num
+        affiche = self._phone_afficher(peer_num) if peer_num else "?"
+        self._phone_set_state("in_call", peer=peer_aid, call_id=call_id,
+                              numero=peer_num)
         if call_id in self._call_track:
             self._call_track[call_id]["answered"] = True
-        self._phone_log(f"← phone_call_accepted : en appel avec {peer} "
+        self._phone_log(f"← phone_call_accepted : en appel avec {affiche} "
                         f"(call_id={call_id})")
         # Appel decroche : la sonnerie / le bip s'arrete des deux cotes.
         self._phone_stop_ring()
@@ -13463,7 +14117,7 @@ class MainWindow(QMainWindow):
         # ouvert.
         ov = self._phone_overlay
         if ov is not None and ov.is_open():
-            ov.show_screen_in_call(peer or "")
+            ov.show_screen_in_call(affiche)
 
     @Slot(str)
     def _on_phone_declined(self, call_id: str):
@@ -13482,40 +14136,330 @@ class MainWindow(QMainWindow):
         self._phone_back_to_contacts()
 
     @Slot(str, str)
-    def _on_phone_busy(self, target: str, cause: str):
+    def _on_phone_busy(self, target_numero: str, cause: str):
+        # [RP 04/08/2026] Numero, plus pseudo. Repli sur le numero compose
+        # localement : c'est nous qui l'avons saisi.
+        target_numero = (target_numero
+                         or getattr(self, "_dernier_numero_compose", ""))
+        affiche = self._phone_afficher(target_numero) if target_numero else "?"
         label = "hors ligne" if cause == "offline" else "deja en appel"
-        self._phone_log(f"← phone_call_busy : {target} est {label}")
+        self._phone_log(f"← phone_call_busy : {affiche} est {label}")
         # Par securite (aucun son ne devrait tourner a ce stade, mais
         # idempotent).
         self._phone_stop_ring()
         # Retire toute piste d'appel sortant vers cette cible AVANT d'enregistrer
         # (sinon un 'ended' ulterieur du serveur la finaliserait une 2e fois).
         for _cid, _info in list(self._call_track.items()):
-            if _info.get("dir") == "out" and _info.get("peer") == target:
+            if _info.get("dir") == "out" and _info.get("numero") == target_numero:
                 self._call_track.pop(_cid, None)
-        self._record_call(target, "out",
-                          "offline" if cause == "offline" else "busy")
+        self._record_call(affiche, "out",
+                          "offline" if cause == "offline" else "busy",
+                          numero=target_numero)
         self._phone_set_state("idle")
         self._phone_back_to_contacts()
 
-    @Slot(str, str, str)
-    def _on_phone_missed(self, call_id: str, caller: str, callee: str):
+    @Slot(dict)
+    def _on_urgence_etat(self, data: dict):
+        """Etat de l'app Urgence pousse par le serveur.
+
+        [URGENCE 15/08/2026] Toujours MEMORISE, meme app fermee : le
+        serveur repond a un urgence_etat envoye a l'ouverture, et la
+        reponse arrive quelques dizaines de millisecondes plus tard. Ne
+        garder l'etat que pour une app deja affichee ferait perdre
+        precisement la premiere reponse, celle qui remplit l'ecran.
+
+        Et surtout, cet etat arrive AUSSI sans qu'on ait rien demande --
+        un secouriste a pris la demande, elle a expire. Le perdre
+        laisserait la victime devant un ecran perime.
+        """
+        self._urgence_etat = dict(data or {})
+        ov = self._phone_overlay
+        if ov is None:
+            return
+        app = getattr(ov, "_current_app", None)
+        if app is not None and getattr(app, "APP_ID", "") == "urgence":
+            try:
+                app.appliquer_etat(self._urgence_etat)
+            except Exception as e:
+                if _CORE_AVAILABLE:
+                    try: _core._dbg_log(f"[URGENCE] etat KO : {e!r}")
+                    except Exception: pass
+
+    @Slot(str)
+    def _on_urgence_notif(self, genre: str):
+        """Un signal d'urgence vient d'etre declenche pour mon role.
+
+        Badge rouge et son, jamais de fenetre surgissante : le joueur est
+        peut-etre en vol, et une popup au mauvais moment est pire qu'une
+        information ratee.
+
+        Le son est le MEME que celui d'un message recu, comme pour
+        Travail. Le joueur apprend un son, pas six -- et il sait deja que
+        celui-la veut dire "le telephone a quelque chose pour toi".
+
+        [URGENCE 15/08/2026] Contrairement a Travail, on sonne MEME si
+        l'app est ouverte. Le secouriste peut etre sur l'onglet
+        administratif ou sur sa propre demande ; rien ne garantit qu'il
+        regarde la liste au moment ou le signal arrive. Et rater une
+        urgence n'a pas le meme cout que rater une annonce.
+        """
+        if _CORE_AVAILABLE:
+            try:
+                _core._dbg_log(f"[URGENCE] signal {genre}")
+            except Exception:
+                pass
+        ov = self._phone_overlay
+        if ov is not None and hasattr(ov, "set_home_badge"):
+            try:
+                ov.set_home_badge("urgence", True)
+            except Exception:
+                pass
+        if _CORE_AVAILABLE:
+            audio = getattr(state, "audio_io", None)
+            if audio is not None:
+                try:
+                    audio.play_phone_notif()
+                except Exception as e:
+                    try: _core._dbg_log(
+                        f"[URGENCE] play_phone_notif KO : {e}")
+                    except Exception: pass
+
+    @Slot(str, int)
+    def _on_message_refuse(self, motif: str, retry_in: int):
+        """Le serveur a REFUSE le dernier message. Le dire au joueur.
+
+        [CORRECTIF 19/08/2026] Le serveur envoyait deja cette trame ; le
+        client ne la lisait pas. Le message restait affiche dans la
+        conversation comme s'il etait parti -- exactement le mode de
+        panne que le serveur cherchait a eviter en l'envoyant.
+
+        Le libelle reste NEUTRE pour « undelivered » : dire « la file de
+        ce joueur est pleine » confirmerait que le numero existe et que
+        la personne est absente depuis longtemps.
+        """
+        motif = str(motif or "")
+        if motif == "undelivered":
+            txt = ("Message non délivré. Réessayez plus tard.")
+        elif motif in ("kick", "blocage"):
+            txt = ("Envoi bloqué : trop de messages en peu de temps."
+                   + (f" Réessayez dans {retry_in} s." if retry_in else ""))
+        else:
+            txt = ("Message non envoyé : trop de messages en peu de temps."
+                   + (f" Réessayez dans {retry_in} s." if retry_in else ""))
+        self._phone_log(f"[PHONE] {txt}")
+        self._on_log(f"[PHONE] {txt}")
+
+    # --- [GROUPES 19/08/2026] discussions de groupe ---
+
+    @Slot(dict)
+    def _on_groupe_etat(self, data: dict):
+        """Liste des groupes du joueur, poussee par le serveur.
+
+        Toujours MEMORISEE, meme app fermee : le serveur pousse cet etat
+        quand un AUTRE joueur nous ajoute a un groupe, sans qu'on ait
+        rien demande. Ne le garder que pour une app ouverte perdrait
+        exactement le cas qui compte.
+
+        Rafraichit la liste des conversations si elle est affichee : sans
+        ca, un groupe cree a l'instant s'appellerait « Groupe » jusqu'a
+        la prochaine ouverture de l'app -- son nom n'etant connu que par
+        cet etat.
+        """
+        avant = {str(g.get("id")) for g in self._phone_groupes_liste()}
+        try:
+            self._phone_groupes = list((data or {}).get("groupes") or [])
+        except Exception:
+            self._phone_groupes = []
+        err = str((data or {}).get("erreur") or "")
+
+        # [GROUPES 19/08/2026] Un groupe qui DISPARAIT de l'etat est un
+        # groupe qu'on a quitte : sa conversation locale est effacee.
+        #
+        # Sans ca, elle survivait sans nom ni membres -- le nom vient de
+        # l'etat, qui ne la mentionne plus -- et s'affichait comme une
+        # ligne « Groupe » orpheline, sans croix pour s'en debarrasser.
+        #
+        # La purge n'a lieu qu'en l'ABSENCE d'erreur : un etat renvoye en
+        # erreur peut etre vide sans que le joueur ait quitte quoi que ce
+        # soit, et effacer sur cette base detruirait des conversations
+        # bien vivantes.
+        if avant and not err:
+            partis = avant - {str(g.get("id")) for g in self._phone_groupes}
+            if partis and _GRP is not None:
+                convos = self._phone_messages.setdefault("conversations", {})
+                touche = False
+                for gid in partis:
+                    if convos.pop(_GRP.cle_conversation(gid), None) is not None:
+                        touche = True
+                if touche:
+                    _phone_save_messages(self._phone_messages)
+        if err:
+            self._phone_log(f"[GROUPES] {err}")
+        ov = self._phone_overlay
+        app = getattr(ov, "_current_app", None) if ov is not None else None
+        if app is not None and getattr(app, "APP_ID", "") == "messagerie":
+            try:
+                app.on_show()
+            except Exception:
+                pass
+
+    def _phone_groupes_liste(self) -> list:
+        """Groupes connus. Alimente l'app Messagerie."""
+        return list(getattr(self, "_phone_groupes", []) or [])
+
+    def _phone_groupe_par_cle(self, cle) -> dict | None:
+        """Groupe correspondant a une cle de conversation "G:<id>".
+
+        Rend None pour une conversation directe, ou pour un groupe qu'on
+        a quitte -- la conversation reste alors visible en lecture, ce
+        qui est voulu : les messages recus n'ont pas a disparaitre parce
+        qu'on est parti.
+        """
+        if _GRP is None or not _GRP.est_cle_groupe(cle):
+            return None
+        gid = _GRP.id_depuis_cle(cle)
+        for g in self._phone_groupes_liste():
+            if str(g.get("id")) == gid:
+                return g
+        return None
+
+    def _phone_creer_groupe(self, nom, membres):
+        """Demande la creation au serveur. Rien n'est cree localement.
+
+        Le groupe n'existe que quand le serveur l'a accepte et renvoye
+        l'etat : l'afficher tout de suite le ferait apparaitre puis
+        disparaitre en cas de refus.
+        """
+        try:
+            _core._ws_send_safe({
+                "type": "groupe_creer",
+                "nom": str(nom or ""),
+                "membres": list(membres or []),
+            })
+        except Exception as e:
+            self._on_log(f"[GROUPES] creation KO : {e}")
+
+    @Slot(dict)
+    def _on_travail_etat(self, data: dict):
+        """Etat de l'app Travail pousse par le serveur.
+
+        [TRAVAIL 10/08/2026] Toujours MEMORISE, meme si l'app n'est pas
+        ouverte : le serveur repond a un travail_liste envoye a
+        l'ouverture, et la reponse arrive quelques dizaines de
+        millisecondes plus tard. Ne garder l'etat que pour une app deja
+        affichee ferait perdre precisement la premiere reponse, celle qui
+        remplit l'ecran.
+        """
+        self._travail_etat = dict(data or {})
+        ov = self._phone_overlay
+        if ov is None:
+            return
+        app = getattr(ov, "_current_app", None)
+        if app is not None and hasattr(app, "appliquer_etat"):
+            try:
+                app.appliquer_etat(self._travail_etat)
+            except Exception as e:
+                if _CORE_AVAILABLE:
+                    try: _core._dbg_log(f"[TRAVAIL] etat KO : {e!r}")
+                    except Exception: pass
+
+    @Slot(str, str)
+    def _on_travail_notif(self, genre: str, texte: str):
+        """Notification poussee : nouvelle mission, ou abandon.
+
+        Journalisee, et badge rouge sur l'icone. Pas de fenetre
+        surgissante : le joueur est en vol, une popup au mauvais moment
+        est pire qu'une information ratee.
+        """
+        # _phone_log est un STUB VIDE depuis la suppression de la page
+        # Phone Debug : y envoyer la notification revenait a la jeter.
+        # On ecrit dans le log debug global, le seul qui existe encore.
+        if _CORE_AVAILABLE:
+            try:
+                _core._dbg_log(f"[TRAVAIL] {texte}")
+            except Exception:
+                pass
+        ov = self._phone_overlay
+        if ov is not None and hasattr(ov, "set_home_badge"):
+            try:
+                ov.set_home_badge("travail", True)
+            except Exception:
+                pass
+
+        # [NOTIF 11/08/2026] Son de notification, le MEME que celui d'un
+        # message recu. Reutilise plutot que decline en un motif propre :
+        # le joueur apprend un son, pas six, et il sait deja que celui-ci
+        # veut dire "le telephone a quelque chose pour toi". Le distinguer
+        # obligerait a memoriser une grammaire sonore que personne ne
+        # retient en vol.
+        #
+        # Deux conditions, reprises de la messagerie :
+        #   - l'app Travail n'est PAS deja ouverte. Sonner pendant que le
+        #     joueur regarde la liste ou l'annonce vient d'apparaitre
+        #     serait du bruit : il l'a vue.
+        #   - l'abandon d'une mission ne sonne pas. C'est une information
+        #     utile mais pas urgente ; le badge suffit.
+        if genre == "nouvelle":
+            deja_ouvert = False
+            try:
+                app = getattr(ov, "_current_app", None) if ov else None
+                deja_ouvert = (app is not None
+                               and getattr(app, "APP_ID", "") == "travail"
+                               and ov.isVisible())
+            except Exception:
+                deja_ouvert = False
+            if not deja_ouvert and _CORE_AVAILABLE:
+                audio = getattr(state, "audio_io", None)
+                if audio is not None:
+                    try:
+                        audio.play_phone_notif()
+                    except Exception as e:
+                        try: _core._dbg_log(
+                            f"[TRAVAIL] play_phone_notif KO : {e}")
+                        except Exception: pass
+
+    @Slot(str, str, str, float)
+    def _on_phone_missed(self, call_id: str, caller_num: str,
+                         callee_num: str, ts: float = 0.0):
         if call_id and self._phone_call_id and call_id != self._phone_call_id:
             self._phone_log(
                 f"← phone_call_missed IGNORE (call_id={call_id} "
                 f"!= courant={self._phone_call_id})"
             )
             return
-        my = state.my_name if _CORE_AVAILABLE else None
-        if caller == my:
+        # [RP 04/08/2026] On se reconnait sur le NUMERO : le pseudo
+        # n'arrive plus. state.my_numero vient du welcome.
+        my_num = str(getattr(state, "my_numero", "") or "") \
+            if _CORE_AVAILABLE else ""
+        if caller_num and my_num and caller_num == my_num:
             self._phone_log(f"← phone_call_missed : appel non abouti "
                             f"(call_id={call_id})")
         else:
+            affiche = self._phone_afficher(caller_num) if caller_num else "?"
             self._phone_log(f"← phone_call_missed : appel manque de "
-                            f"{caller} (call_id={call_id})")
+                            f"{affiche} (call_id={call_id})")
         # Timeout 45s : on coupe la sonnerie / le bip des deux cotes.
         self._phone_stop_ring()
-        self._call_track_finalize(call_id, "missed")
+        if call_id:
+            self._call_track_finalize(call_id, "missed")
+        else:
+            # [QUEUE 04/08/2026] Appel manque REJOUE depuis la file
+            # differee : il n'a pas de call_id (l'appel est termine depuis
+            # longtemps), donc _call_track_finalize ne trouve rien dans
+            # _call_track et sortait sans rien ecrire. L'evenement etait
+            # recu et acquitte, mais n'entrait JAMAIS dans l'historique.
+            # On l'enregistre directement.
+            if caller_num:
+                # [QUEUE 05/08/2026] 'ts' est l'heure de l'APPEL, conservee
+                # dans la file depuis le depot. Sans elle, l'appel manque
+                # s'inscrivait a l'heure de la reconnexion : tout un week-end
+                # d'absence se tassait sur une seule minute, dans le desordre,
+                # et l'historique devenait inexploitable justement quand il
+                # servait le plus.
+                self._record_call(self._phone_afficher(caller_num), "in",
+                                  "missed", numero=caller_num,
+                                  ts_origine=ts)
+            return
         self._phone_set_state("idle")
         self._phone_back_to_contacts()
 
@@ -13549,10 +14493,7 @@ class MainWindow(QMainWindow):
             # Ecran APPELS (mode call) : un appel releve du contexte Appels.
             # Evite de retomber sur l'ancien ecran 'full' titre 'Contacts' si
             # l'utilisateur n'avait pas ouvert Appels avant l'appel.
-            if hasattr(ov, "show_screen_calls"):
-                ov.show_screen_calls()
-            else:
-                ov.show_screen_contacts()
+            ov.revenir_apres_appel()
 
     def _phone_on_disconnect(self):
         """Appele quand la connexion serveur tombe : tout appel en cours
@@ -13692,7 +14633,15 @@ class MainWindow(QMainWindow):
             self._phone_refresh_overlay_contacts()
             # Choix de l'ecran initial selon l'etat d'appel.
             st = getattr(self, "_phone_state", "idle")
-            peer = getattr(self, "_phone_peer", None) or ""
+            # [RP 04/08/2026] C'ETAIT LE BUG. On lisait ici _phone_peer,
+            # c'est-a-dire le PSEUDO, alors que l'appel direct a
+            # show_screen_incoming() passait bien le numero. Le telephone
+            # etant "dans la poche", l'overlay est presque toujours ouvert
+            # APRES le debut de la sonnerie : c'est donc cette branche qui
+            # servait, et elle affichait le pseudo.
+            # On lit desormais le NUMERO, et lui seul.
+            num = getattr(self, "_phone_peer_numero", None) or ""
+            peer = self._phone_afficher(num) if num else "?"
             if st == "ringing_out":
                 ov.show_screen_outgoing(peer)
             elif st == "ringing_in":
@@ -13704,72 +14653,32 @@ class MainWindow(QMainWindow):
             ov.show_animated()
 
     def _phone_refresh_overlay_contacts(self):
-        """Rafraichit la liste des contacts affichee dans l'overlay a
-        partir de l'annuaire et des joueurs actuellement connectes.
-        No-op si l'overlay n'existe pas encore (rien a rafraichir)."""
+        """[NETTOYAGE 02/08/2026] Ne fait plus que rafraichir l'app
+        affichee et le badge d'accueil.
+
+        Reconstruisait la liste de l'ecran natif, supprime : chaque app
+        reconstruit desormais la sienne dans on_show(). La methode est
+        conservee -- et non supprimee -- parce qu'elle est appelee depuis
+        une dizaine d'endroits (welcome, join, reception de message,
+        photo de profil), et qu'elle reste le point unique ou l'on
+        signale qu'il y a du nouveau a afficher.
+        """
         ov = self._phone_overlay
         if ov is None:
             return
         try:
-            online = set()
-            if _CORE_AVAILABLE:
-                online = set(state.players.keys())
-            my_name = state.my_name if _CORE_AVAILABLE else ""
-            # D4 etape 3 : ensemble des contacts avec MP non lus
-            # -> badge rouge sur leur enveloppe.
-            # Calcul du timestamp du dernier message (sent OU received) par
-            # contact pour le tri par recence (24/05/2026). Les contacts
-            # sans convo n'apparaissent pas dans ce dict -> tri alpha en
-            # fin de liste de leur groupe (connecte / deconnecte).
-            unread_set = set()
-            last_msg_ts_map = {}
-            convos = self._phone_messages.get("conversations", {})
-            for pseudo, c in convos.items():
-                if not isinstance(c, dict):
-                    continue
-                if int(c.get("unread", 0)) > 0:
-                    unread_set.add(pseudo)
-                # Dernier ts de la convo = max sur sent + received.
-                latest = 0.0
-                for m in c.get("sent", []):
-                    try:
-                        ts = float(m.get("ts", 0.0))
-                        if ts > latest:
-                            latest = ts
-                    except Exception:
-                        pass
-                for m in c.get("received", []):
-                    try:
-                        ts = float(m.get("ts", 0.0))
-                        if ts > latest:
-                            latest = ts
-                    except Exception:
-                        pass
-                if latest > 0:
-                    last_msg_ts_map[pseudo] = latest
-            ov.refresh_contacts(
-                self._phone_annuaire, online, my_name,
-                unread_set=unread_set,
-                # [D5] Provider de photos : bytes JPEG en cache ou None.
-                # Aussi, declenche une request asynchrone pour les pseudos
-                # qu'on n'a jamais vus (pour qu'ils s'affichent au refresh
-                # suivant).
-                photo_provider=self._photo_provider_for_contacts,
-                last_msg_ts_map=last_msg_ts_map,
-            )
-            # [build 61] Badge global sur l'icone Messagerie du home :
-            # allume tant qu'AU MOINS un contact a des MP non lus. Branche
-            # ICI (et nulle part ailleurs) car cette fonction est deja le
-            # point de passage oblige de tous les changements d'etat
-            # unread : reception d'un MP, ouverture d'une conversation
-            # (mark_read), reception pendant convo ouverte. Une seule
-            # source de verite = badge toujours coherent.
+            # Badge de non-lu sur l'icone Messagerie de l'accueil.
+            convos = (self._phone_messages or {}).get("conversations", {})
+            non_lu = any(int((c or {}).get("unread", 0) or 0) > 0
+                         for c in convos.values() if isinstance(c, dict))
             if hasattr(ov, "set_home_msg_badge"):
-                ov.set_home_msg_badge(bool(unread_set))
-            if hasattr(ov, "refresh_call_history"):
-                ov.refresh_call_history(self._call_history)
+                ov.set_home_msg_badge(bool(non_lu))
+            app = getattr(ov, "_current_app", None)
+            if app is not None and hasattr(app, "on_show"):
+                app.on_show()
         except Exception as e:
-            self._on_log(f"[PHONE] refresh contacts KO : {e}")
+            self._on_log(f"[PHONE] refresh KO : {e}")
+
 
     def _photo_provider_for_contacts(self, pseudo: str):
         """[D5] Wrapper du provider du manager qui declenche TOUJOURS une
@@ -13794,22 +14703,22 @@ class MainWindow(QMainWindow):
         return b
 
     def _phone_annuaire_enrich(self, pseudos):
-        """Enrichit l'annuaire avec une liste de pseudos vus connectes,
-        sauvegarde si quelque chose a change, et rafraichit l'overlay si
-        celui-ci est ouvert. Appele a la reception de la liste des joueurs
-        (welcome) et a chaque join."""
+        """[CONTACTS 31/07/2026] NE COLLECTE PLUS les pseudos.
+
+        Cette methode ajoutait a l'annuaire local tout joueur vu connecte.
+        C'etait un annuaire par la porte de derriere : il suffisait de
+        rester connecte pour collecter tout le monde, alors que la
+        decision du 30/07 reserve l'annuaire a l'administration et veut
+        que les numeros s'echangent en jeu.
+
+        Elle est conservee -- et non supprimee -- parce qu'elle est
+        appelee depuis le welcome et chaque join, et qu'elle declenche le
+        rafraichissement de l'overlay. Seule la collecte disparait.
+        """
         try:
-            my_name = state.my_name if _CORE_AVAILABLE else ""
-            changed = _phone_enrich_annuaire(
-                self._phone_annuaire, pseudos, my_name
-            )
-            if changed:
-                _phone_save_annuaire(self._phone_annuaire)
-            # Refresh live : meme si l'annuaire n'a pas change (pseudo
-            # deja connu), le statut connecte/deconnecte a pu bouger.
             self._phone_refresh_overlay_contacts()
         except Exception as e:
-            self._on_log(f"[PHONE] enrich annuaire KO : {e}")
+            self._on_log(f"[PHONE] refresh contacts KO : {e}")
 
     @Slot(str)
     def _on_phone_overlay_call(self, pseudo: str):
@@ -13832,6 +14741,15 @@ class MainWindow(QMainWindow):
             ok = False
             self._phone_log(f"[ERREUR] _ws_send_safe : {e}")
         if ok:
+            # [RP 05/08/2026] Cet appel part par PSEUDO, donc le serveur
+            # ne renverra plus de 'target_numero' -- il ne divulgue plus
+            # un numero que l'appelant ne lui a pas donne. Les slots
+            # ringing et busy se rabattent alors sur
+            # _dernier_numero_compose ; si on le laissait tel quel, ils
+            # afficheraient le numero d'un appel PRECEDENT, c'est-a-dire
+            # le nom de QUELQU'UN D'AUTRE. On le vide donc ici : mieux
+            # vaut un affichage neutre qu'un affichage faux.
+            self._dernier_numero_compose = ""
             self._phone_log(f"→ phone_call_request (target={pseudo}) [overlay]")
         else:
             self._phone_log("[ERREUR] Envoi phone_call_request echoue.")
@@ -13851,7 +14769,8 @@ class MainWindow(QMainWindow):
             if _phone_mark_read(self._phone_messages, pseudo):
                 _phone_save_messages(self._phone_messages)
             # Construire la liste chronologique + recuperer le brouillon.
-            items = _phone_merge_messages(self._phone_messages, pseudo)
+            items = self._phone_items_groupe(
+                _phone_merge_messages(self._phone_messages, pseudo))
             convo = self._phone_messages.get("conversations", {}).get(
                 pseudo, {}
             )
@@ -13871,13 +14790,46 @@ class MainWindow(QMainWindow):
         if not target or not body:
             return
         body = body[:PHONE_MAX_BODY_LEN]
+        # [CONTACTS 31/07/2026] `target` est desormais un NUMERO. Les
+        # conversations sont donc indexees par numero, et le nom affiche
+        # est substitue a la lecture depuis le carnet local : renommer ou
+        # supprimer un contact n'a aucun effet sur les conversations
+        # stockees.
+        # Un `target` non numerique est une conversation heritee, indexee
+        # par pseudo : on la laisse partir par l'ancien chemin plutot que
+        # de la casser.
+        # [GROUPES 19/08/2026] Une conversation de groupe a pour cle
+        # "G:<id>", qui n'est ni un numero ni un pseudo. Elle part par une
+        # trame DIFFERENTE : le serveur doit verifier l'appartenance avant
+        # de distribuer, ce que phone_message_send ne fait pas.
+        if _GRP is not None and _GRP.est_cle_groupe(target):
+            # [GROUPES 19/08/2026] Seul dans le groupe = lecture seule. On
+            # arrete AVANT l'envoi et avant le stockage local : stocker un
+            # message que personne ne recevra le ferait apparaitre comme
+            # envoye dans l'historique, ce qui est un mensonge.
+            #
+            # Le serveur refuse aussi de son cote -- cette barriere-ci
+            # existe pour que le refus soit immediat et lisible, pas pour
+            # remplacer la sienne.
+            _g = self._phone_groupe_par_cle(target)
+            if _g is not None and _GRP.est_seul(_g):
+                self._phone_log(
+                    "[GROUPES] Vous êtes seul dans ce groupe : "
+                    "plus personne ne peut recevoir vos messages.")
+                return
+            _msg = {"type": "groupe_envoyer",
+                    "id": _GRP.id_depuis_cle(target),
+                    "body": body}
+        else:
+            _est_numero = str(target).isdigit() and len(str(target)) == 6
+            _msg = {"type": "phone_message_send", "body": body}
+            if _est_numero:
+                _msg["target_numero"] = str(target)
+            else:
+                _msg["target"] = target
         # 1) Envoi WS au serveur.
         try:
-            ok = _core._ws_send_safe({
-                "type":   "phone_message_send",
-                "target": target,
-                "body":   body,
-            })
+            ok = _core._ws_send_safe(_msg)
         except Exception as e:
             ok = False
             self._on_log(f"[PHONE-MSG] _ws_send_safe KO : {e}")
@@ -13989,7 +14941,9 @@ class MainWindow(QMainWindow):
             ov = self._phone_overlay
             if ov is not None and getattr(ov, "_convo_pseudo", "") == pseudo:
                 try:
-                    items = _phone_merge_messages(self._phone_messages, pseudo)
+                    items = self._phone_items_groupe(
+                        _phone_merge_messages(self._phone_messages,
+                                              pseudo))
                     ov.refresh_conversation(items)
                 except Exception:
                     pass
@@ -14033,10 +14987,12 @@ class MainWindow(QMainWindow):
                 _phone_save_messages(self._phone_messages)
             except Exception:
                 pass
-        # Refresh Contacts (au cas ou des MP soient arrives pendant qu'on
-        # etait sur la conversation) + bascule.
+        # [MESSAGERIE 02/08/2026] Retour vers l'app Messagerie, et non
+        # vers l'ecran natif : celui-ci listait les joueurs croises et
+        # n'est plus atteignable depuis l'accueil. Y retomber en quittant
+        # une conversation ramenait le joueur sur un ecran mort.
         self._phone_refresh_overlay_contacts()
-        ov.show_screen_contacts()
+        self._phone_retour_messagerie()
 
     @Slot(str, str)
     def _on_phone_overlay_draft_changed(self, pseudo: str, draft: str):
@@ -14079,24 +15035,56 @@ class MainWindow(QMainWindow):
         """Reception d'un MP texte depuis le serveur. Stocke localement,
         joue la notification audio, met a jour la pastille rouge sur
         l'enveloppe du contact, et rafraichit la conversation si elle
-        est actuellement affichee."""
+        est actuellement affichee.
+
+        [GROUPES 19/08/2026] Un message de groupe arrive par CETTE MEME
+        trame, avec son groupe encode en tete du corps (cf. MSG_PREFIXE).
+        Il est detourne ici vers la cle "G:<id>" : tout le reste du
+        chemin -- stockage, notification, pastille, rafraichissement --
+        fonctionne alors sans modification.
+        """
         if not sender or not body:
             return
+
+        # [GROUPES 19/08/2026] L'AUTEUR est conserve dans le corps, sous
+        # forme de NUMERO. L'ecran de conversation n'affiche pas l'auteur
+        # de chaque bulle -- inutile en tete-a-tete, indispensable a
+        # plusieurs -- et le stocker est le seul moyen de ne pas le
+        # perdre.
+        #
+        # C'est le NUMERO qui est ecrit, jamais le nom : la regle du
+        # projet est que le nom n'est stocke nulle part et se substitue a
+        # l'affichage. Un message deja ecrit reste donc lisible si le
+        # contact est renomme, et la substitution pourra etre ajoutee
+        # plus tard sans migrer les conversations existantes.
+        if _GRP is not None:
+            _gid, _texte = _GRP.decode_message(body)
+            if _gid:
+                # [GROUPES 19/08/2026] Une annonce du serveur (« a quitté
+                # le groupe ») porte un marqueur, retire ICI : il sert a
+                # distinguer l'annonce d'un texte tape, pas a etre lu.
+                # Le marqueur systeme est CONSERVE dans le corps stocke :
+                # c'est lui qui permettra a l'affichage de rendre
+                # l'annonce en texte centre plutot qu'en bulle. Le retirer
+                # ici rendait l'annonce indistinguable d'un message tape.
+                _sys = PHONE_SYS_PREFIX if _GRP.est_systeme(_texte) else ""
+                if _sys:
+                    _texte = _GRP.texte_systeme(_texte)
+                # L'auteur est prefixe au texte : "«420001» salut".
+                # Sans lui, toutes les bulles recues d'un groupe seraient
+                # indistinguables et la conversation illisible des trois
+                # participants. Pour une annonce, l'auteur est CELUI DONT
+                # ON PARLE, ce qui donne « <numero> a quitté le groupe ».
+                body = (f"{_sys}{PHONE_GRP_AUTEUR}{sender}"
+                        f"{PHONE_GRP_FIN} {_texte}")
+                sender = _GRP.cle_conversation(_gid)
         try:
             # 1) Stockage local (recu + increment unread).
             _phone_append_received(self._phone_messages, sender, body, ts)
-            # Si l'expediteur n'est pas encore dans l'annuaire (cas rare :
-            # joueur deja connu sur le serveur mais croise pour la 1re fois
-            # via un MP), on l'ajoute aussi pour qu'il apparaisse dans la
-            # liste. _phone_enrich_annuaire est idempotent.
-            try:
-                my_name = state.my_name if _CORE_AVAILABLE else ""
-                if _phone_enrich_annuaire(
-                    self._phone_annuaire, [sender], my_name
-                ):
-                    _phone_save_annuaire(self._phone_annuaire)
-            except Exception:
-                pass
+            # [CONTACTS 31/07/2026] L'expediteur n'est PLUS ajoute a
+            # l'annuaire : recevoir un message ne doit pas creer un
+            # contact. Le numero apparait dans la conversation, et le
+            # joueur decide lui-meme de l'enregistrer ou non.
             _phone_save_messages(self._phone_messages)
             self._phone_log(
                 f"← phone_message_received de {sender} ({len(body)} char)"
@@ -14296,8 +15284,10 @@ class MainWindow(QMainWindow):
             if getattr(ov, "_settings_origin", "contacts") == "settings":
                 ov.show_screen_settings_app()
             else:
-                ov.show_screen_contacts()
+                # Meme raison : l'ecran natif est mort, on revient a
+                # l'accueil du telephone.
                 self._phone_refresh_overlay_contacts()
+                self._phone_retour_messagerie(accueil=True)
         except Exception:
             pass
 
@@ -14850,6 +15840,25 @@ class MainWindow(QMainWindow):
     # Voir la classe DisplayInfoMaskWindow et la constante
     # DISPLAYINFO_MASK_REF_4K plus haut dans le fichier.
 
+    def _do_mask_toggle(self):
+        """[RACCOURCI MASQUE 28/07/2026] Bascule le masque DisplayInfo.
+
+        Passe par la case des Parametres plutot que d'agir directement :
+        elle reste ainsi le reflet fidele de l'etat, et toute la logique
+        de sauvegarde et d'application est deja dans son handler.
+        """
+        try:
+            nouvel_etat = not bool(
+                self._cfg.get("displayinfo_mask_enabled", False)
+            )
+            self.cb_displayinfo_mask.setChecked(nouvel_etat)
+            # setChecked declenche le signal toggled donc le handler ;
+            # si la case n'existait pas encore, on applique quand meme.
+            if self.cb_displayinfo_mask.isChecked() != nouvel_etat:
+                self._on_displayinfo_mask_toggled(nouvel_etat)
+        except Exception as e:
+            self._on_log(f"[MASK] bascule par raccourci KO : {e}")
+
     @Slot(bool)
     def _on_displayinfo_mask_toggled(self, checked: bool):
         """Toggle de la case 'Masquer la zone DisplayInfo'. Sauve dans
@@ -15376,6 +16385,7 @@ class MainWindow(QMainWindow):
             ("lbl_mute_all_key",   "mute_all_key"),
             ("lbl_prox_short_key", "proximity_short_key"),
             ("lbl_cycle_ch_key",   "cycle_channel_key"),
+            ("lbl_mask_toggle_key", "mask_toggle_key"),
             # CircusPhone (D4 etape 4)
             ("lbl_phone_open_key",    "phone_open_key"),
             ("lbl_phone_accept_key",  "phone_accept_key"),
@@ -15432,6 +16442,14 @@ class MainWindow(QMainWindow):
         try: _core._dbg_log("[HOTKEY] cycle_channel press")
         except Exception: pass
         self._sig_hotkey.emit("cycle_channel")
+
+    def _on_hotkey_mask_toggle(self):
+        # [RACCOURCI MASQUE 28/07/2026] Appele depuis le thread du
+        # listener clavier : on ne touche a rien ici, on passe par le
+        # signal qui rebascule sur le thread UI.
+        try: _core._dbg_log("[HOTKEY] mask_toggle press")
+        except Exception: pass
+        self._sig_hotkey.emit("mask_toggle")
 
     def _on_hotkey_profile_pressed(self):
         try: state.profile_radio_active = True
@@ -15533,6 +16551,7 @@ class MainWindow(QMainWindow):
             "mute_all":      self._do_toggle_mute_all,
             "prox_short":    self._do_toggle_prox_short,
             "cycle_channel": self._do_cycle_channel,
+            "mask_toggle":   self._do_mask_toggle,
             # CircusPhone (D4 etape 4)
             "phone_open":    self._do_phone_open,
             "phone_accept":  self._do_phone_accept,
@@ -15669,6 +16688,7 @@ class MainWindow(QMainWindow):
             "mute_all":      ("Mute tout",              "mute_all_key",        "mute_all_key"),
             "prox_short":    ("Proximite 30m / 5m",    "proximity_short_key", "proximity_short_key"),
             "cycle_channel": ("Cycle canal radio",     "cycle_channel_key",   "cycle_channel_key"),
+            "mask_toggle":   ("Masque DisplayInfo",    "mask_toggle_key",     "mask_toggle_key"),
             # CircusPhone (D4 etape 4)
             "phone_open":    ("Ouvrir / Fermer telephone", "phone_open_key",   "phone_open_key"),
             "phone_accept":  ("Decrocher",                 "phone_accept_key", "phone_accept_key"),
@@ -16084,9 +17104,19 @@ class MainWindow(QMainWindow):
             from circusvoip_audio_io import (
                 NOISE_SUPPRESSION_AVAILABLE,
                 _NS_IMPORT_ERR,
+                ns_ready,
             )
-            ns_available = bool(NOISE_SUPPRESSION_AVAILABLE)
-            ns_import_err = _NS_IMPORT_ERR
+            # [CHARGEMENT DIFFERE 28/07/2026] pyrnnoise est importe en
+            # tache de fond. Appeler ns_ready() ICI bloquait la
+            # construction de la fenetre jusqu'a la fin du chargement :
+            # l'attente etait deplacee, pas supprimee (constructeur
+            # MainWindow mesure a 4,35 s au lieu de 0,4 s).
+            # On construit donc la case en supposant le module
+            # disponible, et _poll_ns_ready() corrigera son etat quand le
+            # chargement sera termine — sans bloquer quoi que ce soit.
+            ns_available = True
+            ns_import_err = None
+            QTimer.singleShot(300, self._poll_ns_ready)
         except Exception as e:
             ns_available = False
             ns_import_err = str(e)
@@ -16121,6 +17151,29 @@ class MainWindow(QMainWindow):
             self._on_noise_suppression_toggled
         )
         v.addWidget(self.cb_noise_suppression)
+
+        # [PROXIMITE VERTICALE 28/07/2026] Test opt-in, desactive par
+        # defaut. Dans un vaisseau, l'ecart vertical entre deux joueurs
+        # est multiplie avant le calcul de distance : quelqu'un 2 m
+        # au-dessus, sur le pont superieur, passe de 100 % a 16 % de
+        # volume au lieu d'etre entendu comme s'il etait a cote.
+        # Sans effet ailleurs (stations, hangars, planetes, grottes,
+        # espace) ni a l'horizontale.
+        self.cb_vertical_prox = QCheckBox(
+            "Attenuation verticale dans les vaisseaux (test)"
+        )
+        self.cb_vertical_prox.setChecked(
+            bool(self._cfg.get("vertical_prox_enabled", False))
+        )
+        self.cb_vertical_prox.setToolTip(
+            "Attenue la voix des joueurs situes sur un autre pont du meme "
+            "vaisseau.\nSans effet dans les stations, hangars, planetes et "
+            "grottes."
+        )
+        self.cb_vertical_prox.toggled.connect(
+            self._on_vertical_prox_toggled
+        )
+        v.addWidget(self.cb_vertical_prox)
 
         # ----- Sliders volume (v0.2) ----------------------------------
         # 3 sliders 0..200 % (defaut 100 %) qui controlent les sons
@@ -16288,11 +17341,28 @@ class MainWindow(QMainWindow):
         # Restaurer la selection sauvee (par label)
         saved_mic = self._cfg.get("mic_label")
         saved_out = self._cfg.get("out_label")
+        # [AUDIO 31/07/2026] Le libelle enregistre peut ne plus exister :
+        # casque eteint au lancement, peripherique renomme par le pilote,
+        # troncature MME differente d'une session a l'autre. Avant,
+        # findText renvoyait -1, rien n'etait selectionne, et le repli
+        # automatique ne s'executait JAMAIS puisqu'il vivait dans le
+        # 'else'. Le champ restait sur "(aucun)" -> "Selection invalide"
+        # -> aucun audio, et jusqu'au 31/07 aucun OCR ni telephone non
+        # plus. Cas frequent chez les testeurs et constate en session.
+        _mic_retrouve = False
         if saved_mic:
             idx = self.cb_mic.findText(saved_mic)
             if idx >= 0:
                 self.cb_mic.setCurrentIndex(idx)
-        else:
+                _mic_retrouve = True
+            elif _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        f"[AUDIO] micro enregistre introuvable : "
+                        f"{saved_mic!r} -> selection automatique")
+                except Exception:
+                    pass
+        if not _mic_retrouve:
             # Defaut : device par defaut systeme
             matched = False
             try:
@@ -16352,11 +17422,20 @@ class MainWindow(QMainWindow):
                             except Exception:
                                 pass
                         break
+        _out_retrouve = False
         if saved_out:
             idx = self.cb_out.findText(saved_out)
             if idx >= 0:
                 self.cb_out.setCurrentIndex(idx)
-        else:
+                _out_retrouve = True
+            elif _CORE_AVAILABLE:
+                try:
+                    _core._dbg_log(
+                        f"[AUDIO] sortie enregistree introuvable : "
+                        f"{saved_out!r} -> selection automatique")
+                except Exception:
+                    pass
+        if not _out_retrouve:
             matched = False
             try:
                 default_id = default_output_device()
@@ -16563,8 +17642,34 @@ class MainWindow(QMainWindow):
                      f"out='{out_label}' (id={out_id})")
 
         if mic_id is None or mic_id < 0 or out_id is None or out_id < 0:
-            self._on_log("[AUDIO] Selection invalide (aucun device choisi), "
-                         "demarrage annule. Choisir un micro et une sortie.")
+            # [DECOUPLAGE 31/07/2026] Meme faute que le 26/07, une branche
+            # plus tot : ce return sortait AVANT _start_boot_threads(),
+            # donc un client sans peripherique choisi n'avait ni OCR, ni
+            # position, ni proximite, ni telephone -- pour une raison
+            # purement audio. Cas observe chez les testeurs au tout
+            # premier lancement, quand rien n'est encore configure.
+            # L'audio ne demarre pas (il n'y a rien a demarrer), mais tout
+            # le reste doit tourner : un joueur sans audio doit apparaitre
+            # sur la carte et pouvoir ouvrir son telephone.
+            self._on_log("[AUDIO] Aucun peripherique choisi : audio non "
+                         "demarre. Choisissez un micro et une sortie dans "
+                         "les Parametres. Le reste du client fonctionne.")
+            try:
+                self.lbl_mic_status.setVisible(True)
+            except Exception:
+                pass
+            # audio_io est cree malgre tout : les threads de boot s'en
+            # servent pour brancher le callback de capture, et la
+            # selection ulterieure d'un peripherique reutilisera
+            # l'instance sans repasser par ici.
+            if state.audio_io is None:
+                try:
+                    state.audio_io = AudioIO()
+                    state.audio_io.set_on_capture(self._audio_capture_noop)
+                except Exception as e:
+                    self._on_log(f"[AUDIO] AudioIO() KO : {e}")
+            if not self._core_threads_started:
+                self._start_boot_threads()
             return
 
         # Premier appel : creer l'instance AudioIO
@@ -16629,7 +17734,69 @@ class MainWindow(QMainWindow):
                 self._on_log(f"[AUDIO] set_mic_gain/gate KO : {e}")
 
         try:
+            # [MICRO FALLBACK 26/07/2026] Le peripherique choisi peut
+            # refuser de s'ouvrir : Windows expose le meme micro sous
+            # plusieurs API, et celle retenue n'est pas toujours
+            # utilisable. Cas observe le 26/07 : le casque Corsair
+            # apparait en MME (fonctionne) ET en WDM-KS (PaErrorCode
+            # -9996 "Invalid device"). La deduplication par nom ne les
+            # confond pas, car Windows leur donne des libelles
+            # differents ("CORSAIR" vs "Corsair Audio Device").
+            # S'y ajoute l'instabilite des identifiants : le meme micro
+            # etait id=2 le matin et id=31 l'apres-midi.
+            # Plutot que d'abandonner, on essaie les autres candidats.
             ok_in = state.audio_io.start_capture(mic_id)
+            if not ok_in:
+                try:
+                    from circusvoip_audio_io import list_input_devices
+                    for _cand_id, _cand_label in list_input_devices():
+                        if _cand_id == mic_id:
+                            continue
+                        self._on_log(f"[AUDIO] Micro {mic_id} refuse, essai "
+                                     f"de '{_cand_label}' (id={_cand_id})")
+                        if state.audio_io.start_capture(_cand_id):
+                            ok_in = True
+                            mic_id = _cand_id
+                            self._on_log(f"[AUDIO] Micro de repli retenu : "
+                                         f"'{_cand_label}' (id={_cand_id})")
+                            # Aligner la liste deroulante sur le
+                            # peripherique reellement ouvert, sinon
+                            # l'interface afficherait un micro qui ne
+                            # sert pas.
+                            try:
+                                _i = self.cb_mic.findData(_cand_id)
+                                if _i >= 0:
+                                    # Le blocage des signaux est VOLONTAIRE :
+                                    # sans lui, setCurrentIndex declencherait
+                                    # _on_audio_device_change, qui sauve la
+                                    # config et REDEMARRE la capture -- en
+                                    # pleine sequence de demarrage, et en
+                                    # ecrivant le micro de repli a la place
+                                    # du choix du joueur.
+                                    self.cb_mic.blockSignals(True)
+                                    self.cb_mic.setCurrentIndex(_i)
+                                    self.cb_mic.blockSignals(False)
+                                    # [AFFICHAGE 06/08/2026] Mais bloquer le
+                                    # signal empeche aussi
+                                    # _refresh_mic_pick_label de tourner : le
+                                    # bouton gardait le libelle pose au
+                                    # peuplement, tandis que le combo pointait
+                                    # sur le micro de repli. D'ou un bouton
+                                    # affichant un micro et une popup en
+                                    # surlignant un autre -- la popup disant
+                                    # vrai, puisqu'elle lit currentText().
+                                    # On rafraichit donc a la main, APRES
+                                    # avoir leve le blocage : l'affichage
+                                    # suit sans rouvrir la boucle.
+                                    try:
+                                        self._refresh_mic_pick_label()
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            break
+                except Exception as _e:
+                    self._on_log(f"[AUDIO] Repli micro impossible : {_e}")
             ok_out = state.audio_io.start_playback(out_id)
         except Exception as e:
             self._on_log(f"[AUDIO] start KO : {e}")
@@ -16641,14 +17808,41 @@ class MainWindow(QMainWindow):
         if ok_in and ok_out:
             self._on_log(f"[AUDIO] Capture + lecture OK "
                          f"(mic_id={mic_id}, out_id={out_id})")
-            # Premier demarrage audio reussi : c'est le moment de lancer
-            # les threads OCR/heartbeat qui ont besoin de audio_io existant
-            # pour brancher set_on_capture.
-            if not self._core_threads_started:
-                self._start_boot_threads()
         else:
+            # [DECOUPLAGE 26/07/2026] Avant, _start_boot_threads() n'etait
+            # appele QUE si la capture micro reussissait. Un micro qui
+            # refuse de s'ouvrir privait donc le client de TOUT le reste :
+            # pas d'OCR, donc pas de position, pas de proximite, pas de
+            # radio, pas de heartbeat. Le seul indice etait cette ligne de
+            # log discrete, et un simple relancement "reglait" le probleme
+            # (l'enumeration des peripheriques retombant parfois sur une
+            # API qui fonctionne).
+            # Cas observe : le micro Corsair est expose sous plusieurs API
+            # Windows ; la selection automatique a pris la variante WDM-KS
+            # (id=31) qui refuse l'ouverture avec PaErrorCode -9996, alors
+            # que la variante MME (id=2) fonctionnait au demarrage
+            # precedent.
+            # Un joueur sans micro doit pouvoir entendre les autres et
+            # apparaitre sur la carte : les threads ne dependent que de
+            # l'EXISTENCE de audio_io (pour brancher set_on_capture), pas
+            # d'une capture fonctionnelle.
             self._on_log(f"[AUDIO] Demarrage partiel : "
                          f"in={ok_in} out={ok_out}")
+            if not ok_in:
+                self._on_log("[AUDIO] MICRO INDISPONIBLE - vous entendez "
+                             "les autres mais personne ne vous entend. "
+                             "Choisissez un autre peripherique dans les "
+                             "Parametres, ou relancez le client.")
+        # [MICRO VISIBLE 28/07/2026] Refleter l'etat dans la barre du haut.
+        try:
+            self.lbl_mic_status.setVisible(not ok_in)
+        except Exception:
+            pass
+
+        # Les threads OCR / helmet / heartbeat sont lances dans TOUS les
+        # cas, y compris capture KO (cf. commentaire ci-dessus).
+        if not self._core_threads_started:
+            self._start_boot_threads()
 
     def _audio_capture_noop(self, frame_np):
         """Callback de capture par defaut en 2b : ne fait rien.
@@ -16705,6 +17899,53 @@ class MainWindow(QMainWindow):
             self.vu.setGate(int(value * 100 / 60))
 
     @Slot(bool)
+    def _poll_ns_ready(self):
+        """[CHARGEMENT DIFFERE 28/07/2026] Ajuste la case « Suppression de
+        bruit » quand pyrnnoise a fini de se charger en tache de fond.
+
+        Re-planifie tant que le chargement est en cours, plutot que
+        d'attendre : c'est ce qui permet a la fenetre de s'afficher
+        immediatement. Abandonne au bout de ~15 s pour ne pas boucler
+        indefiniment si le module est introuvable.
+        """
+        try:
+            from circusvoip_audio_io import (
+                _ns_import_thread, NOISE_SUPPRESSION_AVAILABLE, _NS_IMPORT_ERR
+            )
+            if _ns_import_thread.is_alive():
+                self._ns_poll_count = getattr(self, "_ns_poll_count", 0) + 1
+                if self._ns_poll_count < 50:
+                    QTimer.singleShot(300, self._poll_ns_ready)
+                return
+            if NOISE_SUPPRESSION_AVAILABLE:
+                return          # cas nominal : la case est deja correcte
+            self.cb_noise_suppression.setChecked(False)
+            self.cb_noise_suppression.setEnabled(False)
+            self.cb_noise_suppression.setToolTip(
+                "Module pyrnnoise non installe sur ce client."
+            )
+            self._on_log(f"[AUDIO] pyrnnoise indisponible : {_NS_IMPORT_ERR}")
+        except Exception:
+            pass
+
+    def _on_vertical_prox_toggled(self, checked: bool):
+        """Active/desactive la ponderation verticale de la proximite.
+
+        Le flag est lu par la boucle de calcul de distance dans core, a
+        chaque tour : le changement prend effet immediatement, sans
+        reconnexion.
+        """
+        try:
+            if _CORE_AVAILABLE:
+                _core.state.vertical_prox_enabled = bool(checked)
+        except Exception as e:
+            self._on_log(f"[PROX] toggle vertical KO : {e}")
+        self._cfg["vertical_prox_enabled"] = bool(checked)
+        self._on_log(
+            "[PROX] Attenuation verticale dans les vaisseaux : "
+            + ("activee" if checked else "desactivee")
+        )
+
     def _on_noise_suppression_toggled(self, checked: bool):
         """Toggle suppression de bruit (RNNoise via pyrnnoise).
         Si pyrnnoise n'est pas installe, le set_noise_suppression sur
@@ -16853,7 +18094,44 @@ class MainWindow(QMainWindow):
                 self.btn_mute_radio.setStyleSheet("")
 
     @Slot()
+    def _check_audio_devices(self):
+        """Surveille la perte d'un peripherique en cours de session.
+
+        Appele depuis le tick du VU-metre, mais espace a ~2 s : la
+        verification interroge PortAudio, inutile de le faire 30 fois par
+        seconde. On ne tente aucune reouverture automatique -- rouvrir
+        un flux sous les pieds du joueur pendant qu'il parle serait pire
+        que le probleme.
+        """
+        try:
+            now = time.monotonic()
+            if now - getattr(self, "_last_dev_check", 0.0) < 2.0:
+                return
+            self._last_dev_check = now
+            audio = getattr(state, "audio_io", None) if _CORE_AVAILABLE else None
+            if audio is None:
+                return
+            panne = audio.check_devices()
+            if panne == getattr(self, "_derniere_panne_audio", ""):
+                return          # etat inchange : ni log ni clignotement
+            self._derniere_panne_audio = panne
+            if panne:
+                self.lbl_audio_lost.setText(f"AUDIO PERDU : {panne}")
+                self.lbl_audio_lost.setToolTip(
+                    "Le peripherique a ete deconnecte ou eteint. "
+                    "Rebranchez-le puis re-selectionnez-le dans les "
+                    "Parametres. Le reste du client continue de "
+                    "fonctionner.")
+                self.lbl_audio_lost.setVisible(True)
+                self._on_log(f"[AUDIO] Peripherique perdu : {panne}")
+            else:
+                self.lbl_audio_lost.setVisible(False)
+                self._on_log("[AUDIO] Peripheriques de nouveau operationnels")
+        except Exception:
+            pass
+
     def _vu_tick(self):
+        self._check_audio_devices()
         """Timer ~30Hz : lit le RMS courant et met a jour la barre VU."""
         if state.audio_io is None:
             return
@@ -16891,6 +18169,10 @@ class MainWindow(QMainWindow):
         self._worker.sig_player_pos.connect(self._on_player_pos)
         self._worker.sig_player_offline.connect(self._on_player_offline)
         self._worker.sig_players_reset.connect(self._on_players_reset)
+        self._worker.sig_join_accepted.connect(self._remember_server)
+        # [DISCORD 30/07/2026] Le numero arrive dans le welcome : c'est la
+        # connexion qui le fait exister, pas la liaison.
+        self._worker.sig_join_accepted.connect(self._remember_numero)
         self._worker.sig_log.connect(self._on_log)
         self._worker.sig_invalid_token.connect(self._on_invalid_token)
         self._worker.sig_anonymous_mode.connect(self._on_anonymous_mode)
@@ -16915,6 +18197,12 @@ class MainWindow(QMainWindow):
         self._worker.sig_phone_ended.connect(self._on_phone_ended)
         self._worker.sig_phone_server_msg.connect(self._on_phone_server_msg)
         # CircusPhone (D4 etape 3) : reception d'un MP texte.
+        self._worker.sig_travail_etat.connect(self._on_travail_etat)
+        self._worker.sig_groupe_etat.connect(self._on_groupe_etat)
+        self._worker.sig_message_refuse.connect(self._on_message_refuse)
+        self._worker.sig_urgence_etat.connect(self._on_urgence_etat)
+        self._worker.sig_urgence_notif.connect(self._on_urgence_notif)
+        self._worker.sig_travail_notif.connect(self._on_travail_notif)
         self._worker.sig_phone_message_received.connect(
             self._on_phone_message_received
         )
@@ -16938,7 +18226,212 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Slots UI (main thread)
     # ------------------------------------------------------------------
+    # ---------------------------------------------
+    #  [HISTORIQUE SERVEURS 28/07/2026]
+    # ---------------------------------------------
+    # Format en config : "server_history": [{"server": "ip:port",
+    # "token": "..."}, ...], le plus recent en tete, 5 entrees maximum.
+    # Une entree n'est ajoutee QU'APRES un join accepte par le serveur :
+    # une simple ouverture de socket ne prouve rien, et on memoriserait
+    # des mots de passe faux.
+
+    SERVER_HISTORY_MAX = 5
+
+    def _get_server_history(self) -> list:
+        h = self._cfg.get("server_history")
+        if not isinstance(h, list):
+            return []
+        out = []
+        for e in h:
+            if isinstance(e, dict) and e.get("server"):
+                out.append({"server": str(e["server"]),
+                            "token": str(e.get("token", ""))})
+        return out[:self.SERVER_HISTORY_MAX]
+
+    def _reload_server_history(self):
+        """Remplit la liste deroulante depuis la config."""
+        try:
+            txt = self.ed_ip.text() if hasattr(self, "ed_ip") else ""
+        except Exception:
+            txt = ""
+        self.cb_server.blockSignals(True)
+        self.cb_server.clear()
+        for e in self._get_server_history():
+            self.cb_server.addItem(e["server"], e.get("token", ""))
+        self.cb_server.blockSignals(False)
+        if txt:
+            self.ed_ip.setText(txt)
+
+    def _delete_server_history_entry(self, row: int):
+        """Retire une entree de l'historique, mot de passe compris.
+
+        Pas de confirmation : le geste est peu couteux a annuler, l'entree
+        se recreant d'elle-meme a la prochaine connexion reussie sur ce
+        serveur.
+        """
+        try:
+            hist = self._get_server_history()
+            if not (0 <= row < len(hist)):
+                return
+            retiree = hist.pop(row)
+            self._cfg["server_history"] = hist
+            _save_cfg(self._cfg)
+            self._reload_server_history()
+            # La liste ouverte est devenue obsolete : on la referme plutot
+            # que d'afficher des lignes qui ne correspondent plus aux
+            # donnees.
+            try:
+                self.cb_server.hidePopup()
+            except Exception:
+                pass
+            self._on_log(
+                f"[CONFIG] Serveur retire de l'historique : "
+                f"{retiree.get('server', '?')}"
+            )
+        except Exception as e:
+            self._on_log(f"[CONFIG] suppression historique KO : {e}")
+
+    @Slot(int)
+    def _on_server_history_pick(self, index: int):
+        """Selection d'une entree : remplit aussi le mot de passe."""
+        if index < 0:
+            return
+        try:
+            tok = self.cb_server.itemData(index)
+            if tok:
+                self.ed_pw.setText(str(tok))
+        except Exception:
+            pass
+
     @Slot()
+    def _remember_server(self):
+        """Enregistre le serveur courant APRES un join accepte.
+
+        Deduplique sur l'adresse : se reconnecter au meme serveur remonte
+        l'entree en tete et met son mot de passe a jour, plutot que de
+        creer un doublon.
+        """
+        try:
+            srv = (self.ed_ip.text() or "").strip()
+            if not srv:
+                return
+            tok = self.ed_pw.text() or ""
+            hist = [e for e in self._get_server_history()
+                    if e["server"] != srv]
+            hist.insert(0, {"server": srv, "token": tok})
+            self._cfg["server_history"] = hist[:self.SERVER_HISTORY_MAX]
+            _save_cfg(self._cfg)
+            self._reload_server_history()
+        except Exception as e:
+            try:
+                self._on_log(f"[CONFIG] historique serveur KO : {e}")
+            except Exception:
+                pass
+
+    @Slot()
+    def _remember_numero(self):
+        """Memorise le numero recu dans le welcome et rafraichit l'etat.
+
+        Slot Qt (thread UI) : la sauvegarde de config ne se fait donc pas
+        depuis le thread reseau.
+        """
+        try:
+            num = getattr(state, "my_numero", None) if _CORE_AVAILABLE else None
+            if not num or self._cfg.get("account_numero") == num:
+                return
+            self._cfg["account_numero"] = num
+            if _CORE_AVAILABLE:
+                core_cfg = _core._load_client_cfg()
+                core_cfg["account_numero"] = num
+                _core._save_client_cfg(core_cfg)
+            else:
+                _save_cfg(self._cfg)
+            self._on_log(f"[ANNUAIRE] Numéro attribué : {num}")
+        except Exception as e:
+            self._on_log(f"[ANNUAIRE] Échec mémorisation du numéro : {e}")
+
+    def _refresh_account_label(self):
+        """Affiche le numero si le compte est relie, sinon invite a le
+        faire. C'est aussi l'indicateur "Connecte via Discord" du
+        backlog (point 18)."""
+        try:
+            # L'etat n'affiche QUE la liaison. Le numero de telephone
+            # releve de l'annuaire et du CircusPhone, pas de l'ecran de
+            # connexion : les melanger laissait croire que Discord sert a
+            # attribuer un numero, alors qu'il ne sert qu'a identifier.
+            # Remet aussi le style par defaut : le label sert d'alerte
+            # rouge quand on tente de se connecter sans compte.
+            if self._cfg.get("account_token"):
+                self.lbl_account.setText("Relié")
+                self.lbl_account.setStyleSheet(f"color: {THEME_GREEN};")
+                self.btn_discord.setText("RELIER À NOUVEAU")
+            else:
+                self.lbl_account.setText("Aucun compte relié")
+                self.lbl_account.setStyleSheet(f"color: {THEME_ORANGE};")
+                self.btn_discord.setText("COMPTE DISCORD")
+        except Exception:
+            pass
+
+    def _on_link_discord(self):
+        """Ouvre la fenetre de liaison Discord.
+
+        Necessite l'adresse du serveur ET le mot de passe : la liaison
+        passe par le serveur, qui exige son token avant de consommer un
+        numero. On les lit dans les champs plutot que dans la config,
+        pour que l'utilisateur puisse relier un serveur qu'il vient de
+        saisir sans avoir a se connecter d'abord.
+        """
+        try:
+            from circusvoip_discord_link import DiscordLinkDialog
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Compte Discord",
+                f"Module de liaison indisponible :\n{e}")
+            return
+
+        ip = (self.ed_ip.text() or "").strip()
+        pw = self.ed_pw.text() or ""
+        if not ip:
+            QMessageBox.warning(self, "Compte Discord",
+                                "Renseignez d'abord l'adresse du serveur.")
+            return
+        if not pw:
+            QMessageBox.warning(
+                self, "Compte Discord",
+                "Renseignez le mot de passe du serveur : la liaison passe "
+                "par lui.")
+            return
+
+        host, port = _split_host_port(ip, SERVER_PORT)
+        dlg = DiscordLinkDialog(host, pw, port, parent=self)
+        if dlg.exec() != QDialog.Accepted or not dlg.result_data:
+            return
+
+        res = dlg.result_data
+        # Ces trois cles sont core-managed : elles survivent au _save_cfg
+        # de fermeture, sinon le jeton serait perdu a chaque session.
+        self._cfg["account_token"]  = res.get("account_token", "")
+        self._cfg["account_pseudo"] = res.get("pseudo", "")
+        # Pas de numero ici : il arrive dans le welcome, a la connexion.
+        try:
+            if _CORE_AVAILABLE:
+                core_cfg = _core._load_client_cfg()
+                core_cfg["account_token"]  = self._cfg["account_token"]
+                core_cfg["account_pseudo"] = self._cfg["account_pseudo"]
+                _core._save_client_cfg(core_cfg)
+            else:
+                _save_cfg(self._cfg)
+        except Exception as e:
+            self._on_log(f"[DISCORD] Échec sauvegarde du compte : {e}")
+
+        # Le pseudo n'est PAS fixe ici : il reste celui du champ Nom, et
+        # c'est la connexion qui le valide (cf authenticate_join). On ne
+        # touche donc pas a ed_name.
+        self._refresh_account_label()
+        self._on_log(
+            f"[DISCORD] {'Compte retrouvé' if res.get('existing') else 'Compte relié'}")
+        QMessageBox.information(self, "Compte Discord", "Compte relié.")
+
     def _on_toggle_connect(self):
         if state.connected:
             self._do_disconnect()
@@ -16946,6 +18439,20 @@ class MainWindow(QMainWindow):
             self._do_connect()
 
     def _do_connect(self):
+        # [DISCORD 30/07/2026] Compte obligatoire. Bloque AVANT d'ouvrir
+        # la connexion : le serveur refuserait de toute facon (cf
+        # REQUIRE_ACCOUNT), mais il fermerait le socket avec un message
+        # que le joueur ne relierait pas forcement a Discord. Autant le
+        # dire ici, a l'endroit ou se trouve le bouton qui resout le
+        # probleme.
+        if not self._cfg.get("account_token"):
+            self.lbl_account.setText(
+                "Reliez votre compte Discord pour vous connecter")
+            self.lbl_account.setStyleSheet(
+                f"color: {THEME_RED}; font-weight: bold;")
+            self._on_log("[COMPTE] Connexion refusée : aucun compte relié.")
+            return
+
         name = self.ed_name.text().strip() or DEFAULT_NAME
         ip = self.ed_ip.text().strip() or DEFAULT_IP
         pw = self.ed_pw.text()
@@ -16964,10 +18471,22 @@ class MainWindow(QMainWindow):
         # Si l'IP contient un /path apres le host, on coupe.
         if "/" in ip:
             ip = ip.split("/", 1)[0]
-        # Si l'utilisateur a explicitement mis un port (ex: "1.2.3.4:8888")
-        # on le retire car SERVER_PORT est constant.
+        # [PORTS CONFIGURABLES 26/07/2026] Le port saisi est desormais
+        # CONSERVE. Ce nettoyage datait de l'epoque ou SERVER_PORT etait
+        # une constante : il retirait le ":port", et mon parsing en aval
+        # recevait donc une adresse deja amputee — l'hote etait correct
+        # mais le port toujours celui par defaut.
+        # On valide juste que la partie port est numerique et dans la
+        # plage ; sinon on la retire, comme avant, plutot que de laisser
+        # passer une saisie qui ferait echouer la connexion sans que
+        # l'utilisateur comprenne pourquoi.
         if ip.count(":") == 1:
-            ip = ip.split(":", 1)[0]
+            _h, _, _p = ip.partition(":")
+            _p = _p.strip()
+            if _p.isdigit() and 1 <= int(_p) <= 65535:
+                ip = f"{_h.strip()}:{_p}"
+            else:
+                ip = _h
         ip = ip.strip()
 
         # Pseudo : caracteres autorises pour eviter les surprises
@@ -17038,6 +18557,29 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText(txt)
             self._set_status_style(False)
             self.btn_toggle.setText("CONNECTER")
+
+            # [UX 10/08/2026] Compte refuse : l'etat de liaison doit
+            # suivre.
+            #
+            # Le jeton est toujours dans la config, donc
+            # _refresh_account_label affichait "Relie" en VERT pendant que
+            # le bandeau rouge demandait de relier le compte. Deux
+            # elements de la meme fenetre se contredisaient, et le vert
+            # -- couleur de ce qui va bien -- invitait a ne rien faire.
+            #
+            # On ne touche PAS a la config : le jeton reste ecrit, au cas
+            # ou le refus viendrait du serveur et non du compte. Seul
+            # l'affichage change, et il se remettra tout seul a la
+            # prochaine connexion reussie.
+            try:
+                if "compte n'est plus reconnu" in (message or "") \
+                        or "demande un compte relie" in (message or ""):
+                    self.lbl_account.setText("À relier")
+                    self.lbl_account.setStyleSheet(
+                        f"color: {THEME_ORANGE}; font-weight: bold;")
+                    self.btn_discord.setText("RELIER À NOUVEAU")
+            except Exception:
+                pass
             # CircusPhone (D1) : connexion perdue -> tout appel en cours
             # est termine cote serveur, on remet l'etat phone au repos.
             try:
@@ -18011,8 +19553,22 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # Set l'IP audio AVANT que le nouveau thread ne s'en serve
-        state.audio_server_ip = server_ip
+        # Set l'IP audio AVANT que le nouveau thread ne s'en serve.
+        # [PORTS CONFIGURABLES 26/07/2026] On stocke l'HOTE SEUL : le
+        # champ Serveur peut contenir "ip:port", et core construit son
+        # URI en y ajoutant AUDIO_PORT. Sans ce nettoyage on obtiendrait
+        # "wss://51.210.20.30:9443:8889", invalide.
+        # [PORTS CONFIGURABLES 28/07/2026] Invalider le ticket AVANT de
+        # relancer le thread audio. Le ticket est propre a un serveur ;
+        # le laisser en place faisait sortir immediatement la boucle
+        # d'attente du welcome cote core, qui se connectait alors avec le
+        # port du serveur PRECEDENT (WinError 1225 observe a 21:50, puis
+        # reussite 3 s plus tard une fois le bon port applique).
+        try:
+            state.audio_ticket = ""
+        except Exception:
+            pass
+        state.audio_server_ip = _split_host_port(server_ip, SERVER_PORT)[0]
         state.audio_connected = False  # sera mis a True par le nouveau thread
 
         # Si un ancien thread tourne encore, on le laisse mourir tout seul.
@@ -18034,7 +19590,14 @@ class MainWindow(QMainWindow):
             name="c2-audio-ws",
         )
         self._audio_ws_thread.start()
-        self._on_log(f"[AUDIO] Thread WS audio demarre (serveur {server_ip}:8889)")
+        # [PORTS CONFIGURABLES] Le port audio n'est pas 8889 en dur et ne
+        # peut pas etre connu ici : le thread demarre AVANT l'arrivee du
+        # welcome qui l'annonce. On logge donc l'hote seul (nettoye du
+        # ":port" eventuellement saisi) ; le port reel apparait ensuite
+        # dans "[NET] Port audio annonce par le serveur".
+        self._on_log(
+            f"[AUDIO] Thread WS audio demarre (serveur "
+            f"{_split_host_port(server_ip, SERVER_PORT)[0]})")
 
     def _start_boot_threads(self):
         """Au boot : demarre OCR + heartbeat + helmet + radio listener.
@@ -18084,6 +19647,7 @@ class MainWindow(QMainWindow):
             state.mute_radio_key       = _canon(core_cfg.get("mute_radio_key"))
             state.mute_all_key         = _canon(core_cfg.get("mute_all_key"))
             state.proximity_short_key  = _canon(core_cfg.get("proximity_short_key"))
+            state.mask_toggle_key      = _canon(core_cfg.get("mask_toggle_key"))
             state.cycle_channel_key    = _canon(core_cfg.get("cycle_channel_key"))
             # --- CircusPhone (build 62) : raccourcis par defaut F6-F10 ---
             # Avant le b62 ces 5 cles etaient vides ; la fonctionnalite etait
@@ -18121,10 +19685,17 @@ class MainWindow(QMainWindow):
             state.phone_mute_key     = _canon(core_cfg.get("phone_mute_key"))
             state.phone_speaker_key  = _canon(core_cfg.get("phone_speaker_key"))
             state.rp_mode              = bool(core_cfg.get("rp_mode", False))
+            # [PROXIMITE VERTICALE 28/07/2026] Appliquer aussi au boot,
+            # pas seulement au clic dans les Parametres : sinon le
+            # reglage etait perdu a chaque relancement.
+            state.vertical_prox_enabled = bool(
+                core_cfg.get("vertical_prox_enabled", False)
+            )
             self._on_log(
                 f"[CONFIG] Chargee : radio_key={state.radio_key!r} "
                 f"profile_key={state.profile_radio_key!r} "
-                f"rp_mode={state.rp_mode}"
+                f"rp_mode={state.rp_mode} "
+                f"prox_verticale={state.vertical_prox_enabled}"
             )
         except Exception as e:
             self._on_log(f"[CONFIG] Erreur chargement : {e}")
@@ -18139,6 +19710,7 @@ class MainWindow(QMainWindow):
                 on_all           = self._on_hotkey_mute_all,
                 on_prox_short    = self._on_hotkey_prox_short,
                 on_cycle_channel = self._on_hotkey_cycle_channel,
+                on_toggle_mask   = self._on_hotkey_mask_toggle,
                 on_profile_radio_pressed  = self._on_hotkey_profile_pressed,
                 on_profile_radio_released = self._on_hotkey_profile_released,
                 # CircusPhone (D4 etape 4) : 5 raccourcis telephone.
@@ -18886,6 +20458,18 @@ def main():
     print(f"[BOOT] websockets : {'OK' if _WS_AVAILABLE else 'MANQUANT (pip install websockets)'}")
     if _AUDIO_AVAILABLE:
         print(f"[BOOT] audio_io : OK (SAMPLE_RATE={SAMPLE_RATE}, BLOCK_SIZE={BLOCK_SIZE})")
+        # [AUDIO TIMING 26/07/2026] Inventaire complet des peripheriques
+        # au demarrage. Sert a comparer deux lancements : le temps
+        # d'import de sounddevice varie de 0,6 s a 3,6 s sans cause
+        # identifiee, et les identifiants de peripherique changent d'une
+        # session a l'autre (micro id=2 le matin, id=31 l'apres-midi),
+        # ce qui fait parfois retenir une variante WDM-KS qui refuse de
+        # s'ouvrir. Sans cette trace on ne peut que supposer.
+        try:
+            from circusvoip_audio_io import log_audio_inventory
+            log_audio_inventory()
+        except Exception as _e:
+            print(f"[AUDIO INVENTAIRE] indisponible : {_e}")
     else:
         print(f"[BOOT] audio_io : MANQUANT ({_AUDIO_IMPORT_ERROR})")
     if _CORE_AVAILABLE:

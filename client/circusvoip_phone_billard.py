@@ -186,6 +186,18 @@ BILLIARD_TABLES = [
     # interieur identique), meme en vol. Le cid varie par vaisseau mais
     # n'est pas utilise ici (zone + coords suffisent).
     {"name": "Carrack",       "zone": "anvl_carrack", "x": 6.71, "y": 19.27, "z": -5.56},
+    # MISC Starlancer MAX : releve 30/07/2026 (HUD "MISC_Starlancer_Max_862820860613"
+    # -> zone canonique OCR "misc_starlancer_max", deja presente dans
+    # _KNOWN_ZONES_SHIPS de circusvoip_sc_ocr.py).
+    # Coords relevees ALLONGE SUR LA TABLE : ce sont donc celles du billard
+    # lui-meme, pas d'un point voisin -- le rayon de 4 m est bien centre.
+    # Coords LOCALES au vaisseau comme pour le Carrack : une seule entree
+    # couvre TOUS les Starlancer MAX (amenagement identique), meme en vol ;
+    # l'id d'instance varie mais n'est pas utilise ici.
+    # Note : la zone est DISCRIMINANTE (contrairement a Stanton, ou tout est
+    # ObjectContainer_Commercial), donc _TABLE_RADIUS pourrait etre elargi
+    # sans risque de collision si l'icone s'avere trop capricieuse.
+    {"name": "Starlancer MAX", "zone": "misc_starlancer_max", "x": 0.97, "y": 8.79, "z": 1.40},
 ]
 
 

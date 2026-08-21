@@ -104,7 +104,13 @@ from circusvoip_security import AuthLockout, RateLimiter, AuthRegistry
 #  Config
 # ---------------------------------------------
 
-AUDIO_PORT = 8889
+# [PORTS CONFIGURABLES 26/07/2026] Port lu dans le fichier de config
+# partage avec le serveur de positions (meme mecanisme que le token).
+try:
+    from circusvoip_server_config import get_ports as _get_ports
+    AUDIO_PORT = _get_ports()["port_audio"]
+except Exception:
+    AUDIO_PORT = 8889
 SERVER_TOKEN = get_token()  # meme token que serveur positions
 
 # [P3] Limite le nombre de connexions audio simultanees pour eviter qu'un
@@ -217,8 +223,22 @@ RED     = "#f85149"
 class State:
     clients = {}   # websocket -> name
     running = False
-    bytes_total     = 0
-    frames_total    = 0
+    # === [OBS1] Instrumentation debit (25/07/2026) ===
+    # AVANT : un seul compteur `bytes_total` incremente A LA RECEPTION.
+    # Il ignorait (a) le relais -- chaque trame recue est reemise vers
+    # N-1 clients -- et (b) le header de nom ajoute au relais. Le debit
+    # affiche etait donc tres inferieur au debit reel de la machine, et
+    # surtout il ne bougeait pas quand le nombre d'auditeurs augmentait :
+    # tout le cout en N^2 etait invisible.
+    # MAINTENANT : entrant et sortant comptes separement, header inclus,
+    # avec ventilation par pseudo.
+    bytes_in        = 0     # octets recus des clients (trames brutes)
+    frames_in       = 0     # trames audio recues
+    bytes_out       = 0     # octets REELLEMENT emis (somme par destinataire)
+    frames_out      = 0     # envois unitaires (1 trame vers 3 clients = 3)
+    bytes_in_by_name: dict  = {}   # {pseudo emetteur   : octets recus}
+    bytes_out_by_name: dict = {}   # {pseudo destinataire: octets emis vers lui}
+    speakers_window: set    = set()  # pseudos ayant emis dans la fenetre
     last_report_ts  = 0.0
 
     # === Stats debug crackling (ajout 25/05/2026) ===
@@ -296,8 +316,14 @@ async def handler(ws, ui):
                         state.rate_limit_first_drop_logged[name] = now_log
                     continue
                 # Trame audio : relayer a tous les autres clients
-                state.bytes_total  += len(msg)
-                state.frames_total += 1
+                # [OBS1] Entrant : trame brute telle que recue, avant
+                # l'ajout du header de nom (compte, lui, cote sortant).
+                state.bytes_in  += len(msg)
+                state.frames_in += 1
+                state.bytes_in_by_name[name] = (
+                    state.bytes_in_by_name.get(name, 0) + len(msg)
+                )
+                state.speakers_window.add(name)
                 # Prefixer avec le nom de l'emetteur (2 octets taille + nom utf8)
                 name_bytes = name.encode("utf-8")
                 header     = len(name_bytes).to_bytes(2, "big") + name_bytes
@@ -406,8 +432,15 @@ async def handler(ws, ui):
             ui.refresh_clients()
 
 async def _broadcast_binary(data: bytes, exclude=None):
-    """Envoie une trame audio a tous les clients sauf l'emetteur."""
+    """Envoie une trame audio a tous les clients sauf l'emetteur.
+
+    [OBS1] 25/07/2026 : compte le sortant REEL. `data` contient deja le
+    header de nom, et on compte une fois PAR DESTINATAIRE effectivement
+    servi. C'est ce chiffre qui reflete la charge de la machine : pour
+    une trame recue, N-1 envois. Les envois echoues ne sont pas comptes.
+    """
     dead = []
+    size = len(data)
     for ws in list(state.clients.keys()):
         if ws is exclude:
             continue
@@ -415,6 +448,14 @@ async def _broadcast_binary(data: bytes, exclude=None):
             await ws.send(data)
         except Exception:
             dead.append(ws)
+            continue
+        state.bytes_out  += size
+        state.frames_out += 1
+        dest = state.clients.get(ws)
+        if dest:
+            state.bytes_out_by_name[dest] = (
+                state.bytes_out_by_name.get(dest, 0) + size
+            )
     for ws in dead:
         # === Stats debug crackling (25/05/2026) ===
         # Avant : suppression silencieuse. Maintenant : on tracke le pseudo
@@ -428,6 +469,38 @@ async def _broadcast_binary(data: bytes, exclude=None):
         )
         state.clients.pop(ws, None)
 
+# [OBS1] Pont vers le serveur positions (process separe : la console
+# admin est connectee au 8888, les stats audio vivent sur le 8889).
+# Meme principe que circusvoip_auth_tickets.json deja partage entre les
+# deux process. Ecriture atomique (tmp + replace) pour qu'une lecture
+# concurrente ne tombe jamais sur un fichier a moitie ecrit.
+_STATS_FILE = Path(__file__).resolve().parent / "circusvoip_audio_stats.json"
+
+
+def _write_stats_file(kbps_in, kbps_out, fps_in, fps_out, fanout,
+                      bpf_in, n_speakers, n_clients):
+    """Ecrit le dernier echantillon de stats audio pour le serveur
+    positions. Echec silencieux : une stat perdue ne doit jamais tuer
+    le service audio."""
+    payload = {
+        "ts":          time.time(),
+        "clients":     n_clients,
+        "speakers":    n_speakers,
+        "kbps_in":     round(kbps_in, 1),
+        "kbps_out":    round(kbps_out, 1),
+        "fps_in":      round(fps_in, 1),
+        "fps_out":     round(fps_out, 1),
+        "fanout":      round(fanout, 2),
+        "bytes_frame": round(bpf_in, 1),
+    }
+    try:
+        tmp = _STATS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, _STATS_FILE)
+    except Exception:
+        pass
+
+
 async def _report_stats(ui):
     """Affiche les stats de bande passante toutes les 5s.
 
@@ -440,24 +513,98 @@ async def _report_stats(ui):
     # Snapshot pour calcul de delta sur 30s
     prev_rl_drops = {}
     prev_bc_dead  = {}
+    # [OBS1] Accumulateurs sur la fenetre de 30s (le detail par joueur
+    # n'a pas de sens sur 5s : trop de bruit). Remis a zero apres log.
+    acc_in, acc_out, acc_elapsed = {}, {}, 0.0
+    # [OBS1] Ces trois-la doivent etre accumules sur la MEME fenetre de
+    # 30s que acc_in/acc_out. Les prendre sur le dernier tick de 5s
+    # donnait des lignes incoherentes (IN eleve mais "parleurs=0" et
+    # "0 o/trame") quand le joueur se taisait en fin de fenetre.
+    acc_frames_in = acc_frames_out = 0
+    acc_speakers = set()
+    last_ts = time.monotonic()
     while state.running:
         await asyncio.sleep(5)
-        # Mettre a jour les stats meme si pas de trafic, sinon le compteur de
-        # clients reste fige quand tout le monde se deconnecte.
-        if state.bytes_total > 0:
-            kbs    = state.bytes_total / 5 / 1024
-            frames = state.frames_total / 5
-        else:
-            kbs    = 0.0
-            frames = 0.0
-        ui.update_stats(kbs, frames, len(state.clients))
-        state.bytes_total  = 0
-        state.frames_total = 0
+        # [OBS1] Duree REELLE de la fenetre. L'ancien code divisait par 5
+        # en dur : sous charge, asyncio.sleep(5) derive et le debit etait
+        # sous-estime. Tout tirait deja vers le bas, autant etre exact.
+        now_ts       = time.monotonic()
+        elapsed      = max(0.001, now_ts - last_ts)
+        last_ts      = now_ts
+        acc_elapsed += elapsed
+
+        # Unite : kbit/s, volontairement alignee sur celle des forfaits
+        # VPS et des lignes ADSL (l'ancien "KB/s" etait en fait des KiB/s
+        # et ne se comparait a rien).
+        kbps_in  = state.bytes_in  * 8 / 1000.0 / elapsed
+        kbps_out = state.bytes_out * 8 / 1000.0 / elapsed
+        fps_in   = state.frames_in  / elapsed
+        fps_out  = state.frames_out / elapsed
+        # Fanout : nombre moyen de destinataires par trame recue. C'est LE
+        # chiffre a surveiller pour la diffusion par zone (todo 8/9) : il
+        # doit chuter de ~N-1 vers ~2-3.
+        fanout   = (state.frames_out / state.frames_in) if state.frames_in else 0.0
+        # Octets par trame : c'est LE chiffre a surveiller pour Opus
+        # (todo 7). float32 20ms/48kHz ~= 3840 o ; Opus 24kbps ~= 60 o.
+        bpf_in   = (state.bytes_in / state.frames_in) if state.frames_in else 0.0
+        n_speak  = len(state.speakers_window)
+
+        ui.update_stats(kbps_in, kbps_out, fps_in, fanout,
+                        len(state.clients))
+        _write_stats_file(kbps_in, kbps_out, fps_in, fps_out, fanout,
+                          bpf_in, n_speak, len(state.clients))
+
+        acc_frames_in  += state.frames_in
+        acc_frames_out += state.frames_out
+        acc_speakers.update(state.speakers_window)
+        for n, v in state.bytes_in_by_name.items():
+            acc_in[n] = acc_in.get(n, 0) + v
+        for n, v in state.bytes_out_by_name.items():
+            acc_out[n] = acc_out.get(n, 0) + v
+
+        state.bytes_in   = state.frames_in  = 0
+        state.bytes_out  = state.frames_out = 0
+        state.bytes_in_by_name.clear()
+        state.bytes_out_by_name.clear()
+        state.speakers_window.clear()
 
         # Toutes les 30s = 6 ticks : log debug audio enrichi.
         tick += 1
         if tick >= 6:
             tick = 0
+            # [OBS1] Ligne de debit sur 30s, destinee a etre relue apres
+            # coup pour tracer une courbe de charge (comparaison avant /
+            # apres Opus et diffusion par zone).
+            w = max(0.001, acc_elapsed)
+            t_in  = sum(acc_in.values())
+            t_out = sum(acc_out.values())
+            # Toutes les valeurs de cette ligne portent sur la fenetre 30s.
+            w_fanout = (acc_frames_out / acc_frames_in) if acc_frames_in else 0.0
+            w_bpf    = (t_in / acc_frames_in) if acc_frames_in else 0.0
+            ui.log(
+                f"[OBS1 DEBIT] 30s | clients={len(state.clients)} "
+                f"parleurs={len(acc_speakers)} | "
+                f"IN {t_in * 8 / 1000.0 / w:.1f} kbit/s | "
+                f"OUT {t_out * 8 / 1000.0 / w:.1f} kbit/s | "
+                f"fanout x{w_fanout:.1f} | {w_bpf:.0f} o/trame"
+            )
+            if acc_out:
+                # Sortant par destinataire : identifie le client qui
+                # decroche (ADSL) avant qu'il ne s'en plaigne.
+                # Tronque au top 5 : a 100 joueurs la ligne complete
+                # ferait ~1500 caracteres et serait illisible.
+                ranked = sorted(acc_out.items(), key=lambda kv: -kv[1])
+                top    = ranked[:5]
+                detail = " ".join(f"{n}={v * 8 / 1000.0 / w:.0f}" for n, v in top)
+                rest   = ranked[5:]
+                if rest:
+                    r_tot = sum(v for _, v in rest) * 8 / 1000.0 / w
+                    detail += f" | +{len(rest)} autres = {r_tot:.0f}"
+                ui.log(f"[OBS1 DEBIT] OUT/joueur kbit/s (top5/"
+                       f"{len(ranked)}) : {detail}")
+            acc_in, acc_out, acc_elapsed = {}, {}, 0.0
+            acc_frames_in = acc_frames_out = 0
+            acc_speakers = set()
             # Calcul des deltas sur 30s pour chaque client.
             rl_delta = {}
             for name, total in state.rate_limit_drops_by_name.items():
@@ -637,12 +784,21 @@ class ServerUI:
         self._lbl_clients = tk.Label(sf, text="Clients : 0", bg=BG_PANEL, fg=BLUE,
                                      font=("Courier", 10, "bold"))
         self._lbl_clients.pack(side="left", padx=(0, 20))
-        self._lbl_kbs = tk.Label(sf, text="Debit : 0 KB/s", bg=BG_PANEL, fg=ORANGE,
+        # [OBS1] IN et OUT separes + fanout. L'ancien label unique
+        # n'affichait que l'entrant et laissait croire que le serveur
+        # poussait 10x moins qu'en realite.
+        self._lbl_in = tk.Label(sf, text="IN : 0 kbit/s", bg=BG_PANEL, fg=ORANGE,
+                                font=("Courier", 10))
+        self._lbl_in.pack(side="left", padx=(0, 20))
+        self._lbl_out = tk.Label(sf, text="OUT : 0 kbit/s", bg=BG_PANEL, fg=RED,
                                  font=("Courier", 10))
-        self._lbl_kbs.pack(side="left", padx=(0, 20))
-        self._lbl_fps = tk.Label(sf, text="Frames/s : 0", bg=BG_PANEL, fg=GREEN,
+        self._lbl_out.pack(side="left", padx=(0, 20))
+        self._lbl_fps = tk.Label(sf, text="Trames/s : 0", bg=BG_PANEL, fg=GREEN,
                                  font=("Courier", 10))
-        self._lbl_fps.pack(side="left")
+        self._lbl_fps.pack(side="left", padx=(0, 20))
+        self._lbl_fanout = tk.Label(sf, text="Fanout : x0.0", bg=BG_PANEL, fg=PURPLE,
+                                    font=("Courier", 10))
+        self._lbl_fanout.pack(side="left")
 
         # Clients connectes
         cf = tk.Frame(body, bg=BG_PANEL)
@@ -691,11 +847,14 @@ class ServerUI:
                              font=("Courier", 9, "bold"), anchor="w").pack(fill="x")
         self._safe_after(_do)
 
-    def update_stats(self, kbs: float, fps: float, clients: int):
+    def update_stats(self, kbps_in: float, kbps_out: float, fps_in: float,
+                     fanout: float, clients: int):
         def _do():
             self._lbl_clients.config(text=f"Clients : {clients}")
-            self._lbl_kbs.config(text=f"Debit : {kbs:.1f} KB/s")
-            self._lbl_fps.config(text=f"Frames/s : {fps:.1f}")
+            self._lbl_in.config(text=f"IN : {kbps_in:.1f} kbit/s")
+            self._lbl_out.config(text=f"OUT : {kbps_out:.1f} kbit/s")
+            self._lbl_fps.config(text=f"Trames/s : {fps_in:.1f}")
+            self._lbl_fanout.config(text=f"Fanout : x{fanout:.1f}")
         self._safe_after(_do)
 
 # ---------------------------------------------
@@ -722,10 +881,12 @@ class _HeadlessUI:
         # Pas d'affichage de liste en headless (les events sont logges)
         pass
 
-    def update_stats(self, kbs: float, frames: int, n_clients: int):
+    def update_stats(self, kbps_in: float, kbps_out: float, fps_in: float,
+                     fanout: float, n_clients: int):
         ts = datetime.now().strftime("%H:%M:%S")
         line = (f"[{ts}] [STATS] {n_clients} client(s) | "
-                f"{frames} trames/s | {kbs:.1f} kB/s")
+                f"{fps_in:.1f} trames/s | IN {kbps_in:.1f} kbit/s | "
+                f"OUT {kbps_out:.1f} kbit/s | fanout x{fanout:.1f}")
         print(line, flush=True)
         _audio_log_write(line)
 

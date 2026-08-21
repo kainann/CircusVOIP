@@ -50,6 +50,7 @@ _GAME_SPECS = [
 PHONE_GAMES = [c for c in (_imp(m, n) for (m, n) in _GAME_SPECS) if c is not None]
 
 # --- Apps de la racine du home (hors jeux). --------------------------
+UrgenceApp      = _imp("circusvoip_phone_urgence_app", "UrgenceApp")
 WalletApp       = _imp("circusvoip_phone_wallet",   "WalletApp")
 BlueprintsApp   = _imp("circusvoip_phone_blueprints", "BlueprintsApp")
 SettingsApp     = _imp("circusvoip_phone_settings", "SettingsApp")
@@ -62,6 +63,11 @@ PhotosApp       = _imp("circusvoip_phone_photos",   "PhotosApp")
 # NB : Camera (fenetre separee), Photos et Parametres sont ajoutes A PART
 # par l'overlay, dans cet ordre et EN DERNIER, apres Wallet/Jeux.
 PHONE_APPS = []
+# [URGENCE 12/08/2026] En TETE des apps : c'est la seule dont on ait
+# besoin dans l'urgence, et la chercher au milieu des autres coute des
+# secondes exactement quand elles comptent.
+if UrgenceApp is not None:
+    PHONE_APPS.append(UrgenceApp)
 if WalletApp is not None:
     PHONE_APPS.append(WalletApp)
 if BlueprintsApp is not None:

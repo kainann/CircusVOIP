@@ -101,6 +101,14 @@ reimplementer le parsing) :
     are_containers_similar(a, b) Compare deux ids/noms de zones SC en
                                  tolerant les fautes OCR (3 vs 8, etc.).
     is_cave_container(cid, name) True si la zone est un container "cave".
+    is_big_hangar(cid, name)     True si hangar de taille large ou XL.
+    is_echo_container(cid, name) True si le lieu doit declencher la
+                                 reverb : grotte OU grand hangar. C'est
+                                 CETTE fonction que le client appelle.
+    capture_hierarchy(region)    Lit la chaine des containers parents,
+                                 arret a SolarSystem. Appel ponctuel
+                                 (2 passes OCR minimum), pas pour une
+                                 boucle. Voir sa docstring.
 
 Note : ces noms sont des alias des fonctions internes prefixees par _ qui
 existent depuis l'origine. Le code historique du module continue d'utiliser
@@ -747,6 +755,24 @@ _KNOWN_ZONES_INTERIORS = [
     "hangar_mediumfront_rest_nyx",
     "hangar_smalltop_rest_nyx",
     "hangar_smallfront_rest_nyx",
+    # [13/08/2026] Hangars "Collector". "Hangar_XLTop_Collector"
+    # (cid 865695625805) observe en session, systeme Stanton, coordonnees
+    # tres eloignees des corps planetaires -- station isolee.
+    #
+    # Les huit variantes sont inscrites comme pour les autres lieux : la
+    # grille taille x position est structurelle (small/medium/large/xl,
+    # top/front), pas un nom devine. Sans les voisines, une lecture
+    # "Hangar_LargeTop_Collector" se ferait rabattre par le fuzzy sur
+    # "hangar_largetop_reststop" -- un autre lieu, a l'autre bout du
+    # systeme.
+    "hangar_xltop_collector",
+    "hangar_xlfront_collector",
+    "hangar_largetop_collector",
+    "hangar_largefront_collector",
+    "hangar_mediumtop_collector",
+    "hangar_mediumfront_collector",
+    "hangar_smalltop_collector",
+    "hangar_smallfront_collector",
     # GrimHex (Green Imperial Housing Exchange, asteroide Yela).
     # SC affiche "Hangar_MediumFront_GrimHEX_<cid>" (avec "HEX" en majuscules)
     # mais la canonicalisation passe tout en lowercase donc le suffixe stocke
@@ -861,6 +887,13 @@ _KNOWN_ZONES_INTERIORS = [
     # ugf ci-dessus) : la normalisation des separateurs unifie de toute
     # facon, mais on garde la forme observee.
     "objectcontainer_teachsshipshop",
+    # Instance brokered (hangar / lieu instancie) — observe 26/07/2026.
+    # Forme reelle : "ObjectContainerBrokeredInstance_<id 12 chiffres>".
+    # L'id est desormais extrait comme container_id par _PAT_FIRST_CONTAINER
+    # (cf. [SEP_ID]), donc c'est bien le prefixe seul qui est canonicalise.
+    # Deux joueurs dans deux instances differentes partagent ce nom mais ont
+    # des container_id distincts : la proximite les separe correctement.
+    "objectcontainerbrokeredinstance",
     # POI (Points of Interest) dans l'espace
     "tsg_gascloud_001",            # gas cloud events (plusieurs instances)
     "tsg_gascloud_002",
@@ -1098,9 +1131,61 @@ _KNOWN_ZONES_INTERIORS = [
     # (differents de celui du vaisseau). "o" et "0" sont confondus par OCR,
     # on garde la forme "091" / "001" (chiffres) car c'est ce que SC affiche
     # en realite dans le HUD.
-    "rockol_occu_091_size03_001_int",
-    "rockol_occu_091_size03_002_int",
-    "rockol_occu_091_size03_003_int",
+    # [13/08/2026] Ces trois entrees etaient ecrites "rockol_" -- avec les
+    # LETTRES o et l -- alors que le commentaire ci-dessus dit garder la
+    # forme chiffree. Le normaliseur de prefixe convertit "rockol" en
+    # "rock01" AVANT la comparaison : elles ne pouvaient donc jamais
+    # correspondre exactement, et ne servaient qu'a attirer d'autres
+    # grottes par fuzzy. C'est ce qui a rabattu un
+    # "rock01_unoc_001_size02_001_int" reellement lu sur la premiere
+    # d'entre elles, le 13/08 en session.
+    "rock01_occu_091_size03_001_int",
+    "rock01_occu_091_size03_002_int",
+    "rock01_occu_091_size03_003_int",
+    # [13/08/2026] Zones OBSERVEES en session sur Hurston (Stanton), lors
+    # des tests de l'app Urgence. Ajoutees parce que reellement lues a
+    # l'ecran, jamais extrapolees -- cf. l'avertissement plus bas sur les
+    # contested zones.
+    "rock01_unoc_001_size02_001_int",   # grotte, surface Hurston
+    "int_s1_dc_sasu_magnolia",          # centre de distribution Sasu Magnolia
+    "ab_mine_stanton1_sml_003",         # mine d'asteroides, ceinture Stanton
+    # [LAGRANGE 13/08/2026] Points de Lagrange de Stanton.
+    #
+    # Format SC : "OOC_Stanton<N>_L<M>", N = numero de planete
+    # (1 Hurston, 2 Crusader, 3 ArcCorp, 4 microTech), M = numero du
+    # point. Affiches "HUR-L1", "CRU-L3"... sur la starmap.
+    #
+    # Une seule de ces zones a ete OBSERVEE (ooc_stanton1_l1, le
+    # 13/08). Les 19 autres sont inscrites parce que les points de
+    # Lagrange sont une donnee STRUCTURELLE du systeme -- cinq points
+    # par corps, par definition orbitale -- et non des noms devines.
+    # C'est ce qui les distingue des contested zones, ou le nom lui-meme
+    # etait l'inconnue.
+    #
+    # Elles servent de filet : _correct_ocr_zone reconnait deja le
+    # FORMAT et court-circuite le fuzzy, mais si l'OCR abime le nom au
+    # point que le motif ne matche plus, le nom retombait sur le chemin
+    # normal et le nettoyage des parasites mangeait le "_L1".
+    "ooc_stanton1_l1",          # HUR-L1
+    "ooc_stanton1_l2",          # HUR-L2
+    "ooc_stanton1_l3",          # HUR-L3
+    "ooc_stanton1_l4",          # HUR-L4
+    "ooc_stanton1_l5",          # HUR-L5
+    "ooc_stanton2_l1",          # CRU-L1
+    "ooc_stanton2_l2",          # CRU-L2
+    "ooc_stanton2_l3",          # CRU-L3
+    "ooc_stanton2_l4",          # CRU-L4
+    "ooc_stanton2_l5",          # CRU-L5
+    "ooc_stanton3_l1",          # ARC-L1
+    "ooc_stanton3_l2",          # ARC-L2
+    "ooc_stanton3_l3",          # ARC-L3
+    "ooc_stanton3_l4",          # ARC-L4
+    "ooc_stanton3_l5",          # ARC-L5
+    "ooc_stanton4_l1",          # MIC-L1
+    "ooc_stanton4_l2",          # MIC-L2
+    "ooc_stanton4_l3",          # MIC-L3
+    "ooc_stanton4_l4",          # MIC-L4
+    "ooc_stanton4_l5",          # MIC-L5
     # Dealerships Pyro - showrooms vaisseaux/vehicules en surface.
     # SC affiche "dealership_rundown_001" (Rundown station, Pyro). Le suffixe
     # numerique distingue les multiples instances du meme dealership.
@@ -1280,6 +1365,14 @@ def _correct_ocr_zone(name: str) -> str:
         _ZONE_CORRECT_CACHE.pop(next(iter(_ZONE_CORRECT_CACHE)), None)
     _ZONE_CORRECT_CACHE[name] = result
     return result
+
+
+# Format des points de Lagrange de Stanton : "OOC_Stanton<N>_L<M>".
+# [1lI] a chaque position de chiffre : l'OCR y rend regulierement des
+# lettres. Le "ooc" initial est optionnel, il arrive qu'il soit rate.
+_RE_LAGRANGE_BRUT = re.compile(
+    r"^(?:[o0]{1,3}c[\s_]*)?stanton[\s_]*([1-9lI])[\s_]+l[\s_]*([1-9lI])$",
+    re.IGNORECASE)
 
 
 def _correct_ocr_zone_impl(name: str) -> str:
@@ -1668,6 +1761,28 @@ def _pretty_container_name(raw_name: str) -> str:
     # Correction "Oc Stanton" en debut de nom (un O manquant au debut) :
     # utiliser regex avec ancre ^ pour eviter de matcher dans "OOc Stanton"
     name = re.sub(r"^Oc Stanton", "OOc Stanton", name)
+    # [LAGRANGE 13/08/2026] Points de Lagrange, AVANT le nettoyage des
+    # parasites.
+    #
+    # SC ecrit "OOC_Stanton1_L1". L'OCR rend "OOc Stantonl Ll" : les deux
+    # chiffres deviennent des lettres. Le "Ll" final fait alors deux
+    # caracteres isoles en fin de nom, et le strip de parasites ci-dessous
+    # le mangeait -- on obtenait "ooc_stanton1", impossible de distinguer
+    # L1 de L5. Observe en session le 13/08.
+    #
+    # Reconnaitre le FORMAT plutot que lister les zones : il y a 4 planetes
+    # x 5 points dans Stanton, et les lister reviendrait a extrapoler 19
+    # entrees sur une seule observee -- exactement ce que l'avertissement
+    # des contested zones interdit. Le format, lui, est certain.
+    #
+    # La substitution l/I -> 1 est sure ICI : les deux positions sont des
+    # chiffres par construction, un "L" de Lagrange n'y figure jamais.
+    m_lag = _RE_LAGRANGE_BRUT.match(name.strip())
+    if m_lag:
+        num_astre = m_lag.group(1).lower().replace("l", "1").replace("i", "1")
+        num_point = m_lag.group(2).lower().replace("l", "1").replace("i", "1")
+        return f"ooc_stanton{num_astre}_l{num_point}"
+
     # Nettoyer les parasites OCR : caracteres isoles colles en fin du nom.
     # Ex: "ObjectContainer_Entry S", "ObjectContainer_Entry 48", "ObjectContainer_Entry I"
     # Applique 2 fois pour gerer "... S I" -> "..."
@@ -1739,6 +1854,14 @@ def _pretty_container_name(raw_name: str) -> str:
         name,
         flags=re.IGNORECASE,
     )
+    # [13/08/2026] "stanton" est TOUJOURS suivi du numero du systeme, jamais
+    # d'une lettre : SC ecrit "ab_mine_stanton1_sml_003", et l'OCR rend
+    # regulierement "stantonl" (l minuscule) ou "stantonI". Le caractere
+    # suivant est un chiffre par construction, donc la correction ne peut
+    # pas detruire un nom legitime -- contrairement a une substitution
+    # l->1 appliquee partout, qui casserait "levski" ou "calliope".
+    name = re.sub(r"(stanton)[lI|]", lambda m: m.group(1) + "1", name,
+                  flags=re.IGNORECASE)
     # Adoption du nom canonique : si le nom (espaces -> underscores, lowercase)
     # correspond exactement a une zone connue dont le nom canonique est tout
     # en underscores, on remplace les espaces par des underscores dans le nom
@@ -1865,7 +1988,21 @@ _PAT_FIRST_CONTAINER = re.compile(
     r"(?P<n>(?:[A-Za-z]|[0-9](?=[A-Za-z]))[A-Za-z0-9_\- ]*?)"
     # ID numerique optionnel, avec prefixe P optionnel (SC affiche parfois "AEGS Idris P 9875352433452").
     # Le P est l'initiale du prefix persistence SC, on l'ignore pour le container_id.
-    r"(?:\s+[Pp]?\s*(?P<id>\d{10,}))?"
+    # [SEP_ID] 26/07/2026 - Le separateur peut etre un underscore et pas
+    # seulement une espace : SC ecrit "<Nom>_<id>" et l'espace qu'on croit
+    # voir sur les captures est un underscore mal lu par l'OCR. Avec le
+    # seul "\s+", un nom comme "ObjectContainerBrokeredInstance_862192228321"
+    # etait absorbe EN ENTIER par le groupe <n> : container_id vide, et un
+    # nom de zone different a chaque instance (donc jamais canonicalise).
+    # Effet de bord repare au passage : un hangar dont l'underscore etait
+    # lu correctement produisait "Hangar_XLTop_Orison_8620..." sans cid,
+    # alors que la meme position lue avec une espace donnait
+    # "Hangar_XLTop_Orison" + cid -> deux zones distinctes pour un meme
+    # endroit, et proximite coupee entre joueurs cote a cote.
+    # Verifie : aucune des 398 zones connues ne se termine par _<9+ chiffres>,
+    # et les suffixes courts (rs_habs_005_occu_001) sont preserves car on
+    # exige au moins 10 chiffres.
+    r"(?:[\s_]+[Pp]?\s*(?P<id>\d{10,}))?"
     r"\s*[- ]?\s*"
     r"[Pp][o0O]s\s*[:\s]\s*"
     r"(?P<x>-?[\d.]+)\s*(?P<ux>k?m)?[\s]+"
@@ -2766,16 +2903,86 @@ def _is_cave_container(container_id: str, container_name: str) -> bool:
         # o/0 et l/1 sont tres facilement confondus. On applique sur les 6
         # premiers caracteres uniquement pour ne pas affecter le reste du nom.
         head = s[:7]   # "rock01_" ou "rocko1_" etc.
-        head = head.replace("o", "0").replace("l", "1")
+        head = _norm_ocr_chiffres(head)
         s_norm = head + s[7:]
+        # [GROTTES 13/08/2026] Les prefixes sont normalises PAR LA MEME
+        # fonction avant comparaison.
+        #
+        # Sans ca, "rock01_" devenait "r0ck01_" et ne correspondait plus
+        # a lui-meme : les grottes de ROCHE n'ont jamais ete detectees
+        # depuis l'ecriture de cette fonction, et l'echo ne se
+        # declenchait qu'en grotte de SABLE -- "sand01_" ne contenant ni
+        # o ni l, il traversait la normalisation intact.
+        #
+        # Le bug etait invisible : rien n'echoue, l'echo manque
+        # simplement. Trouve le 13/08 en branchant l'affichage
+        # "Grotte" de l'app Urgence sur cette meme fonction.
         for prefix in _CAVE_CONTAINER_PREFIXES:
-            if s_norm.startswith(prefix):
+            if s_norm.startswith(_norm_ocr_chiffres(prefix)):
                 return True
     return False
 
 
+def _norm_ocr_chiffres(txt: str) -> str:
+    """o -> 0 et l -> 1, confusions OCR usuelles sur les chiffres.
+
+    A n'appliquer qu'a un prefixe court : sur un nom entier, elle
+    mutilerait les lettres legitimes.
+    """
+    return txt.replace("o", "0").replace("l", "1")
+
+
 # --- _CAVE_CONTAINER_PREFIXES ---
 _CAVE_CONTAINER_PREFIXES = ("rock01_", "sand01_")
+
+
+# [ECHO HANGARS 13/08/2026] Demande joueur : la reverb des grottes dans
+# les grands hangars.
+#
+# Convention SC : "Hangar_<Taille><Position>_<Lieu>", quatre tailles --
+# small, medium, large, xl -- et deux positions (top, front). On retient
+# large et xl : ce sont les volumes ou l'echo s'entend reellement, et
+# c'est la limite demandee.
+#
+# Le test porte sur le NOM, pas sur le cid : les hangars ont un
+# identifiant d'instance numerique ("Hangar_XLTop_Levski_Nyx
+# 865594446681"), qui ne dit rien de leur taille.
+_RE_GRAND_HANGAR = re.compile(r"^hangar_(?:xl|large)(?:top|front)?(?:_|$)",
+                              re.IGNORECASE)
+
+
+def _is_big_hangar(container_id: str, container_name: str) -> bool:
+    """True si le container est un hangar de taille large ou XL.
+
+    Meme normalisation que _is_cave_container : prefixe "name:" retire,
+    casse ignoree, separateurs homogeneises. Un client lisant
+    "Hangar LargeTop ..." et un autre "Hangar_LargeTop_..." doivent
+    donner le meme verdict, sinon l'echo se declencherait chez l'un et
+    pas chez l'autre dans le meme hangar physique -- exactement le genre
+    d'ecart deja observe le 04/06 entre Skywat et Kainan.
+    """
+    for raw in (container_name, container_id):
+        if not raw:
+            continue
+        s = str(raw).lower()
+        if s.startswith("name:"):
+            s = s[5:]
+        s = re.sub(r"[\s\-]+", "_", s).strip("_")
+        if _RE_GRAND_HANGAR.match(s):
+            return True
+    return False
+
+
+def _is_echo_container(container_id: str, container_name: str) -> bool:
+    """True si le lieu doit declencher la reverb.
+
+    Fonction unique appelee par le client, pour que la liste des lieux
+    a echo vive a un seul endroit. _is_cave_container garde son sens
+    strict : elle est exportee et utilisee par des forks, lui faire
+    renvoyer True sur un hangar ferait mentir son nom.
+    """
+    return (_is_cave_container(container_id, container_name)
+            or _is_big_hangar(container_id, container_name))
 
 # ======================================================================
 # Bloc parser principal (extrait du client1)
@@ -3451,9 +3658,58 @@ def parse_ocr_text(text: str) -> Optional[dict]:
 # Utilitaires geometriques
 # ======================================================================
 
-def distance(a: dict, b: dict) -> float:
+# [PROXIMITE VERTICALE 28/07/2026] Facteur applique a dz A L'INTERIEUR
+# DES VAISSEAUX uniquement.
+#
+# Probleme : la portee de proximite est une SPHERE de 30 m. Un joueur
+# situe 2 m au-dessus, sur le pont superieur, est donc a 2 m — soit dans
+# la zone de volume plein (RADIUS_TRIGGER = 5 m), exactement comme s'il
+# etait a cote. La cloison entre les ponts n'existe pas pour le calcul.
+#
+# Correction : multiplier dz avant la racine transforme la sphere en
+# ellipsoide aplati. Avec un facteur 10, 2 m de denivele comptent comme
+# 20 m et donnent 16 % de volume au lieu de 100 %.
+#
+# Pourquoi un facteur eleve : le volume est PLEIN sous 5 m. Un facteur
+# inferieur a 2,5 ne changerait donc rien a 2 m de denivele.
+#
+# Pourquoi une ponderation et non un seuil : la courbe reste continue.
+# Un seuil vertical franc ferait clignoter la voix d'un joueur pile a la
+# limite au moindre bruit de lecture OCR.
+#
+# Pourquoi les vaisseaux SEULEMENT : ailleurs, un denivele n'implique pas
+# de cloison. Sur une planete, dans une grotte, un hangar ou une station,
+# quelqu'un 3 m plus haut sur une passerelle ou une caisse doit rester
+# audible normalement. Les stations et hangars gardent donc la bulle.
+#
+# Le repere de coordonnees est LOCAL au vaisseau : Z reste le haut du
+# vaisseau quelle que soit son orientation, y compris en manoeuvre.
+VERTICAL_WEIGHT_FACTOR = 10.0
+
+_KNOWN_ZONES_SHIPS_NORM = frozenset(
+    re.sub(r"[_\s-]+", "_", z.strip().lower()) for z in _KNOWN_ZONES_SHIPS
+)
+
+
+def is_ship_zone(zone_name: str) -> bool:
+    """True si la zone est un vaisseau connu.
+
+    Un vaisseau absent de la whitelist renvoie False : la ponderation ne
+    s'applique pas et le comportement reste celui d'aujourd'hui. C'est
+    une degradation sure — au pire on n'attenue pas, jamais l'inverse.
+    """
+    if not zone_name:
+        return False
+    z = re.sub(r"[_\s-]+", "_", str(zone_name).strip().lower())
+    return z in _KNOWN_ZONES_SHIPS_NORM
+
+
+def distance(a: dict, b: dict, z_weight: float = 1.0) -> float:
     """Distance euclidienne 3D entre deux positions {x, y, z}, en metres.
     La cle 'zone' (si presente) est ignoree.
+
+    z_weight multiplie l'ecart vertical avant la racine (1.0 = neutre,
+    comportement historique). Voir VERTICAL_WEIGHT_FACTOR ci-dessus.
 
     Note : ne considere PAS les containers / vaisseaux. Pour CircusVOIP
     qui a une logique container-aware, utilisez votre propre fonction
@@ -3461,7 +3717,7 @@ def distance(a: dict, b: dict) -> float:
     import math as _m
     dx = a.get("x", 0) - b.get("x", 0)
     dy = a.get("y", 0) - b.get("y", 0)
-    dz = a.get("z", 0) - b.get("z", 0)
+    dz = (a.get("z", 0) - b.get("z", 0)) * z_weight
     return _m.sqrt(dx * dx + dy * dy + dz * dz)
 
 
@@ -4181,6 +4437,12 @@ def _restore_minus_signs(img_bgr: _np.ndarray, results: list) -> list:
     return out
 
 
+# Verrou partage par tous les appels a EasyOCR. Voir le commentaire dans
+# _easy_ocr_image : la boucle temps reel et capture_hierarchy() utilisent
+# le meme reader depuis deux threads differents.
+_EASY_OCR_LOCK = threading.Lock()
+
+
 def _easy_ocr_image(img_bgr: _np.ndarray) -> str:
     """OCR via EasyOCR   regroupe les blocs par ligne (meme Y) pour reconstruire les lignes completes."""
     reader = _get_easy_ocr()
@@ -4200,11 +4462,25 @@ def _easy_ocr_image(img_bgr: _np.ndarray) -> str:
         # NOTE : on a TENTE l'option allowlist (filtrer aux ~70 caracteres du
         # HUD SC) mais ca a casse l'OCR : 0% de parse contre 97% avant.
         # On garde donc l'OCR sans restriction de caracteres.
-        results = reader.readtext(img_bgr, detail=1,
-                                  paragraph=False,
-                                  contrast_ths=0.1,
-                                  adjust_contrast=0.5,
-                                  min_size=8)
+        # [URGENCE 12/08/2026] Serialisation des appels a EasyOCR.
+        #
+        # Jusqu'ici un seul thread lisait : celui de SCOCRReader. Avec
+        # capture_hierarchy(), l'app Urgence en lance un second depuis
+        # l'interface, et les deux partagent le MEME objet reader (il est
+        # mis en cache par _get_easy_ocr, l'initialiser deux fois
+        # doublerait l'occupation VRAM).
+        #
+        # readtext() n'est pas reentrant : deux appels simultanes sur le
+        # meme reader corrompent son etat interne. Le verrou les met en
+        # file. Le cout est un decalage d'au plus une lecture pour la
+        # boucle temps reel -- invisible a 10 Hz, la ou une corruption
+        # se manifesterait par des positions fausses sans aucune erreur.
+        with _EASY_OCR_LOCK:
+            results = reader.readtext(img_bgr, detail=1,
+                                      paragraph=False,
+                                      contrast_ths=0.1,
+                                      adjust_contrast=0.5,
+                                      min_size=8)
         if not results:
             return ""
 
@@ -4451,7 +4727,28 @@ def _process_coords_img(img):
                                   "solar_system" in zone_name or
                                   "solarsvstem"  in zone_name or   # OCR : y -> v
                                   "solar_svstem" in zone_name)
-                if not is_solarsystem and (x_abs > 1_000_000 or y_abs > 1_000_000 or z_abs > 1_000_000):
+                # [OOC] 26/07/2026 - Le seuil unique a 1 000 000 m etait
+                # calibre sur des coords INTERIEURES (vaisseau, hangar :
+                # quelques centaines de metres). Il rejetait donc toute
+                # position d'un joueur directement dans une zone planetaire
+                # OOC -- a pied a la surface hors batiment, ou en EVA.
+                # Mesure du 26/07 : "OOC Stanton 2 Crusader" affiche
+                # 5295.4160km, lu correctement par l'OCR, converti en
+                # 5 295 415 m, puis rejete a tort. Consequence : aucune
+                # position emise, donc pas de VOIP de proximite hors
+                # container, et pas de position du tout pour un joueur
+                # immobilise en EVA (cf. app Sauvetage).
+                # Trois paliers selon le referentiel de la zone. Valeurs en
+                # metres (le parseur a deja converti les km) :
+                is_root = zone_name.startswith("root")
+                is_ooc  = zone_name.startswith("ooc")
+                if is_solarsystem or is_root:
+                    limit = 1e10 * 1000      # systeme : ~1,9e10 m mesure
+                elif is_ooc:
+                    limit = 1e6 * 1000       # astre   : ~5,3e6 m mesure
+                else:
+                    limit = 1_000 * 1000     # container : inchange
+                if x_abs > limit or y_abs > limit or z_abs > limit:
                     _logger_dedup(
                         "reject_huge",
                         f"[REJECT] coords aberrantes x={x_abs:.0f} y={y_abs:.0f} z={z_abs:.0f}",
@@ -4748,6 +5045,359 @@ def read_coords(region):
         _logger(f'[COORDS ERR] {e}')
         return None
 
+# ======================================================================
+# Capture de hierarchie de containers (chantier #25)
+# ======================================================================
+# Le HUD SC empile sous la ligne du joueur la chaine complete de ses
+# containers parents, jusqu'a SolarSystem puis Root. La boucle temps
+# reel ne lit que la premiere ligne : elle n'a besoin que du container
+# immediat, et lire plus couterait du temps a chaque frame.
+#
+# L'app Urgence, elle, a besoin de la chaine entiere : une position
+# locale ne dit rien a un joueur qui n'est pas dans le meme container,
+# et c'est precisement le cas d'une urgence. La ligne SolarSystem donne
+# une position absolue (en km, 4 decimales) que tout le monde partage,
+# donc une distance toujours calculable ; les niveaux intermediaires
+# donnent la destination vers laquelle naviguer.
+#
+# --- Trois choix, et leurs raisons (releves du 12/08/2026) ---
+#
+# UNE SEULE PASSE OCR, DECOUPE SUR LE TEXTE. La premiere version
+# decoupait la zone en bandes de la hauteur d'une ligne. Les lignes du
+# HUD ne font pas exactement cette hauteur : le decalage s'accumule et
+# un niveau entier passe entre deux bandes. Sur le releve de reference,
+# "levski_all-001" avait disparu ainsi -- silencieusement, la chaine
+# restant plausible. _easy_ocr_image regroupe deja les blocs par ligne
+# visuelle : on lui donne toute la zone et on decoupe son texte sur les
+# occurrences de "Zone:".
+#
+# AUCUNE INTERPRETATION DES NIVEAUX. On ne cherche pas a savoir lequel
+# est la planete, l'avant-poste ou le vaisseau : la profondeur varie
+# selon les lieux (Levski a un seul niveau intermediaire la ou un site
+# minier en a deux), un vaisseau peut etre a l'interieur d'un autre, et
+# rien dans le HUD ne declare la nature d'un niveau. Toute regle de
+# position se serait trompee sur au moins un des cas releves.
+#
+# NOMS BRUTS, SANS CANONICALISATION. Le fuzzy matcher de
+# _correct_ocr_zone_impl rabat un nom sur la whitelist la plus proche.
+# C'est ce qu'il faut pour l'audio de proximite -- deux clients doivent
+# tomber sur le MEME identifiant -- mais pas ici : les whitelists ont
+# ete construites sur ce qu'affiche la ligne du joueur, et les niveaux
+# parents (avant-postes, champs d'asteroides) y sont largement absents.
+# Un nom absent se ferait rabattre sur un voisin arbitraire, et le
+# secouriste partirait vers un lieu inexistant. Un nom brut legerement
+# bruite reste lisible ; un nom faux mais propre ne se detecte pas.
+
+# Tolerant aux confusions OCR usuelles sur "Zone:" (Z/7, o/0, n/m).
+_HIER_ZONE_SPLIT_REGEX = re.compile(r"[z7][o0][nm][e3]\s*[:;]", re.IGNORECASE)
+
+# "Root" duplique SolarSystem : meme position, autre nom. On s'arrete
+# AVANT lui -- lire Root, c'est etre alle trop loin. La regex ne sert
+# donc qu'a le reconnaitre pour ne pas le prendre pour un niveau.
+_HIER_ROOT_REGEX = re.compile(r"^\s*r[o0][o0]t\b", re.IGNORECASE)
+
+
+def _hier_decouper(text: str) -> list:
+    """Decoupe un texte OCR multi-lignes en segments 'Zone: ...'.
+
+    Chaque segment va d'une occurrence de "Zone:" a la suivante, ce qui
+    marche que les lignes soient separees par des \\n ou concatenees.
+    """
+    if not text:
+        return []
+    bornes = [m.start() for m in _HIER_ZONE_SPLIT_REGEX.finditer(text)]
+    if not bornes:
+        return []
+    bornes.append(len(text))
+    return [text[bornes[i]:bornes[i + 1]].strip()
+            for i in range(len(bornes) - 1)]
+
+
+# Deux separateurs decimaux colles : ",.", ".,", ",," ou "..".
+#
+# [URGENCE 12/08/2026] Ce motif ne fait pas ECHOUER le parsing, il le
+# fait mentir. Observe en session sur "12849644,.3530km" : le nombre est
+# coupe en deux, les trois coordonnees glissent d'un cran et la derniere
+# est perdue -- x=12849644 au lieu de 12849644353, z inconnu. Le
+# resultat reste parfaitement plausible, donc indetectable a l'oeil.
+#
+# Une position fausse et credible est le pire cas possible pour un
+# signal d'urgence : elle envoie un secouriste ailleurs sans que
+# personne ne doute. On refuse le segment.
+_HIER_SEPARATEURS_DOUBLES = re.compile(r"\d\s*[.,]\s*[.,]")
+
+
+def _hier_parser_segment(seg: str):
+    """Parse un segment via le chemin reel du pipeline.
+
+    _normalize_numbers() D'ABORD, comme _process_coords_img : c'est elle
+    qui rattrape les separateurs decimaux perdus par l'OCR.
+    """
+    if not seg or not seg.strip():
+        return None
+    if _HIER_SEPARATEURS_DOUBLES.search(seg):
+        _logger(f"[HIERARCHIE] separateur decimal double, segment refuse : "
+                f"{seg[:60]!r}")
+        return None
+    try:
+        d = _parse_coords(_normalize_numbers(seg))
+    except Exception as e:
+        _logger(f"[HIERARCHIE] parse KO sur {seg[:40]!r} : {e}")
+        return None
+    if not d:
+        return None
+    # container_name porte le nom BRUT ; zone est la forme normalisee,
+    # utile pour comparer mais pas pour afficher.
+    nom = d.get("container_name") or d.get("zone") or ""
+    return {
+        "name": nom,
+        "zone": d.get("zone") or "",
+        "container_id": d.get("container_id"),
+        "x": d.get("x"),
+        "y": d.get("y"),
+        "z": d.get("z"),
+    }
+
+
+def _hier_est_systeme(d: dict) -> bool:
+    if not d:
+        return False
+    for cle in ("name", "zone"):
+        v = d.get(cle) or ""
+        if _SYSTEM_ZONE_REGEX.search(str(v)):
+            return True
+    return False
+
+
+def _hier_est_root(d: dict) -> bool:
+    if not d:
+        return False
+    for cle in ("name", "zone"):
+        if _HIER_ROOT_REGEX.match(str(d.get(cle) or "")):
+            return True
+    return False
+
+
+def _hier_lire_une_fois(region: dict, lignes: int) -> dict:
+    """Une capture, une passe OCR, decoupe et parsing."""
+    haute = dict(region)
+    haute["height"] = int(region.get("height", 29)) * int(lignes)
+
+    r = ocr_texts_from_region(haute)
+    text = "\n".join(r.get("texts") or [])
+
+    chaine, systeme, rates = [], None, 0
+    for seg in _hier_decouper(text):
+        # [URGENCE 12/08/2026] Le systeme est reconnu sur le TEXTE du
+        # segment, avant tout parsing. Sans ca, une ligne SolarSystem
+        # illisible laissait croire qu'on ne l'avait pas atteinte, et
+        # c'est Root -- juste apres -- qui declenchait l'abandon. Le
+        # journal accusait alors "Root rencontre avant SolarSystem",
+        # message exact mais trompeur : le vrai probleme etait une ligne
+        # au-dessus.
+        texte_systeme = bool(_SYSTEM_ZONE_REGEX.search(seg))
+
+        d = _hier_parser_segment(seg)
+        if d is None:
+            if texte_systeme:
+                # Sans coordonnees systeme il n'y a pas de referentiel
+                # commun, donc pas de distance : inutile de continuer.
+                _logger("[HIERARCHIE] ligne SolarSystem illisible")
+                rates += 1
+                break
+            # Un niveau illisible n'est PAS ignore en silence : il
+            # changerait la chaine sans que rien ne le signale. On le
+            # compte, et la comparaison des deux captures tranchera.
+            rates += 1
+            continue
+        if texte_systeme or _hier_est_systeme(d):
+            systeme = d
+            # SolarSystem est le dernier niveau utile. Ce qui suit --
+            # Root, puis les compteurs de FPS et les stats serveur --
+            # n'a rien a apporter : Root duplique la position et le
+            # reste n'est pas une zone.
+            break
+        if _hier_est_root(d):
+            # Root avant SolarSystem : lecture desordonnee. On arrete
+            # plutot que de le prendre pour un niveau intermediaire, ce
+            # qui ajouterait une destination inexistante a la chaine.
+            _logger("[HIERARCHIE] Root rencontre avant SolarSystem : "
+                    "lecture abandonnee")
+            break
+        chaine.append(d)
+
+    return {"chain": chaine, "system": systeme,
+            "unparsed": rates, "raw": text}
+
+
+def _hier_proches(a, b, tol) -> bool:
+    """Egalite numerique a tolerance, None compris."""
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    try:
+        return abs(float(a) - float(b)) <= float(tol)
+    except Exception:
+        return False
+
+
+def _hier_concordent(a: dict, b: dict, tol_local: float,
+                     tol_systeme: float) -> bool:
+    """Deux lectures decrivent-elles la meme situation ?
+
+    Les NOMS doivent etre identiques au caractere pres : une divergence
+    signale un OCR instable, et un nom de destination approximatif
+    envoie le secouriste ailleurs.
+
+    Les COORDONNEES ont une tolerance, parce qu'elles bougent pour de
+    vrai entre deux captures -- le releve de reference donnait 0,07 puis
+    0,08 m sur un joueur assis et immobile. La tolerance systeme reste
+    tres inferieure a ce qu'un chiffre errone produirait (des centaines
+    de km), donc elle ne masque pas une erreur de lecture.
+    """
+    if not a or not b:
+        return False
+    if a.get("unparsed") or b.get("unparsed"):
+        return False
+    ca, cb = a.get("chain") or [], b.get("chain") or []
+    if len(ca) != len(cb):
+        return False
+    for na, nb in zip(ca, cb):
+        if (na.get("name") or "") != (nb.get("name") or ""):
+            return False
+        if na.get("container_id") != nb.get("container_id"):
+            return False
+        for axe in ("x", "y", "z"):
+            if not _hier_proches(na.get(axe), nb.get(axe), tol_local):
+                return False
+    sa, sb = a.get("system"), b.get("system")
+    if not sa or not sb:
+        return False
+    for axe in ("x", "y", "z"):
+        if not _hier_proches(sa.get(axe), sb.get(axe), tol_systeme):
+            return False
+    return True
+
+
+def capture_hierarchy(region: dict, lines: int = 8, attempts: int = 3,
+                      tol_local: float = 5.0,
+                      tol_system: float = 25_000.0,
+                      double_lecture: bool = True):
+    """Lit la chaine complete des containers parents du joueur.
+
+    Prevu pour un declenchement ponctuel (signal d'urgence), pas pour
+    une boucle : chaque appel coute deux passes EasyOCR, parfois six.
+
+    Parametres
+    ----------
+    region : dict
+        Zone d'UNE ligne, celle du client (cle `zone_coords` de la
+        config, sinon auto_ocr_zone()). La hauteur est multipliee par
+        `lines` en interne : ne pas fournir une zone deja haute.
+    lines : int
+        Nombre de hauteurs de ligne a capturer vers le bas. 8 couvre
+        largement les cas releves (5 lignes au plus profond) ; le
+        surplus ne coute rien puisque tout ce qui suit SolarSystem est
+        ignore.
+    attempts : int
+        Nombre de tentatives avant d'abandonner. Une divergence n'est
+        jamais arbitree : on refait.
+    double_lecture : bool
+        True  : deux lectures qui doivent concorder. Pour la VICTIME.
+        False : une seule lecture, verifiee seulement complete.
+
+        [13/08/2026] La double lecture protege un ONE-SHOT : une victime
+        au sol ne peut pas relancer sa capture, donc une lecture bruitee
+        n'a pas de tour suivant pour la corriger.
+
+        Le SECOURISTE est dans la situation inverse. Il remesure toutes
+        les 10 a 30 s, donc une lecture douteuse se corrige d'elle-meme ;
+        et surtout il SE DEPLACE. Observe en session : en vol, ses
+        coordonnees planetaires bougent de 233 m entre deux lectures
+        espacees de ~3 s, la ou tol_local vaut 5 m. La concordance
+        echouait a tous les coups et aucune mesure n'aboutissait.
+
+        Elargir la tolerance aurait ete le mauvais correctif : a
+        plusieurs centaines de metres pres, elle n'aurait plus rien
+        attrape.
+    tol_local, tol_system : float
+        Tolerances en metres sur les coordonnees, respectivement pour
+        les niveaux locaux et pour SolarSystem.
+
+        L'ecart entre les deux n'est pas un caprice. [URGENCE 12/08/2026]
+        Observe en session : un joueur IMMOBILE sur Hurston garde des
+        coordonnees locales identiques au centimetre pres pendant six
+        lectures, tandis que ses coordonnees SolarSystem derivent de
+        ~2,2 km par lecture. Ce n'est pas du bruit OCR : c'est la
+        PLANETE qui orbite, a environ 600 m/s. Une tolerance de 1 km sur
+        le systeme faisait echouer trois essais d'affilee sur un
+        mouvement parfaitement reel.
+
+        25 km absorbe l'orbite sur plusieurs secondes tout en restant
+        des ordres de grandeur en dessous de ce qu'un chiffre errone
+        produit -- l'incident du meme jour deplacait de 12 millions de
+        km. Le vrai garde-fou reste la tolerance LOCALE, serree, sur des
+        coordonnees qui ne bougent pas quand le joueur ne bouge pas.
+
+    Retour
+    ------
+    dict ou None. Le dict contient :
+
+        chain   : liste du plus PROCHE au plus LARGE, SolarSystem exclu.
+                  Chaque entree : name (brut), container_id, x, y, z.
+                  Peut n'avoir qu'un seul element (en vol dans l'espace,
+                  seul le vaisseau est present).
+        system  : coordonnees SolarSystem, partagees par tous les
+                  joueurs. C'est le seul referentiel commun garanti,
+                  donc la distance est toujours calculable.
+        raw     : texte OCR complet, pour diagnostic.
+
+    None signifie que la lecture n'a pas ete jugee sure. C'est un
+    resultat normal, pas une panne : mieux vaut dire au joueur que la
+    position n'a pas pu etre lue que d'envoyer un secouriste a un
+    endroit faux.
+    """
+    _ensure_imaging()
+    if not region or "height" not in region:
+        _logger("[HIERARCHIE] region invalide")
+        return None
+
+    for essai in range(1, max(1, int(attempts)) + 1):
+        try:
+            a = _hier_lire_une_fois(region, lines)
+            b = _hier_lire_une_fois(region, lines) if double_lecture else None
+        except Exception as e:
+            _logger(f"[HIERARCHIE] capture KO (essai {essai}) : {e}")
+            continue
+
+        if double_lecture:
+            if not _hier_concordent(a, b, tol_local, tol_system):
+                _logger(f"[HIERARCHIE] essai {essai} : les deux lectures "
+                        f"divergent, on refait")
+                continue
+        else:
+            # Lecture unique : on verifie seulement qu'elle est COMPLETE.
+            # Un niveau illisible amputerait la chaine sans que rien ne le
+            # signale, et l'absence de SolarSystem interdit tout repli.
+            if a.get("unparsed") or not a.get("system"):
+                _logger(f"[HIERARCHIE] essai {essai} : lecture incomplete, "
+                        f"on refait")
+                continue
+
+        noms = " > ".join(d.get("name") or "?" for d in
+                          reversed(a.get("chain") or []))
+        _logger(f"[HIERARCHIE] OK en {essai} essai(s) : {noms or '(vide)'}")
+        return {
+            "chain": a.get("chain") or [],
+            "system": a.get("system"),
+            "raw": a.get("raw", ""),
+        }
+
+    _logger(f"[HIERARCHIE] echec apres {attempts} essai(s)")
+    return None
+
+
 class SCOCRReader:
     """Lit en continu le HUD de Star Citizen et appelle un callback a
     chaque position lue avec succes.
@@ -4937,6 +5587,8 @@ class SCOCRReader:
 #   - is_sign_flip           (= _is_sign_flip)
 #   - are_containers_similar (= _are_containers_similar)
 #   - is_cave_container      (= _is_cave_container)
+#   - is_big_hangar          (= _is_big_hangar)
+#   - is_echo_container      (= _is_echo_container)  [grotte OU grand hangar]
 #   - capture_with_backoff   (= _capture_with_backoff)
 #   - parse_coords           (= _parse_coords)        [parseur prefere]
 #   - normalize_numbers      (= _normalize_numbers)   [normaliseur OCR]
@@ -4953,6 +5605,8 @@ apply_sign_memory      = _apply_sign_memory
 is_sign_flip           = _is_sign_flip
 are_containers_similar = _are_containers_similar
 is_cave_container      = _is_cave_container
+is_big_hangar          = _is_big_hangar
+is_echo_container      = _is_echo_container
 capture_with_backoff   = _capture_with_backoff
 parse_coords           = _parse_coords
 normalize_numbers      = _normalize_numbers

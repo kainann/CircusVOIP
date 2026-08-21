@@ -41,6 +41,7 @@ from PySide6.QtCore import Qt, QRectF, QEvent, Signal
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QPainterPath, QPen, QPixmap,
     QLinearGradient, QRadialGradient, QBrush, QImageReader,
+    QFontMetricsF,
 )
 from PySide6.QtWidgets import QApplication, QWidget
 
@@ -125,6 +126,10 @@ class SettingsApp(PhoneApp):
         self._selected_key = ""           # fond actuellement applique (coche)
         self._file_thumbs = {}            # path -> QPixmap (cache)
         self._default_preview_path = None # image du fond par defaut (tuile)
+        # [NUMERO 05/08/2026] Numero du joueur, pousse par l'overlay.
+        # Vide tant que le welcome n'est pas arrive : on n'affiche alors
+        # RIEN plutot qu'un faux numero ou un "000000" de remplissage.
+        self._mon_numero = ""
 
     # --- API poussee par l'overlay ------------------------------------
     def set_wallpaper_dir(self, path):
@@ -136,6 +141,17 @@ class SettingsApp(PhoneApp):
     def set_selected_key(self, key):
         # Aucun fond configure -> la tuile « Défaut » est cochee.
         self._selected_key = key or _DEFAULT_KEY
+        self.update()
+
+    def set_mon_numero(self, numero):
+        """Numero de telephone du joueur, affiche sous le logo.
+
+        [NUMERO 05/08/2026] Pousse par l'overlay a chaque ouverture de
+        l'app, comme le fond d'ecran : l'app ne lit rien de l'etat global,
+        elle recoit. Une valeur vide (pas encore connecte, ou compte non
+        relie) laisse la ligne vide au lieu d'inventer un numero.
+        """
+        self._mon_numero = str(numero or "").strip()
         self.update()
 
     def set_default_preview(self, path):
@@ -445,6 +461,50 @@ class SettingsApp(PhoneApp):
         p.setFont(ft)
         p.drawText(QRectF(0, h * 0.07, w, h * 0.12), Qt.AlignCenter, "Paramètres")
         self._draw_gear(p, w * 0.5, h * 0.18, max(7, w // 22))
+
+        # [NUMERO 05/08/2026] Numero du joueur, entre le logo et le
+        # premier bouton. Le joueur ne connaissait son propre numero que
+        # par l'onglet Compte de la fenetre principale -- hors du jeu,
+        # donc inaccessible en pleine partie, alors que c'est justement
+        # l'information qu'on donne a l'oral pour se faire rappeler.
+        # Espace libre entre l'engrenage (0.18) et y0 (0.34) : on centre
+        # a 0.245 sans deplacer les boutons.
+        if self._mon_numero:
+            # Libelle discret AU-DESSUS plutot qu'en prefixe sur la meme
+            # ligne : "Numéro de téléphone : 424294" en gras w//14 deborde
+            # d'un ecran de telephone. Sur deux lignes, le libelle peut
+            # rester petit et attenue, et le numero garde sa taille -- il
+            # est fait pour etre lu et dicte a voix haute.
+            # Une seule ligne, deux styles : libelle attenue + numero en
+            # gras accentue. Les tailles sont RETRECIES jusqu'a tenir dans
+            # 92 % de la largeur plutot que fixees en dur -- "Numéro de
+            # téléphone : 424294" fait 26 caracteres, et une valeur codee
+            # en dur qui tient sur cet ecran-ci deborderait sur un
+            # telephone plus etroit, ou apres un changement de police.
+            _lib = "Numéro de téléphone : "
+            _t_lab, _t_num = max(7, w // 26), max(9, w // 16)
+            for _ in range(12):
+                _flab = QFont("Consolas", _t_lab)
+                _fnum = QFont("Consolas", _t_num); _fnum.setBold(True)
+                _wl = QFontMetricsF(_flab).horizontalAdvance(_lib)
+                _wn = QFontMetricsF(_fnum).horizontalAdvance(self._mon_numero)
+                if _wl + _wn <= w * 0.92 or _t_lab <= 6:
+                    break
+                _t_lab -= 1
+                _t_num = max(8, _t_num - 1)
+
+            _band = QRectF(0, h * 0.225, w, h * 0.065)
+            _x = (w - (_wl + _wn)) / 2.0
+            p.setFont(_flab)
+            p.setPen(QColor(_MUTED))
+            p.drawText(QRectF(_x, _band.y(), _wl, _band.height()),
+                       Qt.AlignVCenter | Qt.AlignLeft, _lib)
+            p.setFont(_fnum)
+            p.setPen(QColor(_ACCENT))
+            p.drawText(QRectF(_x + _wl, _band.y(), _wn, _band.height()),
+                       Qt.AlignVCenter | Qt.AlignLeft, self._mon_numero)
+            p.setPen(QColor(_TEXT))
+
         self._rects = []
         bw = w * 0.82; bh = max(34.0, h * 0.11); gap = bh * 0.34
         x = (w - bw) / 2.0; y0 = h * 0.34

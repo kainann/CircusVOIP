@@ -47,7 +47,16 @@ if _env_updates_dir:
     UPDATES_DIR = Path(_env_updates_dir).resolve()
 else:
     UPDATES_DIR = _default_updates_dir
-HTTP_PORT    = 8080
+# [PORTS CONFIGURABLES 26/07/2026] Port lu dans le fichier de config.
+# ATTENTION : le client v0.4 interroge encore ce port EN DUR. Le changer
+# rendrait les mises a jour injoignables. Il ne deviendra reellement
+# configurable qu'une fois le port annonce au client, dans un cycle
+# ulterieur (cf. todo).
+try:
+    from circusvoip_server_config import get_ports as _get_ports
+    HTTP_PORT = _get_ports()["port_update"]
+except Exception:
+    HTTP_PORT = 8080
 
 # ---------------------------------------------
 #  Tkinter (mode UI seulement, optionnel)

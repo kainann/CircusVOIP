@@ -88,7 +88,28 @@ RADIUS_TRIGGER  = 5.0       # m : volume max (zone verte)
 RADIUS_FADE     = 30.0      # m : debut du fondu (volume 0)
 AUDIBLE_RANGE_M = 30.0      # m : limite d'audibilite proximity
 SERVER_PORT     = 8888      # port WS serveur de controle
-AUDIO_PORT      = 8889      # port WS serveur audio
+# [PORTS CONFIGURABLES 26/07/2026] Valeur de repli uniquement. Le port
+# reel est annonce par le serveur de positions dans le message welcome
+# (cle "audio_port") et pousse ici par set_audio_port(). Sans annonce
+# (serveur v0.3), on garde l'historique 8889.
+AUDIO_PORT      = 8889      # port WS serveur audio (defaut/repli)
+
+
+def set_audio_port(port):
+    """Applique le port audio annonce par le serveur.
+
+    Appele a la reception du welcome. Ignore silencieusement une valeur
+    absente ou aberrante : mieux vaut tenter le port par defaut que de
+    ne pas se connecter du tout.
+    """
+    global AUDIO_PORT
+    try:
+        p = int(port)
+        if 1 <= p <= 65535 and p != AUDIO_PORT:
+            AUDIO_PORT = p
+            _dbg_log(f"[NET] Port audio annonce par le serveur : {p}")
+    except Exception:
+        pass
 
 # v0.2 (optim perf) : periode des logs [STATS Xs] et [METRICS] dans la
 # boucle OCR. Reduire cette valeur pendant les phases d'optimisation pour
@@ -672,6 +693,11 @@ class State:
     mute_prox_key    = None   # toggle ecoute proximity (mute_proximity)
     mute_radio_key   = None   # toggle ecoute radio (mute_radio)
     mute_all_key     = None   # toggle tout mute (active/desactive les 3 ci-dessus simultanement)
+    # [RACCOURCI MASQUE 28/07/2026] Bascule le masque DisplayInfo sans
+    # ouvrir les Parametres : utile en cours de partie, notamment pour
+    # les joueurs qui diffusent et veulent masquer/afficher la zone a la
+    # volee. None = aucun raccourci assigne.
+    mask_toggle_key  = None
     # Proximite reduite : mode "chuchotement" qui reduit la portee audible
     # de la voip de proximite a 5m (100% volume jusqu'a 5m, 0% au-dela).
     # Utile pour les conversations discretes en jeu de role.
@@ -687,6 +713,10 @@ class State:
     # ou recepteur) porte un casque. Filtre LOCAL (option A) : chaque joueur
     # decide de son experience, son reglage n'est pas impose aux autres.
     rp_mode          = False
+    # [PROXIMITE VERTICALE 28/07/2026] Ponderation de dz dans les
+    # vaisseaux. Desactive par defaut : c'est un test, active depuis les
+    # Parametres du client.
+    vertical_prox_enabled = False
     # Etat casque local. Defaut True (heuristique : la majorite des joueurs
     # portent un casque en jeu, donc en cas d'incertitude initiale on suppose
     # qu'ils en ont un - mieux que d'omettre le filtre RP au demarrage).
@@ -1240,6 +1270,7 @@ class RadioKeyListener:
         self._on_toggle_prox  = None
         self._on_toggle_radio = None
         self._on_toggle_all   = None  # tout-mute
+        self._on_toggle_mask  = None  # masque DisplayInfo
         self._on_toggle_prox_short = None  # toggle proximite reduite 30m/5m
         self._on_cycle_channel     = None  # cycle vers le canal suivant
         # Callbacks PTT profil : appeles au press/release de profile_radio_key.
@@ -1279,6 +1310,22 @@ class RadioKeyListener:
         if state.phone_in_call:
             try:
                 _dbg_log("[RADIO PTT] press ignore (appel telephone en cours)")
+            except Exception:
+                pass
+            return
+        # [RADIO SANS CANAL 28/07/2026] Sans canal assigne, la radio n'a
+        # aucun destinataire : le serveur relaie une trame 0x01 a la liste
+        # des membres du canal, qui est vide. On emettait donc du son pour
+        # rien — jusqu'a 64 kbit/s montants par joueur, plus le bip PTT et
+        # le forcage du gate, pour un resultat que personne n'entend.
+        # On ignore le press comme pendant un appel telephone.
+        if not state.my_channel:
+            # Anti-spam : la touche peut etre pressee en rafale, on ne
+            # trace qu'une fois toutes les 5 s.
+            try:
+                _dbg_log_dedup("radio_no_channel",
+                               "[RADIO PTT] press ignore : aucun canal "
+                               "assigne, rien n'est emis")
             except Exception:
                 pass
             return
@@ -1367,13 +1414,15 @@ class RadioKeyListener:
                              on_profile_radio_released=None,
                              on_phone_open=None, on_phone_accept=None,
                              on_phone_decline=None, on_phone_mute=None,
-                             on_phone_speaker=None):
+                             on_phone_speaker=None,
+                             on_toggle_mask=None):
         """Enregistre les callbacks de toggle (appeles depuis un thread non-UI).
         Les callbacks doivent etre thread-safe (utiliser root.after en interne)."""
         self._on_toggle_mic   = on_mic
         self._on_toggle_prox  = on_prox
         self._on_toggle_radio = on_radio
         self._on_toggle_all   = on_all
+        self._on_toggle_mask  = on_toggle_mask
         self._on_toggle_prox_short = on_prox_short
         self._on_cycle_channel     = on_cycle_channel
         self._on_profile_radio_pressed  = on_profile_radio_pressed
@@ -1405,6 +1454,17 @@ class RadioKeyListener:
         if state.phone_in_call:
             try:
                 _dbg_log("[RADIO PTT-PROFIL] press ignore (appel telephone en cours)")
+            except Exception:
+                pass
+            return
+        # [RADIO SANS CANAL 28/07/2026] Meme logique cote profil : sans
+        # profil assigne par l'admin, la trame 0x02 n'a aucun destinataire
+        # (la reception filtre sur player_profiles[sender] == my_profile).
+        if not state.my_profile:
+            try:
+                _dbg_log_dedup("radio_no_profile",
+                               "[RADIO PTT-PROFIL] press ignore : aucun "
+                               "profil assigne, rien n'est emis")
             except Exception:
                 pass
             return
@@ -1548,6 +1608,12 @@ class RadioKeyListener:
         if ak and self._on_toggle_all and \
                 _combo_matches_pressed(ak, self._currently_pressed, key_str):
             try: self._on_toggle_all()
+            except Exception: pass
+        # Masque DisplayInfo
+        mk = state.mask_toggle_key or ""
+        if mk and self._on_toggle_mask and \
+                _combo_matches_pressed(mk, self._currently_pressed, key_str):
+            try: self._on_toggle_mask()
             except Exception: pass
         # Proximite reduite (toggle 30m / 5m)
         pxk = state.proximity_short_key or ""
@@ -2142,6 +2208,103 @@ def _update_rp_filter():
 # le callback sounddevice (qui tourne dans un thread audio realtime).
 _audio_send_queue: "queue.Queue[bytes]" = None
 
+# ---------------------------------------------
+#  [OPUS] Passerelle vers le codec
+# ---------------------------------------------
+# Import paresseux et tolerant : circusvoip_opus prepare lui-meme le PATH
+# pour trouver opus.dll avant de charger opuslib. Si la DLL manque (client
+# mal mis a jour), on veut un message clair UNE fois, pas un traceback a
+# chaque trame — d'ou le flag _opus_warned.
+_opus_mod    = None
+_opus_warned = False
+
+
+def _opus_get():
+    global _opus_mod
+    if _opus_mod is None:
+        try:
+            import circusvoip_opus as _m
+            _opus_mod = _m
+        except Exception:
+            _opus_mod = False
+    return _opus_mod or None
+
+
+def _opus_warn_once(contexte: str):
+    global _opus_warned
+    if _opus_warned:
+        return
+    _opus_warned = True
+    m = _opus_get()
+    raison = m.unavailable_reason() if m else "module circusvoip_opus absent"
+    try:
+        _dbg_log(f"[OPUS INDISPONIBLE] {contexte} : {raison}")
+        _dbg_log("[OPUS INDISPONIBLE] verifier opus.dll a cote des modules "
+                 "du client et le paquet opuslib / opuslib-next")
+    except Exception:
+        pass
+
+
+_opus_enc_fail_logged = False
+
+
+def _opus_encode(frame_np, cle=None):
+    """Encode une trame de capture. None = ne rien emettre.
+
+    [SONNERIE 06/08/2026] `cle` identifie le FLUX. Sonnerie et voix sont
+    deux contenus differents au meme instant : un encodeur Opus unique,
+    qui est a etat, se desynchroniserait entre les deux.
+    """
+    global _opus_enc_fail_logged
+    m = _opus_get()
+    if m is None or not m.is_available():
+        _opus_warn_once("emission")
+        return None
+    try:
+        pkt = m.encode(frame_np, cle)
+    except TypeError:
+        pkt = m.encode(frame_np)
+    if pkt is None and not _opus_enc_fail_logged:
+        # Diagnostic detaille UNE fois : la cause la plus probable est une
+        # trame qui ne fait pas exactement BLOCK_SIZE samples (le
+        # peripherique de capture peut livrer une autre taille de bloc),
+        # auquel cas l'encodeur refuse et plus aucun son ne part.
+        _opus_enc_fail_logged = True
+        try:
+            _dbg_log(
+                f"[OPUS ENCODE KO] shape={getattr(frame_np, 'shape', '?')} "
+                f"dtype={getattr(frame_np, 'dtype', '?')} "
+                f"octets={getattr(frame_np, 'nbytes', '?')} "
+                f"(attendu {m.PCM_BYTES} = {m.BLOCK_SIZE} samples float32)"
+            )
+        except Exception:
+            pass
+    return pkt
+
+
+def _opus_decode(sender: str, packet: bytes, flag=None):
+    """Decode une trame recue en PCM float32 brut. None = trame a jeter.
+
+    [OPUS 31/07/2026] `flag` identifie le FLUX, pas seulement l'emetteur.
+    Un meme joueur peut en alimenter plusieurs en meme temps : cette
+    fonction envoie la meme trame encodee en 0x01 ET en 0x00 quand un
+    auditeur est a la fois sur le canal et a portee. Sans le flag, les
+    deux copies entraient dans le meme decodeur Opus, qui est a etat, et
+    le desynchronisaient -> radio degradee et sacadee des que l'emetteur
+    est proche.
+    """
+    m = _opus_get()
+    if m is None or not m.is_available():
+        _opus_warn_once("reception")
+        return None
+    try:
+        return m.decode(sender, packet, flag)
+    except TypeError:
+        # Module Opus anterieur au 31/07 (deploiement partiel) : on
+        # retombe sur l'ancienne signature plutot que de couper le son.
+        return m.decode(sender, packet)
+
+
 # === Stats debug crackling (ajout 25/05/2026) ===
 # Compteurs cumulatifs depuis le demarrage du process. Lus par la boucle
 # [AUDIO STATS] toutes les 30s qui calcule les deltas. Pas de modification
@@ -2183,14 +2346,19 @@ def _flush_audio_send_queue() -> int:
     return n_dropped
 
 
-async def _audio_sender(ws):
-    """Task asyncio : sort les trames de la queue et les envoie sur le WS."""
-    global _audio_send_queue
+async def _audio_sender(ws, ma_queue):
+    """Task asyncio : sort les trames de la queue et les envoie sur le WS.
+
+    [RACE 05/08/2026] 'ma_queue' est passee en PARAMETRE et non lue dans
+    la globale. La globale est reassignee par chaque nouveau
+    _audio_ws_loop ; un sender qui la relirait a chaque tour changerait de
+    file en cours de route, au profit de celle d'un autre thread.
+    """
     loop = asyncio.get_event_loop()
     while True:
         try:
             # run_in_executor pour que queue.get() ne bloque pas la boucle
-            data = await loop.run_in_executor(None, _audio_send_queue.get)
+            data = await loop.run_in_executor(None, ma_queue.get)
         except asyncio.CancelledError:
             # Cancellation propre (le caller a cancel() cette task).
             # Le thread executor reste bloque dans queue.get() : c'est
@@ -2227,7 +2395,28 @@ async def _audio_ws_loop(ui, my_gen: int = 0):
     """
     global _audio_send_queue
     import queue as _q
-    _audio_send_queue = _q.Queue(maxsize=50)
+    # [RACE 05/08/2026] La file est gardee dans une variable LOCALE au
+    # thread, en plus d'etre publiee dans la globale (que lit
+    # _on_audio_captured pour deposer les trames).
+    #
+    # Sans ca, le bloc 'finally' plus bas relisait la GLOBALE au moment de
+    # se fermer -- or lors d'une reconnexion, le nouveau thread l'a deja
+    # remplacee. L'ancien thread deposait donc sa sentinelle None dans la
+    # file du NOUVEAU, dont le _audio_sender la lisait, l'interpretait
+    # comme un signal de fin et sortait aussitot.
+    #
+    # Symptome vecu : socket ouvert, JOIN audio enregistre, reception
+    # normale -- mais plus rien n'est emis. Le serveur voyait
+    # 'parleurs=0' avec rate_drops=0 et broadcast_dead=0, donc aucune
+    # erreur nulle part. Cote joueurs : rond gris, il vous entend, vous ne
+    # l'entendez plus.
+    #
+    # C'est une COURSE : si l'ancien thread finit son finally avant que le
+    # nouveau ne reassigne la globale, la sentinelle atterrit au bon
+    # endroit et tout va bien. D'ou un bug qui n'apparait que sur
+    # certaines reconnexions.
+    _ma_queue = _q.Queue(maxsize=50)
+    _audio_send_queue = _ma_queue
 
     while True:
         # [P4+] Verifier qu'on est toujours le thread actif. Si un
@@ -2241,10 +2430,31 @@ async def _audio_ws_loop(ui, my_gen: int = 0):
             await asyncio.sleep(1)
             continue
 
+        # [PORTS CONFIGURABLES 26/07/2026] Attendre le welcome avant de
+        # tenter la connexion audio. Il porte le port annonce ET le
+        # ticket d'authentification : se connecter avant, c'est viser le
+        # port par defaut et echouer (WinError 1225 observe le 28/07),
+        # puis attendre la reconnexion suivante — 5 secondes perdues a
+        # chaque connexion sur un serveur a port personnalise.
+        # L'attente est bornee : sur un serveur qui n'enverrait jamais
+        # de ticket, on tente quand meme plutot que de rester bloque.
+        _t_wait = 0.0
+        while not getattr(state, "audio_ticket", ""):
+            if my_gen != 0 and my_gen != state.audio_ws_generation:
+                break
+            if _t_wait >= 5.0:
+                _dbg_log("[AUDIO] welcome non recu apres 5s, tentative "
+                         "de connexion audio avec le port courant")
+                break
+            await asyncio.sleep(0.1)
+            _t_wait += 0.1
+        if my_gen != 0 and my_gen != state.audio_ws_generation:
+            break
+
         # Vider la queue des vieilles trames d'une precedente connexion
-        while not _audio_send_queue.empty():
+        while not _ma_queue.empty():
             try:
-                _audio_send_queue.get_nowait()
+                _ma_queue.get_nowait()
             except Exception:
                 break
 
@@ -2276,7 +2486,7 @@ async def _audio_ws_loop(ui, my_gen: int = 0):
                 }))
 
                 # Lancer le task d'envoi en parallele de la reception
-                sender_task = asyncio.create_task(_audio_sender(ws))
+                sender_task = asyncio.create_task(_audio_sender(ws, _ma_queue))
 
                 try:
                     async for msg in ws:
@@ -2299,8 +2509,51 @@ async def _audio_ws_loop(ui, my_gen: int = 0):
                             is_radio_canal  = (flag == 1)
                             is_radio_profil = (flag == 2)
                             is_phone        = (flag == 3)
+                            is_ring         = (flag == 4)
                             is_radio = is_radio_canal or is_radio_profil  # alias pour audio_io
-                            frame    = payload[1:]
+                            # [OPUS] Frontiere codec cote reception. Tout
+                            # ce qui suit (effet radio, mix, volumes, echo
+                            # grotte) continue de manipuler du float32 et
+                            # n'a pas ete touche.
+                            # decode() renvoie None si la trame est
+                            # inexploitable — notamment si elle fait
+                            # exactement 3840 octets, signature d'un client
+                            # v0.3 reste en PCM brut : on la jette au lieu
+                            # de la passer a Opus, qui produirait du bruit
+                            # fort dans les oreilles du joueur.
+                            frame = _opus_decode(sender, payload[1:], flag)
+                            if frame is None:
+                                if len(payload) - 1 == 3840:
+                                    _opus_warn_once(
+                                        f"trame PCM v0.3 recue de {sender}, ignoree")
+                                continue
+
+                            # ── Sonnerie d'un voisin (flag 0x04) ──
+                            # [SONNERIE 06/08/2026] Aucun gain applique
+                            # ici : audio_io range la trame sous une cle
+                            # derivee, lui donne sa propre file et son mix,
+                            # et y applique la distance PUIS le curseur du
+                            # RECEPTEUR. Doubler le calcul ici attenuerait
+                            # deux fois.
+                            # Le mute proximite coupe aussi les sonneries :
+                            # se rendre sourd a son entourage et continuer
+                            # d'entendre son telephone n'aurait pas de sens.
+                            if is_ring:
+                                if state.mute_proximity:
+                                    continue
+                                if state.audio_io is None:
+                                    continue
+                                try:
+                                    state.audio_io.feed_remote_frame(
+                                        sender, frame, is_ring=True)
+                                except TypeError:
+                                    # audio_io pas encore a jour : on ignore
+                                    # la trame plutot que de la jouer plein
+                                    # pot dans le mix de proximite.
+                                    pass
+                                except Exception:
+                                    pass
+                                continue
 
                             # ── CircusPhone (D3) : trame voix telephone ──
                             # Une trame 0x03 n'est jouee QUE si elle vient
@@ -2438,25 +2691,29 @@ async def _audio_ws_loop(ui, my_gen: int = 0):
                     # donc on doit le reveiller proprement. Au shutdown
                     # asyncio joindrait alors les threads et abandonnerait
                     # apres 300s avec un RuntimeWarning.
+                    # [RACE 05/08/2026] _ma_queue, PAS _audio_send_queue :
+                    # la globale peut deja designer la file d'un thread
+                    # plus recent, qu'on tuerait en y deposant cette
+                    # sentinelle.
                     try:
-                        if _audio_send_queue is not None:
+                        if _ma_queue is not None:
                             # Si la queue est pleine, on draine d'abord
                             # quelques items pour garantir que put_nowait
                             # passe. Pas besoin de tout vider, juste assez
                             # pour faire de la place pour la sentinel.
                             try:
-                                _audio_send_queue.put_nowait(None)
+                                _ma_queue.put_nowait(None)
                             except Exception:
                                 # Queue pleine : on draine puis on retente.
                                 try:
                                     for _ in range(60):
-                                        if _audio_send_queue.empty():
+                                        if _ma_queue.empty():
                                             break
-                                        _audio_send_queue.get_nowait()
+                                        _ma_queue.get_nowait()
                                 except Exception:
                                     pass
                                 try:
-                                    _audio_send_queue.put_nowait(None)
+                                    _ma_queue.put_nowait(None)
                                 except Exception:
                                     pass
                     except Exception:
@@ -2560,14 +2817,54 @@ def _on_audio_captured(frame_np):
     # depuis l'overlay (ecran 'En appel'), aucune trame n'est emise.
     # La capture continue de tourner (pour reprendre instantanement) mais
     # cette frame est simplement jetee. Coupure NETTE : la spec l'impose.
+    # [SONNERIE PROXIMITE 28/07/2026] La sonnerie n'est diffusee QUE sur
+    # le canal de proximite : pas de radio, pas de profil, pas de
+    # telephone. Un PTT actif la met donc en pause cote reseau (elle
+    # continue de sonner localement).
+    # Pourquoi cette restriction plutot qu'un envoi separe : le recepteur
+    # n'a qu'UN decodeur Opus par emetteur, tous flags confondus. Emettre
+    # un contenu different en 0x00 et en 0x01 au meme instant ferait
+    # transiter deux flux dans le meme decodeur et produirait des
+    # artefacts. Un decodeur par couple emetteur/flag serait la solution
+    # propre, mais c'est un chantier a part.
+    _ptt_actif = (state.phone_in_call or state.radio_active
+                  or state.profile_radio_active)
+    _ring = None
     if state.audio_io is not None:
         try:
+            _ring_actif = state.audio_io.is_ring_tx_active()
             if state.audio_io.is_capture_muted():
-                return
+                # Micro coupe : on ne poursuit que si une sonnerie doit
+                # reellement partir. audio_io a deja remplace la voix par
+                # du silence, aucune fuite possible.
+                if not _ring_actif or _ptt_actif:
+                    return
+            # [SONNERIE 06/08/2026] Part meme sous PTT : flux dedie, donc
+            # on peut parler pendant que son telephone sonne autour de soi.
+            if _ring_actif:
+                _ring = state.audio_io.pop_ring_tx_frame(len(frame_np))
         except Exception:
-            pass
+            _ring = None
     try:
-        frame_bytes = frame_np.tobytes()
+        # [OPUS] Frontiere codec cote emission. Avant : PCM float32 brut
+        # (3840 o/trame, 1536 kbit/s par parleur en flux continu, mesure
+        # du 26/07). Maintenant : ~58 o en voix, ~23 en silence.
+        # L'encodage est fait UNE SEULE FOIS ici, meme quand on emet deux
+        # trames (radio/telephone + proximite) : c'est le meme audio, seul
+        # l'octet de flag change. Le flag reste en position 0, donc toute
+        # la logique radio/telephone/proximite en aval est inchangee.
+        # Si le codec est indisponible on n'emet RIEN : envoyer du PCM
+        # brut produirait du bruit fort chez les recepteurs v0.4.
+        # [SONNERIE 06/08/2026] Plus additionnee a la voix : une fois les
+        # deux sommees puis encodees, il n'y a plus qu'un signal et le
+        # recepteur ne peut plus baisser l'une sans l'autre. Flux dedie,
+        # flag 0x04, encodeur dedie.
+        _ring_bytes = None
+        if _ring is not None:
+            _ring_bytes = _opus_encode(_ring, cle="ring")
+        frame_bytes = _opus_encode(frame_np)
+        if frame_bytes is None:
+            return
 
         def _put(data):
             global _audio_send_frames_total, _audio_send_frames_dropped
@@ -2595,6 +2892,10 @@ def _on_audio_captured(frame_np):
                 except Exception:
                     pass
             _audio_send_queue.put_nowait(data)
+
+        # Flux sonnerie, independant de la voix et de tout PTT.
+        if _ring_bytes is not None:
+            _put(b"\x04" + _ring_bytes)
 
         if state.phone_in_call:
             # Appel telephone en cours : flag 0x03 + (eventuellement)
@@ -2666,6 +2967,8 @@ def _heartbeat_loop(ui: "ClientUI"):
 from circusvoip_sc_ocr import (
     read_coords,
     distance,
+    is_ship_zone,
+    VERTICAL_WEIGHT_FACTOR,
     compute_proximity_volume,
     auto_ocr_zone,
     list_monitors,
@@ -2674,7 +2977,31 @@ from circusvoip_sc_ocr import (
     _are_containers_similar,
     _is_sticky_zone_variant,
     _is_cave_container,
+    _is_big_hangar,
 )
+
+# [VPROX 05/08/2026] Remanence de la detection "je suis dans un vaisseau".
+#
+# Le correctif du matin a supprime la cause STRUCTURELLE du clignotement
+# (la branche [CID SIMILAIRE] qui ne reportait pas 'zone'). Il reste le
+# bruit OCR sur le NOM lui-meme : releve en session, un 'rsi_polaris' lu
+# 'polaris' -- absent de la whitelist des 169 vaisseaux -- a fait tomber
+# l'attenuation pendant 0,9 s :
+#
+#   20:38:26  poids vertical -> x1   (zone='polaris')
+#   20:38:27  poids vertical -> x10  (zone='rsi_polaris')
+#
+# Ca ne se corrige pas en fiabilisant la lecture, et surtout pas en
+# ajoutant 'polaris' a la whitelist : la prochaine troncature serait
+# 'aris' ou 'rsi_polari', et la liste deviendrait un depotoir de fautes
+# d'OCR. Il faut une memoire courte.
+#
+# 8 s = quatre lectures OCR (une toutes les ~2 s). Trois echecs d'affilee
+# sont necessaires pour percer la remanence, ce qui ne se produit plus par
+# bruit mais par sortie reelle. Le prix est un retard maximal de 8 s a la
+# sortie d'un vaisseau -- imperceptible, marcher jusqu'a la rampe prend
+# plus longtemps.
+VPROX_HYSTERESIS_S = 8.0
 
 # Le flag _minus_was_restored est lu par la boucle pour savoir si la
 # detection visuelle de tirets a corrige une lecture (auquel cas le
@@ -3718,6 +4045,16 @@ def _ocr_loop_inner(ui: "ClientUI"):
                              f"(reecrit en {cid_last!r})")
                     pos["container_id"]   = cid_last
                     pos["container_name"] = last_pos.get("container_name", pos.get("container_name"))
+                    # [VPROX 05/08/2026] 'zone' doit suivre le meme sort que
+                    # container_name, sinon on stabilise le container tout en
+                    # laissant passer une zone bruitee. Consequence vecue :
+                    # la proximite ne decroche pas (le cid est reecrit) mais
+                    # is_ship_zone() echoue sur cette lecture et l'attenuation
+                    # verticale saute pour un tour -> intermittence audible
+                    # sans aucun autre symptome. La branche [ZONE COLLANTE]
+                    # ci-dessous le faisait deja ; celle-ci l'avait oublie.
+                    if last_pos.get("zone") is not None:
+                        pos["zone"] = last_pos.get("zone")
                     stats_cid_similar += 1
                 # [build 61] Zone collante : variante OCR tres bruitee d'un cid
                 # name: (au-dela de la distance 2 de _are_containers_similar,
@@ -3785,16 +4122,27 @@ def _ocr_loop_inner(ui: "ClientUI"):
             # Mettre a jour l'UI
             ui.update_my_pos(pos)
 
-            # Activer/desactiver l'echo grotte selon le container courant.
-            # Appele a chaque nouvelle pos (OCR) pour reagir des l'entree/sortie
-            # d'une grotte. Interne a audio_io : toggle sans cout si valeur
-            # inchangee.
+            # Activer/desactiver la reverb selon le container courant.
+            # Appele a chaque nouvelle pos (OCR) pour reagir des l'entree/
+            # sortie du lieu. Interne a audio_io : toggle sans cout si
+            # valeur inchangee.
+            #
+            # [ECHO HANGARS 13/08/2026] Deux profils de reverb au lieu
+            # d'un booleen : demande joueur d'avoir de la reverb dans les
+            # hangars, mais la reverb grotte n'y sonne pas juste -- une
+            # caverne est un volume absorbant, un hangar une grande boite
+            # metallique ouverte. Les reglages vivent dans audio_io, la
+            # reconnaissance des lieux dans le module OCR.
             if state.audio_io is not None:
-                in_cave = _is_cave_container(
-                    pos.get("container_id") or "",
-                    pos.get("container_name") or "",
-                )
-                state.audio_io.set_cave_echo(in_cave)
+                cid = pos.get("container_id") or ""
+                cnom = pos.get("container_name") or ""
+                if _is_cave_container(cid, cnom):
+                    profil = "grotte"
+                elif _is_big_hangar(cid, cnom):
+                    profil = "hangar"
+                else:
+                    profil = None
+                state.audio_io.set_echo_profile(profil)
 
             for name, info in state.players.items():
                 if info.get("pos"):
@@ -3812,7 +4160,71 @@ def _ocr_loop_inner(ui: "ClientUI"):
                         # Containers differents -> hors de portee
                         d = float("inf")
                     else:
-                        d = distance(pos, info["pos"])
+                        # [PROXIMITE VERTICALE 28/07/2026] Dans un
+                        # vaisseau, un denivele signifie une cloison :
+                        # on aplatit la sphere de proximite en
+                        # ellipsoide. On teste MA zone, lue localement
+                        # (elle est forcement la meme que la sienne
+                        # puisque les container_id correspondent).
+                        # [VPROX 05/08/2026] On lit 'zone' PUIS
+                        # 'container_name' en repli, comme le mannequin
+                        # (circusvoip_mannequin.py, _distance) : les deux
+                        # composants posaient jusqu'ici deux questions
+                        # differentes sur le meme fait, ce qui rendait toute
+                        # comparaison a l'oreille ininterpretable.
+                        # container_name est le champ que la chaine anti-bruit
+                        # OCR protege le mieux ; il sert de filet quand 'zone'
+                        # est vide ou bruitee. La whitelist reste le seul juge
+                        # : un nom hors liste ne declenche rien, donc le repli
+                        # ne peut qu'attenuer davantage la ou c'est legitime,
+                        # jamais a tort.
+                        _zw = 1.0
+                        if getattr(state, "vertical_prox_enabled", False):
+                            try:
+                                _zone_vprox = (pos.get("zone")
+                                               or pos.get("container_name")
+                                               or "")
+                                _now_vp = time.monotonic()
+                                _mode_vp = "off"
+                                if is_ship_zone(_zone_vprox):
+                                    _zw = VERTICAL_WEIGHT_FACTOR
+                                    _mode_vp = "direct"
+                                    state._vprox_last_ok_ts = _now_vp
+                                else:
+                                    # Remanence : la derniere detection
+                                    # franche vaut encore quelques secondes.
+                                    # Elle n'est JAMAIS invoquee tant qu'il
+                                    # n'y a pas eu de detection positive --
+                                    # sans quoi on attenuerait a l'entree
+                                    # d'un hangar au seul motif qu'aucun
+                                    # vaisseau n'a encore ete vu.
+                                    _ok_ts = getattr(state,
+                                                     "_vprox_last_ok_ts", 0.0)
+                                    if (_ok_ts > 0.0
+                                            and (_now_vp - _ok_ts)
+                                            < VPROX_HYSTERESIS_S):
+                                        _zw = VERTICAL_WEIGHT_FACTOR
+                                        _mode_vp = "remanence"
+
+                                # Journal des BASCULES uniquement (pas de
+                                # ligne par tour). Le MODE fait partie de la
+                                # cle : passer de "direct" a "remanence" ne
+                                # change pas le volume, mais c'est
+                                # exactement ce qu'on veut voir. Sans cette
+                                # ligne, la remanence masquerait en silence
+                                # un OCR qui se degrade -- un repli
+                                # silencieux, ce que le corollaire de la
+                                # §5 ter interdit.
+                                _cle_vp = (_zw, _mode_vp)
+                                if _cle_vp != getattr(state,
+                                                      "_vprox_last_key", None):
+                                    state._vprox_last_key = _cle_vp
+                                    _dbg_log(f"[VPROX] poids vertical -> "
+                                             f"x{_zw:.0f} [{_mode_vp}] "
+                                             f"(zone={_zone_vprox!r})")
+                            except Exception:
+                                _zw = 1.0
+                        d = distance(pos, info["pos"], z_weight=_zw)
                     info["dist"] = d
                     # Rafraichir l'UI de ce joueur
                     ui.update_player(name, info["pos"], d)

@@ -64,9 +64,174 @@ from circusvoip_security import AuthRegistry, RateLimiter
 # cette valeur a "127.0.0.1" pour que SEUL le proxy local puisse parler
 # au serveur (voir le bloc TLS dans _server_main()).
 HOST = "0.0.0.0"
-PORT = 8888
+# [PORTS CONFIGURABLES 26/07/2026] Les ports viennent desormais de
+# circusvoip_server_config.json (memes valeurs par defaut qu'avant, donc
+# rien ne change tant que l'admin n'y touche pas).
+# PORT est le point de RENDEZ-VOUS : le seul que le client doit connaitre
+# a l'avance, saisi sous la forme ip:port. AUDIO_PORT lui est annonce
+# dans le message welcome, il n'a donc plus a le deviner.
+try:
+    from circusvoip_server_config import get_ports as _get_ports
+    _PORTS = _get_ports()
+except Exception:
+    _PORTS = {"port_positions": 8888, "port_audio": 8889, "port_update": 8080}
+PORT = _PORTS["port_positions"]
+AUDIO_PORT = _PORTS["port_audio"]
 CLIENT_TIMEOUT = 30.0
 SERVER_TOKEN = get_token()  # charge ou cree le token joueur
+
+# [DISCORD 30/07/2026] Comptes / annuaire. Le store est le proprietaire
+# de l'identite : discord_id -> {pseudo, numero}. Il tolere l'absence de
+# configuration Discord (le serveur demarre, seule la liaison repond
+# "non configuree"), mais PAS un fichier de comptes corrompu -- effacer
+# l'annuaire de tout le monde en silence serait pire que de refuser de
+# demarrer.
+# [QUEUE 03/08/2026] Messagerie differee + anti-spam. Import GARDE, comme
+# les comptes : un deploiement ou le module manque doit continuer a tourner
+# exactement comme avant (message perdu si la cible est hors ligne), pas
+# refuser de demarrer. C'est ce qui permet de deployer les fichiers en deux
+# temps sans coupure.
+_QUEUE_ENABLED = False
+_queue_store = None
+_rate_limiter = None
+try:
+    from circusvoip_phone_queue import (
+        QueueStore as _QueueStore,
+        RateLimiter as _RateLimiter,
+        KIND_MSG as _K_MSG, KIND_IMG as _K_IMG, KIND_MISSED as _K_MISSED,
+        V_OK as _V_OK, V_REFUS as _V_REFUS, V_SILENCE as _V_SILENCE,
+        V_KICK as _V_KICK, V_BLOCAGE as _V_BLOCAGE,
+    )
+    _queue_store = _QueueStore()
+    _rate_limiter = _RateLimiter()
+    _QUEUE_ENABLED = True
+except Exception as _e_q:
+    pass
+
+# [TRAVAIL 10/08/2026] Tableau d'annonces entre joueurs.
+#
+# Import garde comme celui de phone_queue, et BRUYANT pour les memes
+# raisons : une app Travail absente ne doit pas empecher la VOIP de
+# tourner, mais son absence ne doit pas non plus etre silencieuse -- les
+# joueurs verraient une app qui ne repond jamais, sans que rien ne le
+# signale cote serveur.
+# [URGENCE 15/08/2026] Meme dispositif que Travail : un drapeau, un
+# bandeau bruyant si le module manque. Une app d'urgence qui ne repond
+# pas doit se voir cote serveur -- sinon un joueur declenche un signal
+# qui ne part nulle part, et personne ne sait pourquoi.
+_URGENCE_ENABLED = False
+_urgence_store = None
+
+_TRAVAIL_ENABLED = False
+_travail_store = None
+try:
+    import circusvoip_phone_travail as _TR
+    from circusvoip_travail_store import MissionStore as _MissionStore, \
+        destinataires as _travail_destinataires
+    _travail_store = _MissionStore()
+    _TRAVAIL_ENABLED = True
+except Exception as _e_tr:
+    import sys as _sys_tr
+    for _st in (_sys_tr.stderr, _sys_tr.stdout):
+        try:
+            print("=" * 68, file=_st)
+            print("[TRAVAIL] *** APP TRAVAIL DESACTIVEE ***", file=_st)
+            print(f"[TRAVAIL] Module indisponible : {_e_tr!r}", file=_st)
+            print("[TRAVAIL] Consequence : les joueurs voient l'app mais",
+                  file=_st)
+            print("[TRAVAIL] aucune mission ne circulera.", file=_st)
+            print("=" * 68, file=_st, flush=True)
+        except Exception:
+            pass
+
+
+try:
+    import circusvoip_phone_urgence as _UR
+    from circusvoip_urgence_store import UrgenceStore as _UrgenceStore
+    _urgence_store = _UrgenceStore()
+    _URGENCE_ENABLED = True
+except Exception as _e_ur:
+    import sys as _sys_ur
+    for _st in (_sys_ur.stderr, _sys_ur.stdout):
+        try:
+            print("=" * 68, file=_st)
+            print("[URGENCE] *** APP URGENCE DESACTIVEE ***", file=_st)
+            print(f"[URGENCE] Module indisponible : {_e_ur!r}", file=_st)
+            print("[URGENCE] Consequence : les joueurs voient l'app mais",
+                  file=_st)
+            print("[URGENCE] aucun signal ne partira.", file=_st)
+            print("=" * 68, file=_st)
+            _st.flush()
+        except Exception:
+            pass
+
+
+_GROUPES_ENABLED = False
+_groupes_store = None
+try:
+    import circusvoip_phone_groupes as _GR
+    from circusvoip_groupes_store import GroupeStore as _GroupeStore
+    _groupes_store = _GroupeStore()
+    _GROUPES_ENABLED = True
+except Exception as _e_gr:
+    import sys as _sys_gr
+    for _st in (_sys_gr.stderr, _sys_gr.stdout):
+        try:
+            print("=" * 68, file=_st)
+            print("[GROUPES] *** GROUPES DESACTIVES ***", file=_st)
+            print(f"[GROUPES] Module indisponible : {_e_gr!r}", file=_st)
+            print("[GROUPES] Consequence : les joueurs peuvent ouvrir",
+                  file=_st)
+            print("[GROUPES] l'ecran mais aucun groupe ne sera cree, et",
+                  file=_st)
+            print("[GROUPES] les groupes existants seront INVISIBLES.",
+                  file=_st)
+            print("=" * 68, file=_st)
+            _st.flush()
+        except Exception:
+            pass
+
+
+_ACCOUNTS_ENABLED = False
+_accounts_ctx = None
+try:
+    from circusvoip_accounts import AccountStore as _AccountStore
+    from circusvoip_accounts_ws import (
+        ACCOUNT_TYPES as _ACCOUNT_TYPES,
+        AccountsContext as _AccountsContext,
+        handle as _accounts_handle,
+        authenticate_join as _accounts_auth_join,
+    )
+    try:
+        from circusvoip_server_config import get_discord as _get_discord
+        _DISCORD_CFG = _get_discord()
+    except Exception:
+        _DISCORD_CFG = {"client_id": "", "client_secret": ""}
+    _accounts_ctx = _AccountsContext(
+        _AccountStore(),
+        _DISCORD_CFG.get("client_id", ""),
+        _DISCORD_CFG.get("client_secret", ""),
+        SERVER_TOKEN,
+        log=lambda m: _log(m, BLUE),
+        # Comptes de service (mannequin, tests de charge) : actives par
+        # "allow_service_accounts": true dans circusvoip_server_config.json.
+        # Absent = desactive, donc un serveur de jeu n'expose rien.
+        allow_service=bool(_DISCORD_CFG.get("allow_service_accounts", False)),
+        service_secret=str(_DISCORD_CFG.get("service_secret", "") or ""),
+    )
+    _ACCOUNTS_ENABLED = True
+except Exception as _e_acc:
+    # Modules absents (ancien deploiement) : le serveur tourne comme
+    # avant, sans comptes. C'est ce qui permet de deployer les fichiers
+    # en deux temps sans coupure.
+    _ACCOUNT_TYPES = ()
+    print(f"[COMPTES] desactives : {_e_acc}", flush=True)
+
+# Exiger un compte pour se connecter (decision du 30/07 : liaison
+# Discord obligatoire). Mis a False, le serveur accepte les clients sans
+# compte comme avant -- indispensable tant que le mannequin et les tests
+# de charge n'ont pas de compte de service.
+REQUIRE_ACCOUNT = True
 
 # [P2] Limite le nombre de joueurs simultanes (DoS guard).
 MAX_CLIENTS = 64
@@ -406,6 +571,20 @@ active_calls: dict = {}
 # Duree maximale de sonnerie avant "appel non abouti" (spec : 45 s).
 PHONE_RING_TIMEOUT_S = 45.0
 
+# [MISSED 06/08/2026] Duree minimale d'une sonnerie pour qu'un appel
+# abandonne laisse une trace.
+#
+# Jusqu'ici seule l'expiration des 45 s produisait un appel manque.
+# L'appelant qui raccrochait avant -- le cas le plus frequent -- ne
+# gardait rien dans son historique, et l'appele ne recevait aucun appel
+# manque. Un appel de 40 s disparaissait aussi surement qu'une faute de
+# frappe au clavier.
+#
+# 5 s : assez pour ecarter le numero compose de travers et corrige
+# aussitot, assez bas pour couvrir un abandon normal. En dessous, on
+# considere qu'il n'y a pas eu d'intention d'appeler.
+PHONE_MISSED_MIN_S = 5.0
+
 # Log debug dedie aux appels (separe du log serveur generique).
 PHONE_LOG_FILE = _DEBUG_DIR / "phone_calls.log"
 _phone_log_fp = None
@@ -653,6 +832,167 @@ def _log(msg: str, color: str = TEXT):
 
 
 # ─────────────────────────────────────────────
+#  [OBS1] Instrumentation debit (25/07/2026)
+# ─────────────────────────────────────────────
+# Meme demarche que cote serveur audio : on veut le sortant REEL, pas
+# seulement l'entrant. Le flux positions est en N^2 lui aussi (chaque
+# position recue est rediffusee a tous les autres), et il devient le
+# premier poste de bande passante des que l'audio est compresse.
+# Ces compteurs servent de mesure de reference AVANT la diffusion par
+# zone (todo 8) : le fanout doit ensuite chuter de ~N-1 vers ~2-3.
+
+class _PosStats:
+    bytes_in     = 0     # octets recus des joueurs (tous types de messages)
+    msgs_in      = 0
+    bytes_in_pos = 0     # dont messages "pos" seuls
+    msgs_in_pos  = 0
+    bytes_out    = 0     # octets emis, comptes PAR DESTINATAIRE
+    msgs_out     = 0
+    bytes_out_by_name: dict = {}   # {pseudo: octets emis vers lui}
+
+_pstats = _PosStats()
+
+
+def _count_out(ws, size: int):
+    """Comptabilise un envoi reussi vers un joueur. Appele par les
+    fonctions _broadcast_* ; les envois echoues ne sont pas comptes."""
+    _pstats.bytes_out += size
+    _pstats.msgs_out  += 1
+    info = clients.get(ws)
+    if info:
+        n = info.get("name")
+        if n:
+            _pstats.bytes_out_by_name[n] = (
+                _pstats.bytes_out_by_name.get(n, 0) + size
+            )
+
+
+_AUDIO_STATS_FILE = Path(__file__).resolve().parent / "circusvoip_audio_stats.json"
+
+
+def _read_audio_stats() -> dict:
+    """Relit le fichier de stats ecrit par le serveur audio (process
+    separe, port 8889). Retourne {} si absent, illisible ou perime :
+    la console admin affichera alors "audio: n/a" plutot que des
+    chiffres faux."""
+    try:
+        raw = json.loads(_AUDIO_STATS_FILE.read_text(encoding="utf-8"))
+        if time.time() - float(raw.get("ts", 0)) > 30.0:
+            return {}
+        return raw
+    except Exception:
+        return {}
+
+
+async def _report_pos_stats():
+    """[OBS1] Boucle de mesure du flux positions. Pousse un message
+    "stats" aux admins toutes les 5s et logge une ligne toutes les 30s
+    pour pouvoir tracer une courbe de charge apres un test groupe."""
+    tick = 0
+    acc_out, acc_elapsed = {}, 0.0
+    acc_bin = acc_bout = 0
+    # [OBS1] Accumules sur la meme fenetre 30s que acc_bin/acc_bout,
+    # sinon le fanout de la ligne 30s serait celui du dernier tick 5s.
+    acc_min = acc_mout = 0
+    # [OBS1] Echantillons audio relus toutes les 5s via le pont fichier.
+    # On les moyenne sur 30s : le fichier ne contient que le dernier
+    # tick de 5s, l'additionner tel quel a un total positions sur 30s
+    # donnerait une ligne incoherente.
+    aud_in_s, aud_out_s = [], []
+    last_ts = time.monotonic()
+    while True:
+        await asyncio.sleep(5)
+        now_ts       = time.monotonic()
+        elapsed      = max(0.001, now_ts - last_ts)
+        last_ts      = now_ts
+        acc_elapsed += elapsed
+
+        kbps_in  = _pstats.bytes_in  * 8 / 1000.0 / elapsed
+        kbps_out = _pstats.bytes_out * 8 / 1000.0 / elapsed
+        fanout   = (_pstats.msgs_out / _pstats.msgs_in) if _pstats.msgs_in else 0.0
+        audio    = _read_audio_stats()
+
+        try:
+            await _broadcast_admins(json.dumps({
+                "type": "stats",
+                "pos": {
+                    "clients":  len(clients),
+                    "kbps_in":  round(kbps_in, 1),
+                    "kbps_out": round(kbps_out, 1),
+                    "msgs_in":  round(_pstats.msgs_in / elapsed, 1),
+                    "msgs_out": round(_pstats.msgs_out / elapsed, 1),
+                    "fanout":   round(fanout, 2),
+                },
+                "audio": audio,
+            }))
+        except Exception:
+            pass
+
+        acc_bin  += _pstats.bytes_in
+        acc_bout += _pstats.bytes_out
+        acc_min  += _pstats.msgs_in
+        acc_mout += _pstats.msgs_out
+        if audio:
+            aud_in_s.append(float(audio.get("kbps_in", 0.0)))
+            aud_out_s.append(float(audio.get("kbps_out", 0.0)))
+        for n, v in _pstats.bytes_out_by_name.items():
+            acc_out[n] = acc_out.get(n, 0) + v
+
+        _pstats.bytes_in  = _pstats.msgs_in  = 0
+        _pstats.bytes_out = _pstats.msgs_out = 0
+        _pstats.bytes_in_pos = _pstats.msgs_in_pos = 0
+        _pstats.bytes_out_by_name.clear()
+
+        tick += 1
+        if tick >= 6:
+            tick = 0
+            w = max(0.001, acc_elapsed)
+            w_fanout = (acc_mout / acc_min) if acc_min else 0.0
+            _log(f"[OBS1 DEBIT] 30s positions | joueurs={len(clients)} | "
+                 f"IN {acc_bin * 8 / 1000.0 / w:.1f} kbit/s | "
+                 f"OUT {acc_bout * 8 / 1000.0 / w:.1f} kbit/s | "
+                 f"fanout x{w_fanout:.1f}", MUTED)
+            if acc_out:
+                # Tronque au top 5 (cf. meme logique cote serveur audio).
+                ranked = sorted(acc_out.items(), key=lambda kv: -kv[1])
+                top    = ranked[:5]
+                detail = " ".join(f"{n}={v * 8 / 1000.0 / w:.0f}" for n, v in top)
+                rest   = ranked[5:]
+                if rest:
+                    r_tot = sum(v for _, v in rest) * 8 / 1000.0 / w
+                    detail += f" | +{len(rest)} autres = {r_tot:.0f}"
+                _log(f"[OBS1 DEBIT] OUT/joueur kbit/s (top5/"
+                     f"{len(ranked)}) : {detail}", MUTED)
+            # [OBS1] Ligne de synthese : c'est le seul endroit ou les
+            # deux flux sont additionnes. La console admin l'affiche en
+            # direct, mais rien ne l'ecrivait sur disque -- or c'est ce
+            # total qui se compare au debit du VPS et qui sert de
+            # reference avant/apres Opus.
+            def _fmt(kbps):
+                return (f"{kbps / 1000.0:.2f} Mbit/s" if kbps >= 10000
+                        else f"{kbps:.1f} kbit/s")
+
+            p_in  = acc_bin  * 8 / 1000.0 / w
+            p_out = acc_bout * 8 / 1000.0 / w
+            if aud_in_s:
+                a_in  = sum(aud_in_s)  / len(aud_in_s)
+                a_out = sum(aud_out_s) / len(aud_out_s)
+                _log(f"[OBS1 TOTAL] 30s | joueurs={len(clients)} | "
+                     f"IN {_fmt(p_in + a_in)} | OUT {_fmt(p_out + a_out)} | "
+                     f"(pos {_fmt(p_out)} + audio {_fmt(a_out)} en sortie)",
+                     ORANGE)
+            else:
+                _log(f"[OBS1 TOTAL] 30s | joueurs={len(clients)} | "
+                     f"IN {_fmt(p_in)} | OUT {_fmt(p_out)} | "
+                     f"audio indisponible (positions seules)", ORANGE)
+
+            acc_out, acc_elapsed = {}, 0.0
+            acc_bin = acc_bout = 0
+            acc_min = acc_mout = 0
+            aud_in_s, aud_out_s = [], []
+
+
+# ─────────────────────────────────────────────
 #  WebSocket
 # ─────────────────────────────────────────────
 
@@ -660,6 +1000,7 @@ async def _broadcast(sender_ws, message: str):
     """Envoie un message a tous les joueurs sauf l'emetteur, et a tous
     les admins (les admins recoivent toujours, ils ne sont pas dans clients)."""
     dead = []
+    size = len(message.encode("utf-8"))   # [OBS1] octets reels sur le fil
     for ws in list(clients.keys()):
         if ws is sender_ws:
             continue
@@ -667,6 +1008,8 @@ async def _broadcast(sender_ws, message: str):
             await ws.send(message)
         except Exception:
             dead.append(ws)
+            continue
+        _count_out(ws, size)
     for ws in dead:
         _track_dead_broadcast(ws, "_broadcast")
         clients.pop(ws, None)
@@ -677,11 +1020,14 @@ async def _broadcast(sender_ws, message: str):
 async def _broadcast_all(message: str):
     """Envoie un message a tous les joueurs ET tous les admins."""
     dead = []
+    size = len(message.encode("utf-8"))   # [OBS1]
     for ws in list(clients.keys()):
         try:
             await ws.send(message)
         except Exception:
             dead.append(ws)
+            continue
+        _count_out(ws, size)
     for ws in dead:
         _track_dead_broadcast(ws, "_broadcast_all")
         clients.pop(ws, None)
@@ -694,11 +1040,14 @@ async def _broadcast_clients_only(message: str):
     peuvent recevoir plus d'infos), comme pour profiles_list ou les
     permissions de profils."""
     dead = []
+    size = len(message.encode("utf-8"))   # [OBS1]
     for ws in list(clients.keys()):
         try:
             await ws.send(message)
         except Exception:
             dead.append(ws)
+            continue
+        _count_out(ws, size)
     for ws in dead:
         _track_dead_broadcast(ws, "_broadcast_clients_only")
         clients.pop(ws, None)
@@ -713,6 +1062,7 @@ async def _broadcast_channel(channel, message: str):
     channel = None ou un id de canal. Si None, on broadcast aux joueurs
     qui n'ont pas de canal (rare cas)."""
     dead = []
+    size = len(message.encode("utf-8"))   # [OBS1]
     for ws, info in list(clients.items()):
         if info.get("channel") != channel:
             continue
@@ -720,6 +1070,8 @@ async def _broadcast_channel(channel, message: str):
             await ws.send(message)
         except Exception:
             dead.append(ws)
+            continue
+        _count_out(ws, size)
     for ws in dead:
         _track_dead_broadcast(ws, "_broadcast_channel")
         clients.pop(ws, None)
@@ -1317,6 +1669,1010 @@ async def _phone_hp_apply_state(call_id: str, owner_name: str,
          PURPLE)
 
 
+def _numero_to_pseudo(numero) -> str | None:
+    """[CONTACTS 31/07/2026] Resout un numero de telephone en pseudo.
+
+    Retourne None si le numero n'est attribue a personne. La resolution
+    reste STRICTEMENT interne au serveur : le pseudo obtenu sert a router
+    et a retrouver un fichier, il n'est jamais renvoye au client. Sinon
+    l'annuaire, reserve a l'admin, fuirait par le telephone.
+    """
+    if not _ACCOUNTS_ENABLED:
+        return None
+    try:
+        n = int(str(numero).strip())
+    except Exception:
+        return None
+    try:
+        acc = _accounts_ctx.store.get_by_numero(n)
+    except Exception:
+        return None
+    return acc.get("pseudo") if acc else None
+
+
+def _pseudo_to_numero(pseudo: str):
+    """Numero d'un pseudo, ou None. Sert a annoncer l'appelant par son
+    numero et non par son nom."""
+    if not _ACCOUNTS_ENABLED or not pseudo:
+        return None
+    try:
+        for a in _accounts_ctx.store.list_accounts():
+            if a.get("pseudo") == pseudo:
+                return a.get("numero")
+    except Exception:
+        pass
+    return None
+
+
+def _numero_of_name(name: str):
+    """Numero d'un joueur CONNECTE, lu sur sa fiche (pas de parcours).
+
+    Repli sur _pseudo_to_numero() pour un joueur hors ligne, ou pour une
+    fiche anterieure a ce champ.
+    """
+    for _ws, info in clients.items():
+        if info.get("name") == name:
+            n = info.get("numero")
+            if n is not None:
+                return n
+            break
+    return _pseudo_to_numero(name)
+
+
+def _queue_exempt(numero) -> bool:
+    """Comptes de service (mannequin, test de charge) : exemptes de quota.
+
+    Ils emettent a un rythme non humain PAR NATURE. Sans exemption ils se
+    font bloquer par leur propre serveur, et on perd du temps a comprendre
+    pourquoi.
+    """
+    if not _ACCOUNTS_ENABLED or numero is None:
+        return False
+    try:
+        acc = _accounts_ctx.store.get_by_numero(int(numero))
+    except Exception:
+        return False
+    # Un compte de service porte un discord_id prefixe "local:" (cf.
+    # SERVICE_PREFIX dans circusvoip_accounts_ws) : c'est le seul marqueur,
+    # il n'y a pas de champ dedie sur la fiche.
+    return bool(acc and str(acc.get("discord_id", "")).startswith("local:"))
+
+
+async def _queue_verdict(ws, sender: str, octets: int) -> bool:
+    """Applique l'anti-spam AVANT routage. True = laisser passer.
+
+    Le quota vaut pour TOUS les envois, pas seulement pour ceux qui
+    partent en differe : envoyer trente images a un joueur CONNECTE ne
+    consomme aucun disque, mais reste du harcelement. La regle vise le
+    comportement, pas seulement la machine.
+
+    Le client peut afficher un compte a rebours de son cote, mais c'est un
+    confort d'interface : quelqu'un qui veut saturer n'utilisera pas notre
+    client. La decision est ici.
+    """
+    if not _QUEUE_ENABLED:
+        return True
+    num = _numero_of_name(sender)
+    if num is None:
+        return True
+    if _queue_exempt(num):
+        return True
+    verdict, duree = _rate_limiter.check(num, octets)
+    if verdict == _V_OK:
+        return True
+
+    # Un refus SILENCIEUX laisserait l'emetteur croire qu'il a ete
+    # delivre. On previent, meme si un client ancien ignorera le type.
+    try:
+        await ws.send(json.dumps({
+            "type":    "phone_message_refused",
+            "reason":  verdict,
+            "retry_in": int(duree),
+        }))
+    except Exception:
+        pass
+
+    if verdict in (_V_KICK, _V_BLOCAGE):
+        if verdict == _V_BLOCAGE and _ACCOUNTS_ENABLED:
+            # Le blocage doit survivre a un systemctl restart : il va sur
+            # la fiche de compte (deja persistee), pas dans un fichier de
+            # plus. Borne dans le temps -- un faux positif ne doit JAMAIS
+            # exclure quelqu'un definitivement sans decision humaine.
+            try:
+                _accounts_ctx.store.block_numero(int(num), duree)
+            except Exception:
+                pass
+        _log(f"[PHONE-SPAM] {sender} (#{num}) : {verdict}", ORANGE)
+        _phone_log_event("spam", call_id=None, sender=sender,
+                         numero=num, verdict=verdict)
+        try:
+            # Un script qui recoit un refus recommence en boucle, et chaque
+            # refus coute du traitement. On coupe.
+            await ws.close()
+        except Exception:
+            pass
+    else:
+        _log(f"[PHONE-SPAM] {sender} (#{num}) : {verdict} "
+             f"({int(duree)}s)", ORANGE)
+        _phone_log_event("spam", call_id=None, sender=sender,
+                         numero=num, verdict=verdict)
+    return False
+
+
+def _queue_depot(dest_numero, kind: str, from_name: str, body: str = "") -> str:
+    """Depose un evenement dans la file d'un destinataire hors ligne.
+
+    Rend l'etat rendu par QueueStore.enqueue(), ou "off" si le module
+    n'est pas charge. Le numero de l'EMETTEUR est resolu ici : la file est
+    classee par numero de bout en bout, jamais par pseudo.
+    """
+    if not _QUEUE_ENABLED:
+        return "off"
+    src = _numero_of_name(from_name)
+    if src is None or dest_numero is None:
+        return "invalide"
+    etat, _ev = _queue_store.enqueue(dest_numero, kind, src, body)
+    return etat
+
+
+async def _queue_purge_loop():
+    """Purge la retention. Au demarrage PUIS toutes les 24 h.
+
+    Le passage au demarrage rattrape les arrets prolonges : sans lui, un
+    serveur eteint six semaines redemarrerait avec six semaines d'arriere
+    qu'aucun tour de boucle n'aurait encore traite.
+
+    La purge LOGUE ce qu'elle supprime -- sans trace, on ne saura jamais
+    si elle tourne.
+    """
+    while True:
+        try:
+            supprimes = _queue_store.purge()
+            if supprimes:
+                total_ev = sum(n for (_num, n, _o) in supprimes)
+                total_o = sum(o for (_num, _n, o) in supprimes)
+                _log(f"[QUEUE] Purge retention : {total_ev} evenements, "
+                     f"{total_o // 1024} Ko, {len(supprimes)} file(s)", BLUE)
+            # Meme passage : les fiches d'anti-spam inactives, sinon le
+            # dictionnaire grossit indefiniment.
+            n = _rate_limiter.entretien()
+            if n:
+                _log(f"[QUEUE] Entretien anti-spam : {n} fiche(s)", BLUE)
+            # [TRAVAIL 10/08/2026] Meme boucle, meme rythme : les missions
+            # expirees a 30 jours et les closes de plus de 7 jours. Une
+            # boucle a part ne rendrait rien de plus et ferait un
+            # deuxieme endroit ou oublier de journaliser.
+            if _TRAVAIL_ENABLED:
+                nm = _travail_store.purger()
+                if nm:
+                    _log(f"[TRAVAIL] Purge : {nm} mission(s) retiree(s)",
+                         BLUE)
+        except Exception as exc:
+            _log(f"[QUEUE] Purge en echec : {exc}", ORANGE)
+        await asyncio.sleep(24 * 3600)
+
+
+async def _urgence_purge_loop():
+    """Purge des signaux expires, toutes les minutes.
+
+    [URGENCE 15/08/2026] Boucle SEPAREE de l'entretien quotidien, et ce
+    n'est pas de la duplication : un signal expire a 1 h. Le purger une
+    fois par jour laisserait des demandes mortes visibles pendant 23
+    heures, et leurs victimes devant un ecran qui promet des secours.
+
+    La minute est un compromis : assez fin pour que l'expiration se voie,
+    assez lache pour ne rien couter -- la purge ne parcourt que les
+    signaux actifs, qui se comptent sur les doigts.
+    """
+    while True:
+        await asyncio.sleep(60)
+        if not _URGENCE_ENABLED:
+            continue
+        try:
+            expires = _urgence_store.purger()
+            for sig in expires:
+                # Prevenir la victime ET ceux qui etaient en route. Sans
+                # ca, l'ecran de la victime resterait sur une demande que
+                # le serveur ne connait plus.
+                cibles = [sig.get("auteur")] + list(sig.get("preneurs")
+                                                    or [])
+                await _urgence_pousser_etat([c for c in cibles if c])
+            if expires:
+                _log(f"[URGENCE] Purge : {len(expires)} signal(aux) "
+                     f"expire(s)", BLUE)
+        except Exception as exc:
+            _log(f"[URGENCE] Purge en echec : {exc!r}", ORANGE)
+
+
+async def _queue_rejouer(ws, name: str, numero):
+    """Rejoue la file d'un joueur qui vient de se connecter.
+
+    CONVERSATION PAR CONVERSATION, chacune vidée entierement avant la
+    suivante (§6 octies) : un fil melange serait illisible a l'arrivee.
+
+    Etalement au VOLUME, pas au nombre : les textes s'enchainent sans
+    pause, les images en marquent une. Une image par seconde saturerait
+    plus que l'audio complet.
+
+    Les types envoyes sont ceux du temps reel (phone_message_received,
+    phone_image_received, phone_call_missed) : un client ancien les
+    affiche donc SANS RIEN SAVOIR du differe. Il n'acquittera pas, et
+    c'est marquer_envoye() qui finit par abandonner l'evenement.
+    """
+    if not _QUEUE_ENABLED or numero is None:
+        return
+    try:
+        groupes = _queue_store.conversations(numero)
+    except Exception:
+        return
+    if not groupes:
+        return
+
+    total = sum(len(g) for g in groupes)
+    _log(f"[QUEUE] Rejeu pour {name} (#{numero}) : {total} evenement(s), "
+         f"{len(groupes)} conversation(s)", BLUE)
+
+    envoyes = []
+    for groupe in groupes:
+        for ev in groupe:
+            kind = ev.get("kind")
+            src = ev.get("from")
+            # Le pseudo est resolu MAINTENANT, pas au stockage : c'est
+            # tout l'interet d'avoir classe la file par numero. Un
+            # emetteur renomme entre-temps est annonce sous son nom
+            # actuel, et un compte supprime ne casse rien.
+            # [RP 04/08/2026] Numero seul. La file est classee par numero
+            # de bout en bout : il n'y a plus rien a resoudre au rejeu, ce
+            # qui supprime aussi le cas du compte supprime entre-temps.
+            if kind == _K_MSG:
+                msg = {"type": "phone_message_received",
+                       "sender_numero": src,
+                       "body": ev.get("body", ""), "ts": ev.get("ts"),
+                       "queued": True, "queued_id": ev.get("id")}
+            elif kind == _K_IMG:
+                msg = {"type": "phone_image_received",
+                       "sender_numero": src,
+                       "data": ev.get("body", ""), "ts": ev.get("ts"),
+                       "queued": True, "queued_id": ev.get("id")}
+            elif kind == _K_MISSED:
+                msg = {"type": "phone_call_missed", "call_id": None,
+                       "caller_numero": src,
+                       "callee_numero": numero, "ts": ev.get("ts"),
+                       "queued": True, "queued_id": ev.get("id")}
+            else:
+                continue
+            try:
+                await ws.send(json.dumps(msg))
+            except Exception:
+                # Deconnexion en plein rejeu : on s'arrete la. Rien n'a
+                # ete retire de la file, la reprise se fera a la
+                # prochaine connexion.
+                _log(f"[QUEUE] Rejeu interrompu pour {name}", ORANGE)
+                break
+            envoyes.append(ev.get("id"))
+            if kind == _K_IMG:
+                await asyncio.sleep(0.5)
+        else:
+            continue
+        break
+
+    _phone_log_event("queue_replayed", call_id=None, target=name,
+                     numero=numero, count=len(envoyes))
+    try:
+        abandonnes = _queue_store.marquer_envoye(numero, envoyes)
+        if abandonnes:
+            # Client ancien qui n'acquitte pas : on a resservi trois fois,
+            # on abandonne plutot que de le faire indefiniment.
+            _log(f"[QUEUE] {name} : {len(abandonnes)} evenement(s) "
+                 f"abandonne(s) faute d'acquittement", ORANGE)
+    except Exception:
+        pass
+
+
+async def _travail_envoyer_etat(ws, numero, erreur=""):
+    """Renvoie au demandeur TOUT ce que son ecran doit afficher.
+
+    Un seul message plutot que trois : missions visibles, missions
+    publiees, mission en cours et metiers arrivent ensemble. Le client
+    n'a donc jamais un ecran a moitie a jour -- et il n'a aucun etat a
+    reconstituer par recoupement, ce qui est la porte ouverte aux
+    divergences entre ce qu'il croit et ce que le serveur sait.
+    """
+    mets = []
+    notifs = True
+    if _ACCOUNTS_ENABLED and _accounts_ctx is not None:
+        try:
+            acc = _accounts_ctx.store.get_by_numero(numero)
+            if acc:
+                mets = list(acc.get("metiers") or [])
+                notifs = bool(acc.get("travail_notifs", True))
+        except Exception:
+            pass
+    try:
+        await ws.send(json.dumps({
+            "type": "travail_etat",
+            "metiers": mets,
+            "notifs": notifs,
+            "missions": _travail_store.visibles(mets),
+            "miennes": _travail_store.de_auteur(numero),
+            "en_cours": _travail_store.en_cours(numero),
+            "erreur": erreur,
+        }))
+    except Exception:
+        pass
+
+
+async def _travail_notifier(mission):
+    """Previent les joueurs CONNECTES qui exercent le metier recherche.
+
+    Cible plutot que diffuse : sur 100 joueurs dont 10 mecaniciens, c'est
+    10 messages au lieu de 100. Meme principe que la diffusion des
+    positions par zone.
+
+    Les joueurs hors ligne ne sont PAS notifies et ne recoivent rien en
+    differe : une annonce n'est pas un message personnel, et elle sera
+    toujours la a leur retour -- la retrouver dans l'onglet suffit.
+    """
+    if not (_ACCOUNTS_ENABLED and _accounts_ctx is not None):
+        return
+    try:
+        table = _accounts_ctx.store.metiers_par_numero()
+    except Exception:
+        return
+    for num in _travail_destinataires(mission, table):
+        nom = _numero_to_pseudo(num)
+        if nom is None:
+            continue
+        try:
+            acc = _accounts_ctx.store.get_by_numero(num)
+            if acc and not acc.get("travail_notifs", True):
+                continue
+        except Exception:
+            pass
+        await _send_to_name(nom, {
+            "type": "travail_nouvelle",
+            "metier": mission.get("metier"),
+            "titre": mission.get("titre"),
+        })
+
+
+async def _travail_handle(ws, msg_type, data):
+    """Point d'entree unique des trames travail_*."""
+    if not _TRAVAIL_ENABLED:
+        try:
+            await ws.send(json.dumps({
+                "type": "travail_etat", "metiers": [], "missions": [],
+                "miennes": [], "en_cours": None,
+                "erreur": "Le tableau d'annonces est indisponible sur ce "
+                          "serveur."}))
+        except Exception:
+            pass
+        return
+
+    numero = clients[ws].get("numero")
+    if numero is None:
+        # Sans numero, aucune identite : ni publier ni prendre.
+        await _travail_envoyer_etat(
+            ws, "", "Compte non relié : reliez votre compte Discord.")
+        return
+    numero = str(numero)
+    mid = str(data.get("id") or "")
+    erreur = ""
+    publiee = None
+
+    try:
+        if msg_type == "travail_liste":
+            pass                                    # l'etat suffit
+        elif msg_type == "travail_publier":
+            publiee = _travail_store.publier(
+                numero, data.get("metier"), data.get("titre"),
+                data.get("paiement"), data.get("description") or "")
+        elif msg_type == "travail_prendre":
+            _travail_store.prendre(mid, numero)
+        elif msg_type == "travail_abandonner":
+            m = _travail_store.abandonner(mid, numero)
+            # L'auteur attend quelqu'un qui ne viendra pas : il doit le
+            # savoir pour republier ou chercher ailleurs.
+            nom = _numero_to_pseudo(m.get("auteur"))
+            if nom:
+                await _send_to_name(nom, {
+                    "type": "travail_abandon",
+                    "titre": m.get("titre")})
+        elif msg_type == "travail_clore":
+            _travail_store.clore(mid, numero)
+        elif msg_type == "travail_retirer":
+            _travail_store.retirer(mid, numero)
+        elif msg_type == "travail_metiers":
+            if _ACCOUNTS_ENABLED and _accounts_ctx is not None:
+                acc = _accounts_ctx.store.get_by_numero(numero)
+                if acc:
+                    _accounts_ctx.store.set_metiers(
+                        acc["discord_id"], data.get("metiers"),
+                        data.get("notifs"))
+        else:
+            erreur = "Action inconnue."
+    except _TR.TravailError as e:
+        # Erreur METIER : montrable telle quelle au joueur.
+        erreur = str(e)
+    except Exception as e:
+        # Erreur technique : on ne montre pas l'exception au joueur, mais
+        # on la journalise -- sinon elle disparait sans trace.
+        _log(f"[TRAVAIL] {msg_type} KO ({numero}) : {e!r}", ORANGE)
+        erreur = "Action impossible pour le moment."
+
+    await _travail_envoyer_etat(ws, numero, erreur)
+    if publiee is not None:
+        _log(f"[TRAVAIL] {numero} publie « {publiee.get('titre')} » "
+             f"-> {publiee.get('metier')}", BLUE)
+        await _travail_notifier(publiee)
+
+
+async def _groupes_envoyer_etat(ws, numero, erreur=""):
+    """Renvoie au demandeur TOUS ses groupes.
+
+    Un seul message, comme travail_etat : le client n'a jamais un ecran a
+    moitie a jour, et n'a aucun etat a reconstituer par recoupement.
+
+    Il n'y a volontairement PAS de liste publique a cote : un groupe ne
+    se decouvre pas, on en est membre ou on ignore son existence.
+    """
+    try:
+        await ws.send(json.dumps({
+            "type": "groupe_etat",
+            "groupes": _groupes_store.de_joueur(numero),
+            "erreur": erreur,
+        }))
+    except Exception:
+        pass
+
+
+async def _groupes_pousser_etat(numeros, sauf_ws=None):
+    """Pousse leur etat aux membres CONNECTES, sans qu'ils demandent.
+
+    Necessaire a la creation : les autres membres doivent voir le groupe
+    apparaitre sans avoir a rouvrir l'app. Sans cette poussee, ils ne le
+    decouvriraient qu'au premier message -- qui arriverait alors dans une
+    conversation dont ils ignorent le nom.
+
+    `sauf_ws` ecarte l'auteur de l'action : il recoit deja sa reponse par
+    _groupes_envoyer_etat, et lui pousser un second etat le ferait
+    reconstruire son ecran deux fois.
+    """
+    for num in numeros:
+        nom = _numero_to_pseudo(num)
+        if nom is None:
+            continue                       # hors ligne : il verra a sa
+                                           # prochaine ouverture d'app
+        for ws_m, info in list(clients.items()):
+            if ws_m is sauf_ws or info.get("name") != nom:
+                continue
+            await _groupes_envoyer_etat(ws_m, num)
+
+
+async def _groupes_router_message(groupe_id, emetteur_numero, texte):
+    """Distribue un message de groupe. Rend le nombre de destinataires.
+
+    L'emetteur est ecarte : son client a deja affiche le message.
+
+    Le corps est REENCODE ici a partir de l'identifiant que le serveur a
+    lui-meme verifie -- jamais a partir de ce que le client a envoye. Un
+    joueur qui taperait "[grp]autre-groupe" dans son texte n'ecrit donc
+    nulle part ailleurs.
+
+    Les membres hors ligne sont mis en DIFFERE, contrairement aux
+    annonces de Travail : un message de groupe est un message personnel,
+    et le perdre en silence est exactement le mode de panne qu'on evite
+    partout ailleurs.
+    """
+    membres = _groupes_store.membres_de(groupe_id, emetteur_numero)
+    if membres is None:
+        return 0                           # pas membre, ou inexistant
+    if len(membres) < 2:
+        # [GROUPES 19/08/2026] Seul dans le groupe : lecture seule. Il n'y
+        # a personne a qui router, et laisser partir le message le ferait
+        # disparaitre en silence.
+        return 0
+    body = _GR.encode_message(groupe_id, texte)
+    ts = time.time()
+    envoyes = 0
+    for num in membres:
+        if num == emetteur_numero:
+            continue
+        nom = _numero_to_pseudo(num)
+        if nom is None:
+            # Hors ligne : depot dans sa file. L'emetteur n'est PAS
+            # prevenu du refus eventuel -- le lui dire revelerait qui du
+            # groupe est absent, et depuis combien de temps.
+            _queue_depot(num, _K_MSG, _numero_to_pseudo(emetteur_numero)
+                         or "", body)
+            continue
+        if await _send_to_name(nom, {
+                "type": "phone_message_received",
+                "sender_numero": emetteur_numero,
+                "body": body,
+                "ts": ts}):
+            envoyes += 1
+    return envoyes
+
+
+async def _groupes_annoncer(groupe_id, sujet_numero, destinataires, texte):
+    """Envoie une annonce systeme aux membres restants.
+
+    `sujet_numero` est CELUI DONT ON PARLE -- le partant -- et voyage en
+    tant qu'emetteur : le client prefixe l'auteur a l'affichage, ce qui
+    donne « <numero> a quitté le groupe » sans traitement particulier.
+
+    Le NUMERO, jamais le pseudo : c'est la regle du projet, et le client
+    substituera un nom s'il l'a dans son carnet.
+
+    Les absents recoivent l'annonce en differe, comme un message
+    ordinaire. Un joueur qui se reconnecte doit savoir qui est parti
+    pendant son absence -- sinon l'en-tete du groupe aura change sans
+    qu'aucune trace n'explique pourquoi.
+    """
+    body = _GR.encode_systeme(groupe_id, texte)
+    ts = time.time()
+    for num in destinataires:
+        nom = _numero_to_pseudo(num)
+        if nom is None:
+            _queue_depot(num, _K_MSG,
+                         _numero_to_pseudo(sujet_numero) or "", body)
+            continue
+        await _send_to_name(nom, {
+            "type": "phone_message_received",
+            "sender_numero": sujet_numero,
+            "body": body,
+            "ts": ts})
+
+
+async def _groupes_handle(ws, msg_type, data):
+    """Point d'entree unique des trames groupe_*.
+
+    Meme raison que pour travail_* et urgence_* : repartir ces actions en
+    branches separees garantirait qu'une action ajoutee plus tard oublie
+    la verification du numero ou le renvoi de l'etat -- et un oubli de ce
+    genre ne casse rien de visible, il laisse juste un joueur avec un
+    ecran perime.
+    """
+    if not _GROUPES_ENABLED:
+        try:
+            await ws.send(json.dumps({
+                "type": "groupe_etat", "groupes": [],
+                "erreur": "Les groupes sont indisponibles sur ce "
+                          "serveur."}))
+        except Exception:
+            pass
+        return
+
+    numero = clients[ws].get("numero")
+    if numero is None:
+        await _groupes_envoyer_etat(
+            ws, "", "Compte non relié : reliez votre compte Discord.")
+        return
+    numero = str(numero)
+    erreur = ""
+    creee = None
+    partants = []
+
+    try:
+        if msg_type == "groupe_liste":
+            pass                                    # l'etat suffit
+
+        elif msg_type == "groupe_creer":
+            creee = _groupes_store.creer(
+                numero, data.get("nom"), data.get("membres"))
+
+        elif msg_type == "groupe_quitter":
+            gid = str(data.get("id") or "")
+            # Les membres sont lus AVANT le depart : apres, l'appelant
+            # n'en fait plus partie et ne pourrait plus les obtenir.
+            avant = _groupes_store.membres_de(gid, numero) or []
+            _groupes_store.quitter(gid, numero)
+            partants = [m for m in avant if m != numero]
+            # [GROUPES 19/08/2026] Annonce du depart a CEUX QUI RESTENT.
+            # Sans elle, le partant disparaitrait de l'en-tete sans un
+            # mot, et ceux qui restent croiraient a un bug -- ou pire,
+            # continueraient a lui ecrire en pensant qu'il lit.
+            #
+            # L'annonce est fabriquee par le SERVEUR : un client ne peut
+            # pas en forger une, le marqueur systeme etant ajoute ici.
+            if partants:
+                await _groupes_annoncer(gid, numero, partants,
+                                        _GR.SYS_DEPART)
+
+        elif msg_type == "groupe_envoyer":
+            gid = str(data.get("id") or "")
+            texte = data.get("body")
+            texte = texte if isinstance(texte, str) else ""
+            if not texte.strip():
+                erreur = "Message vide."
+            else:
+                n = await _groupes_router_message(gid, numero, texte)
+                _m = _groupes_store.membres_de(gid, numero)
+                if _m is not None and len(_m) < 2:
+                    # Message EXPLICITE : le joueur doit comprendre que
+                    # rien n'est parti, sinon il croira avoir ecrit.
+                    erreur = ("Vous êtes seul dans ce groupe : "
+                              "plus personne ne peut recevoir vos "
+                              "messages.")
+                elif n == 0 and _m is None:
+                    # Message NEUTRE : ne distingue pas "ce groupe
+                    # n'existe pas" de "vous n'en etes pas membre". Cf.
+                    # GroupeStore.membres_de().
+                    erreur = "Ce groupe n'existe pas."
+
+        else:
+            erreur = "Action inconnue."
+
+    except _GR.GroupeError as e:
+        # Erreur METIER : montrable telle quelle au joueur.
+        erreur = str(e)
+    except Exception as e:
+        # Erreur technique : on ne montre pas l'exception au joueur, mais
+        # on la journalise -- sinon elle disparait sans trace.
+        _log(f"[GROUPES] {msg_type} KO ({numero}) : {e!r}", ORANGE)
+        erreur = "Action impossible pour le moment."
+
+    await _groupes_envoyer_etat(ws, numero, erreur)
+
+    if creee is not None:
+        _log(f"[GROUPES] {numero} cree « {creee.get('nom')} » "
+             f"({len(creee.get('membres') or [])} membres)", BLUE)
+        # Les autres membres doivent voir le groupe apparaitre tout de
+        # suite : ils n'ont rien demande et n'ont aucune raison de
+        # rouvrir l'app.
+        await _groupes_pousser_etat(
+            [m for m in creee.get("membres") or [] if m != numero],
+            sauf_ws=ws)
+
+    if partants:
+        # Ceux qui restent voient le depart. Sans cette poussee, le
+        # partant resterait affiche dans leur en-tete jusqu'a la
+        # prochaine ouverture de l'app.
+        _log(f"[GROUPES] {numero} quitte un groupe "
+             f"({len(partants)} restant(s))", BLUE)
+        await _groupes_pousser_etat(partants, sauf_ws=ws)
+
+
+# ======================================================================
+#  App Urgence
+# ======================================================================
+#
+# [URGENCE 15/08/2026] Meme architecture que Travail : un point d'entree
+# unique, et l'etat COMPLET renvoye apres chaque action.
+#
+# Ce qui differe, et pourquoi :
+#
+#   - le cloisonnement par role. Un medecin ne voit RIEN de la securite,
+#     ni les signaux ni les collegues. Le filtrage se fait au serveur, pas
+#     a l'affichage : un client bricole ne doit pas pouvoir demander la
+#     liste d'en face.
+#   - la prise de service. Elle vit en RAM et meurt avec la connexion. Un
+#     detenteur de role connecte n'est PAS de garde tant qu'il n'a pas
+#     pointe -- sans ca, "aucun secouriste disponible" serait faux des
+#     qu'un medecin joue a autre chose.
+#   - le chef est en service de fait, des sa connexion. Il est le filet
+#     de securite du dispositif.
+
+
+def _urgence_fiche(numero):
+    """Fiche du joueur, ou None. Role et drapeau chef s'y lisent."""
+    if not (_ACCOUNTS_ENABLED and _accounts_ctx is not None):
+        return None
+    try:
+        return _accounts_ctx.store.get_by_numero(int(numero))
+    except Exception:
+        return None
+
+
+def _urgence_role(numero):
+    acc = _urgence_fiche(numero)
+    return (acc or {}).get("role")
+
+
+def _urgence_est_chef(numero):
+    acc = _urgence_fiche(numero)
+    return bool((acc or {}).get("chef"))
+
+
+def _urgence_collegues(role, moi):
+    """Numeros des collegues EN SERVICE, hors soi.
+
+    Un detenteur ordinaire ne voit que ceux qui ont pointe. Le chef, lui,
+    voit toute son equipe -- c'est _urgence_equipe qui la rend.
+    """
+    if not _URGENCE_ENABLED:
+        return []
+    return [n for n in _urgence_store.numeros_en_service(role)
+            if str(n) != str(moi)]
+
+
+def _urgence_equipe(role):
+    """Toute l'equipe d'un role, en service ou non. RESERVE AU CHEF.
+
+    Le chef doit voir ceux qui ne sont pas de garde : sinon il ne peut ni
+    les retirer, ni savoir qui il a deja nomme.
+    """
+    if not (_ACCOUNTS_ENABLED and _accounts_ctx is not None):
+        return []
+    out = []
+    for acc in _accounts_ctx.store.equipe(role):
+        num = acc.get("numero")
+        if not num:
+            continue
+        out.append({
+            "numero": str(num),
+            "chef": bool(acc.get("chef")),
+            "en_service": _urgence_store.est_en_service(num)
+                          if _URGENCE_ENABLED else False,
+        })
+    return out
+
+
+async def _urgence_envoyer_etat(ws, numero, erreur=""):
+    """Renvoie TOUT ce que l'ecran du joueur doit afficher.
+
+    Un seul message plutot que quatre : role, service, demande en cours,
+    signaux visibles et equipe arrivent ensemble. Le client n'a donc
+    jamais un ecran a moitie a jour, et rien a reconstituer par
+    recoupement -- ce qui est la porte ouverte aux divergences entre ce
+    qu'il croit et ce que le serveur sait.
+    """
+    role = _urgence_role(numero)
+    chef = _urgence_est_chef(numero)
+    en_service = (_urgence_store.est_en_service(numero)
+                  if _URGENCE_ENABLED else False)
+    charge = {
+        "type": "urgence_etat",
+        "role": role,
+        "chef": chef,
+        "en_service": bool(en_service or (chef and role)),
+        "ma_demande": (_urgence_store.ma_demande(numero)
+                       if _URGENCE_ENABLED else None),
+        "signaux": [],
+        "collegues": [],
+        "equipe": [],
+        "erreur": erreur,
+    }
+    if role and _URGENCE_ENABLED:
+        charge["signaux"] = _urgence_store.visibles(role, numero)
+        charge["collegues"] = _urgence_collegues(role, numero)
+        if chef:
+            charge["equipe"] = _urgence_equipe(role)
+    try:
+        await ws.send(json.dumps(charge))
+    except Exception:
+        pass
+
+
+async def _urgence_notifier(signal):
+    """Previent les detenteurs EN SERVICE du role vise.
+
+    Cible, jamais diffuse : un signal medical ne part pas aux agents de
+    securite. Et il ne part pas non plus aux medecins hors service --
+    c'est tout l'interet du pointage : voir sans etre derange.
+
+    Aucun depot en differe : un joueur absent n'a rien a recevoir a son
+    retour, le signal aura expire ou ete traite.
+    """
+    if not _URGENCE_ENABLED:
+        return
+    voulu = _UR.ROLE_DESTINATAIRE.get(signal.get("type"))
+    for num in _urgence_store.numeros_en_service(voulu):
+        nom = _numero_to_pseudo(num)
+        if nom is None:
+            continue
+        await _send_to_name(nom, {
+            "type": "urgence_nouvelle",
+            "urgence_type": signal.get("type"),
+        })
+
+
+async def _urgence_pousser_etat(numeros):
+    """Renvoie l'etat a des joueurs qui n'ont rien demande.
+
+    Necessaire parce que l'etat d'un signal change SANS action de leur
+    part : la victime abandonne, un autre secouriste prend la demande, le
+    signal expire. Sans cette poussee, leur ecran resterait sur une
+    situation qui n'existe plus -- et un secouriste continuerait de voler
+    vers un signal mort.
+    """
+    for num in set(str(n) for n in (numeros or [])):
+        nom = _numero_to_pseudo(num)
+        if nom is None:
+            continue
+        for ws_c, info in list(clients.items()):
+            if str(info.get("numero")) == num:
+                await _urgence_envoyer_etat(ws_c, num)
+                break
+
+
+async def _urgence_handle(ws, msg_type, data):
+    """Point d'entree unique des trames urgence_*.
+
+    Comme pour Travail : repartir en branches elif au niveau du routeur
+    garantirait qu'une action ajoutee plus tard oublie la verification du
+    numero ou le renvoi de l'etat -- un oubli qui ne casse rien de
+    visible, il laisse juste un joueur avec un ecran perime.
+    """
+    if not _URGENCE_ENABLED:
+        try:
+            await ws.send(json.dumps({
+                "type": "urgence_etat", "role": None, "chef": False,
+                "en_service": False, "ma_demande": None, "signaux": [],
+                "collegues": [], "equipe": [],
+                "erreur": "Les urgences sont indisponibles sur ce "
+                          "serveur."}))
+        except Exception:
+            pass
+        return
+
+    info = clients.get(ws) or {}
+    numero = info.get("numero")
+    if not numero:
+        await _urgence_envoyer_etat(
+            ws, 0, "Votre compte n'est pas relié : action impossible.")
+        return
+    numero = str(numero)
+
+    erreur = ""
+    creee = None
+    a_prevenir = []
+    role = _urgence_role(numero)
+    chef = _urgence_est_chef(numero)
+    sid = data.get("id")
+
+    try:
+        if msg_type == "urgence_etat":
+            pass
+
+        elif msg_type == "urgence_creer":
+            creee = _urgence_store.creer(
+                numero, data.get("urgence_type"), data.get("position"),
+                data.get("texte") or "")
+
+        elif msg_type == "urgence_position":
+            sig = _urgence_store.actualiser_position(
+                numero, data.get("position"))
+            a_prevenir += list(sig.get("preneurs") or [])
+
+        elif msg_type == "urgence_abandonner":
+            sig = _urgence_store.abandonner(numero)
+            if sig:
+                # Prevenir ceux qui etaient en route : sans ca, ils
+                # continueraient de voler vers un signal mort.
+                a_prevenir += list(sig.get("preneurs") or [])
+
+        elif msg_type == "urgence_service":
+            if not role:
+                raise _UR.UrgenceError("Vous n'avez pas de rôle d'urgence.")
+            if data.get("actif"):
+                _UR.valide_prise_service(role, chef)
+                _urgence_store.prendre_service(numero, role, chef)
+            else:
+                if chef:
+                    raise _UR.UrgenceError(
+                        "Un chef est de service dès qu'il est connecté.")
+                sig_relaches = [
+                    s.get("auteur") for s in
+                    _urgence_store.visibles(role, numero) if s.get("mien")]
+                _urgence_store.quitter_service(numero)
+                a_prevenir += [n for n in sig_relaches if n]
+            # Les collegues voient la liste des presents changer.
+            a_prevenir += _urgence_collegues(role, numero)
+
+        elif msg_type == "urgence_prendre":
+            sig = _urgence_store.prendre(sid, numero, role)
+            a_prevenir.append(sig.get("auteur"))
+            a_prevenir += _urgence_collegues(role, numero)
+
+        elif msg_type == "urgence_relacher":
+            sig = _urgence_store.relacher(sid, numero)
+            a_prevenir.append(sig.get("auteur"))
+            a_prevenir += _urgence_collegues(role, numero)
+
+        elif msg_type == "urgence_terminer":
+            sig = _urgence_store.clore(sid, numero)
+            a_prevenir.append(sig.get("auteur"))
+            a_prevenir += list(sig.get("preneurs") or [])
+
+        elif msg_type == "urgence_attribuer":
+            _urgence_attribuer(numero, role, chef, data.get("numero"),
+                               retirer=bool(data.get("retirer")))
+            a_prevenir.append(str(data.get("numero") or ""))
+
+        else:
+            erreur = "Action inconnue."
+
+    except _UR.UrgenceError as e:
+        # Erreur METIER : montrable telle quelle au joueur.
+        erreur = str(e)
+    except Exception as e:
+        # Erreur technique : jamais montree, toujours journalisee.
+        _log(f"[URGENCE] {msg_type} KO ({numero}) : {e!r}", ORANGE)
+        erreur = "Action impossible pour le moment."
+
+    await _urgence_envoyer_etat(ws, numero, erreur)
+
+    if creee is not None:
+        _log(f"[URGENCE] {numero} déclenche « {creee.get('type')} »", BLUE)
+        await _urgence_notifier(creee)
+    if a_prevenir:
+        await _urgence_pousser_etat(a_prevenir)
+
+
+def _urgence_attribuer(numero_chef, role, chef, numero_cible, retirer=False):
+    """Un chef donne ou retire SON role a un joueur, par numero.
+
+    Il n'y a pas de parametre "role a donner" : un chef medical ne fait
+    que des medecins. L'introduire lui permettrait de nommer dans l'autre
+    corps.
+
+    L'attribution est IMMEDIATE, sans acceptation du destinataire. Ca
+    ouvre un oracle d'existence -- un chef peut enumerer les numeros et
+    savoir lesquels sont attribues -- mais il n'est ouvert qu'aux deux
+    comptes designes a la main par un administrateur. C'est un choix
+    assume, ecrit ici pour qu'il ne ressorte pas dans six mois comme une
+    faille qu'on croirait avoir manquee.
+    """
+    if not (_ACCOUNTS_ENABLED and _accounts_ctx is not None):
+        raise _UR.UrgenceError("Les comptes sont indisponibles.")
+    cible = _UR.valide_numero(numero_cible)
+    acc = _accounts_ctx.store.get_by_numero(int(cible))
+    if acc is None:
+        # Retour franc : sans lui, le chef croirait avoir nomme quelqu'un
+        # et son equipe aurait un membre fantome.
+        raise _UR.UrgenceError("Aucun joueur ne porte ce numéro.")
+    actuel = acc.get("role")
+    if retirer:
+        _UR.valide_retrait(role, chef, actuel)
+        if acc.get("chef"):
+            raise _UR.UrgenceError("Un chef ne peut pas être retiré ici.")
+        _accounts_ctx.store.set_role(acc["discord_id"], None)
+        if _URGENCE_ENABLED:
+            _urgence_store.quitter_service(cible)
+    else:
+        _UR.valide_attribution(role, chef, actuel)
+        acc_chef = _urgence_fiche(numero_chef) or {}
+        _accounts_ctx.store.set_role(
+            acc["discord_id"], role, par=acc_chef.get("discord_id"))
+
+
+async def _phone_declare_missed(call_id, caller, callee, cause):
+    """Declare un appel non abouti : notifie les deux parties et depose
+    l'appel manque en differe si l'appele est hors ligne.
+
+    [MISSED 06/08/2026] Entonnoir UNIQUE, appele par _ring_timeout (les
+    45 s sont ecoulees) ET par phone_call_hangup (l'appelant abandonne
+    apres au moins PHONE_MISSED_MIN_S). Ecrire cette logique deux fois,
+    c'est se garantir qu'un troisieme chemin ajoute plus tard oubliera le
+    depot differe -- sans que rien ne casse de visible : l'appele ne
+    saurait simplement jamais qu'on l'a appele.
+
+    'cause' distingue "timeout" (personne n'a decroche) de "abandon"
+    (l'appelant a raccroche). Les deux ne racontent pas la meme chose a
+    l'ecran, et sans ce champ l'historique melangerait les deux.
+    """
+    _phone_log_event("missed", call_id, caller=caller, callee=callee,
+                     cause=cause)
+    _phone_clear_call(call_id)
+    # [RP 04/08/2026] Numeros seuls, plus de pseudos.
+    missed_msg = {"type": "phone_call_missed", "call_id": call_id,
+                  "caller_numero": _numero_of_name(caller),
+                  "callee_numero": _numero_of_name(callee),
+                  "cause": cause}
+    await _send_to_name(caller, missed_msg)
+    await _send_to_name(callee, missed_msg)
+    # [QUEUE 03/08/2026] Appele HORS LIGNE : il n'a rien recu, la trace
+    # n'existerait nulle part. On la depose en differe. ~100 octets : les
+    # appels ne consomment pas de quota. Un appele CONNECTE a deja recu
+    # missed_msg, donc rien a deposer -- sinon il aurait la ligne en double.
+    if _QUEUE_ENABLED and _find_ws_by_name(callee) is None:
+        num_callee = _pseudo_to_numero(callee)
+        if num_callee is not None:
+            _queue_depot(num_callee, _K_MISSED, caller, "")
+
+
 async def _ring_timeout(call_id: str):
     """Timer de sonnerie : attend PHONE_RING_TIMEOUT_S secondes ; si
     l'appel est toujours en 'ringing' a l'expiration, il devient un
@@ -1336,17 +2692,7 @@ async def _ring_timeout(call_id: str):
     caller, callee = call["caller"], call["callee"]
     _log(f"[PHONE] Appel non abouti : {caller} -> {callee} "
          f"(pas de reponse en {int(PHONE_RING_TIMEOUT_S)}s)", ORANGE)
-    _phone_log_event("missed", call_id, caller=caller, callee=callee)
-    # Cleanup centralise (idempotent, gere aussi le HP - mais pas de HP
-    # en ringing, donc no-op pour cette partie). On utilise la version
-    # avec helper plutot que pop direct pour la coherence avec les
-    # autres chemins de sortie d'un appel.
-    _phone_clear_call(call_id)
-    missed_msg = {"type": "phone_call_missed", "call_id": call_id,
-                  "caller": caller, "callee": callee}
-    # Cote appelant : "appel non abouti" ; cote appele : stoppe la sonnerie.
-    await _send_to_name(caller, missed_msg)
-    await _send_to_name(callee, missed_msg)
+    await _phone_declare_missed(call_id, caller, callee, "timeout")
 
 
 async def _phone_drop_calls_for(name: str, reason: str):
@@ -1441,6 +2787,137 @@ async def _admin_session(ws):
 async def _admin_handle_cmd(ws, cmd: str, data: dict) -> tuple:
     """Dispatch une commande admin. Retourne (ok: bool, reason: str)."""
     try:
+        # [DISCORD 30/07/2026] Annuaire -- ADMIN UNIQUEMENT. On n'arrive
+        # ici qu'apres auth_admin reussi (cf _admin_session), donc pas de
+        # controle supplementaire a faire. C'est la SEULE facon de
+        # consulter l'annuaire : aucun equivalent n'existe cote joueur.
+        if cmd == "annuaire_list":
+            if not _ACCOUNTS_ENABLED:
+                return (False, "comptes desactives sur ce serveur")
+            try:
+                entries = _accounts_ctx.store.list_accounts()
+            except Exception as e:
+                return (False, f"lecture annuaire : {e}")
+            # Envoi separe : admin_response ne transporte que (ok, reason).
+            await ws.send(json.dumps({
+                "type": "annuaire_list",
+                "entries": entries,
+            }))
+            return (True, "")
+
+        if cmd == "annuaire_delete":
+            if not _ACCOUNTS_ENABLED:
+                return (False, "comptes desactives sur ce serveur")
+            did = str(data.get("discord_id", ""))
+            if not did:
+                return (False, "identifiant manquant")
+            try:
+                supprime = _accounts_ctx.store.delete(did)
+            except Exception as e:
+                return (False, f"suppression : {e}")
+            if not supprime:
+                return (False, "fiche introuvable")
+            _log(f"ADMIN : fiche annuaire supprimee ({did})", ORANGE)
+            # On repousse la liste : l'admin voit le resultat sans avoir
+            # a recliquer, et sa vue ne peut pas diverger du serveur.
+            try:
+                await ws.send(json.dumps({
+                    "type": "annuaire_list",
+                    "entries": _accounts_ctx.store.list_accounts(),
+                }))
+            except Exception:
+                pass
+            return (True, "")
+
+        # --- Urgence : designation des chefs -------------------------
+        #
+        # [URGENCE 15/08/2026] Les chefs sont nommes ICI, et nulle part
+        # ailleurs. Un chef peut distribuer son role, mais pas en creer
+        # un autre : sinon le controle se perdrait en deux sauts.
+        #
+        # C'est aussi le chemin critique du dispositif. Sans premier
+        # chef, personne ne peut distribuer de role, donc personne n'est
+        # en service, donc toute demande est refusee.
+
+        if cmd == "urgence_chefs":
+            if not _ACCOUNTS_ENABLED:
+                return (False, "comptes desactives sur ce serveur")
+            if not _URGENCE_ENABLED:
+                return (False, "urgences desactivees sur ce serveur")
+            try:
+                chefs = _accounts_ctx.store.chefs()
+            except Exception as e:
+                return (False, f"lecture chefs : {e}")
+            # Envoi separe, comme annuaire_list : admin_response ne
+            # transporte que (ok, reason).
+            await ws.send(json.dumps({
+                "type": "urgence_chefs",
+                "chefs": {
+                    role: {
+                        "discord_id": acc.get("discord_id"),
+                        "pseudo": acc.get("pseudo"),
+                        "numero": acc.get("numero"),
+                    } for role, acc in chefs.items()
+                },
+                "roles": list(_UR.ROLES),
+                "libelles": dict(_UR.LIBELLES_CHEF),
+            }))
+            return (True, "")
+
+        if cmd == "urgence_set_chef":
+            if not _ACCOUNTS_ENABLED:
+                return (False, "comptes desactives sur ce serveur")
+            if not _URGENCE_ENABLED:
+                return (False, "urgences desactivees sur ce serveur")
+            role = str(data.get("role", ""))
+            did = data.get("discord_id")
+            # discord_id vide = destitution sans remplacement. Sans cette
+            # possibilite, le seul moyen de retirer un chef serait d'en
+            # nommer un autre.
+            did = str(did) if did else None
+            try:
+                _UR.valide_role(role)
+            except Exception as e:
+                return (False, str(e))
+            try:
+                _accounts_ctx.store.set_chef(did, role)
+            except Exception as e:
+                return (False, f"designation : {e}")
+
+            # Le nouveau chef est en service DE FAIT, mais seulement s'il
+            # est connecte : le registre de service vit en RAM et suit la
+            # connexion.
+            try:
+                if did and _URGENCE_ENABLED:
+                    acc = _accounts_ctx.store.get_by_discord_id(did)
+                    num = (acc or {}).get("numero")
+                    if num and any(str(i.get("numero")) == str(num)
+                                   for i in clients.values()):
+                        _urgence_store.prendre_service(num, role, True)
+                        await _urgence_pousser_etat([num])
+            except Exception as e:
+                _log(f"[URGENCE] mise en service du chef KO : {e!r}",
+                     ORANGE)
+
+            _log(f"ADMIN : chef {role} = {did or '(aucun)'}", ORANGE)
+            try:
+                chefs = _accounts_ctx.store.chefs()
+                await ws.send(json.dumps({
+                    "type": "urgence_chefs",
+                    "chefs": {
+                        r: {
+                            "discord_id": a.get("discord_id"),
+                            "pseudo": a.get("pseudo"),
+                            "numero": a.get("numero"),
+                        } for r, a in chefs.items()
+                    },
+                    "roles": list(_UR.ROLES),
+                    "libelles": dict(_UR.LIBELLES_CHEF),
+                }))
+            except Exception:
+                pass
+            return (True, "")
+
         if cmd == "add_channel":
             ok = add_channel(data.get("name", ""))
             return (ok, "" if ok else "nom invalide ou deja existant")
@@ -1578,6 +3055,19 @@ async def handler(ws):
 
             msg_type = data.get("type")
 
+            # [OBS1] Entrant : tous les messages joueurs, avec le detail
+            # des "pos" (le flux dominant : plusieurs envois par seconde
+            # et par joueur, contre quelques evenements pour le reste).
+            try:
+                _sz = len(raw.encode("utf-8")) if isinstance(raw, str) else len(raw)
+            except Exception:
+                _sz = 0
+            _pstats.bytes_in += _sz
+            _pstats.msgs_in  += 1
+            if msg_type == "pos":
+                _pstats.bytes_in_pos += _sz
+                _pstats.msgs_in_pos  += 1
+
             # [P5 - rate limiting] Pour les clients DEJA authentifies, on
             # applique un quota de messages. Le tout premier message
             # (join/auth_admin) n'est pas limite ici : il est deja couvert
@@ -1633,6 +3123,19 @@ async def handler(ws):
                 await _admin_session(ws)
                 return
 
+            # [DISCORD 30/07/2026] Messages de compte : traites AVANT le
+            # join, puisque c'est ainsi qu'on obtient le jeton local qu'il
+            # faudra presenter au join. Le token serveur est verifie a
+            # l'interieur du handler (cf circusvoip_accounts_ws).
+            if _ACCOUNTS_ENABLED and msg_type in _ACCOUNT_TYPES:
+                _out = _accounts_handle(msg_type, data, _accounts_ctx, peer_ip)
+                if _out is not None:
+                    try:
+                        await ws.send(json.dumps(_out))
+                    except Exception:
+                        pass
+                continue
+
             if msg_type == "join":
                 # [P1] Verifier le token en temps constant
                 token = data.get("token", "")
@@ -1669,7 +3172,26 @@ async def handler(ws):
 
                 _record_auth_success(peer_ip)
 
-                name = data.get("name", f"Player_{len(clients)+1}")
+                # [DISCORD 30/07/2026] Identite par le jeton local. Le
+                # pseudo retenu est celui de la FICHE, jamais celui
+                # annonce par le client : sinon il suffirait d'editer sa
+                # config locale pour se presenter sous le nom d'un autre.
+                _account = None
+                if _ACCOUNTS_ENABLED:
+                    _account, _acc_err = _accounts_auth_join(data, _accounts_ctx)
+                    if _account is None and REQUIRE_ACCOUNT:
+                        _log(f"REFUSE : {_acc_err['reason']} (ip: {peer_ip})", RED)
+                        try:
+                            await ws.send(json.dumps(_acc_err))
+                        except Exception:
+                            pass
+                        await ws.close(code=1008, reason=_acc_err["reason"])
+                        return
+
+                if _account:
+                    name = _account["pseudo"]
+                else:
+                    name = data.get("name", f"Player_{len(clients)+1}")
 
                 # [P4 - auth partagee] Genere un ticket court pour ce
                 # joueur. Le client le recevra dans le welcome et devra le
@@ -1685,6 +3207,13 @@ async def handler(ws):
                     initial_channel = None
                 clients[ws] = {
                     "name": name,
+                    # [QUEUE 03/08/2026] Numero memorise a la connexion.
+                    # _pseudo_to_numero() parcourt TOUT l'annuaire a chaque
+                    # appel ; il etait deja invoque a chaque message et a
+                    # chaque appel entrant, et la file differee l'aurait
+                    # sollicite davantage. Le numero ne change pas en cours
+                    # de session : on le lit une fois.
+                    "numero": (_account or {}).get("numero"),
                     "pos": None,
                     "last_seen": time.time(),
                     "helmet_on": False,
@@ -1700,6 +3229,24 @@ async def handler(ws):
                 _log(f"JOIN : {name}  ({len(clients)} connecté(s))", GREEN)
                 if _ui:
                     _ui.add_player(name)
+
+                # [URGENCE 15/08/2026] Le CHEF est en service des sa
+                # connexion : il est le filet de securite du dispositif,
+                # et valide_prise_service() lui refuse le bouton.
+                #
+                # Les autres detenteurs arrivent HORS service : un etat de
+                # garde repris de la veille voudrait dire qu'on est de
+                # garde sans l'avoir decide.
+                if _URGENCE_ENABLED:
+                    try:
+                        _num_j = clients[ws].get("numero")
+                        _acc_j = _urgence_fiche(_num_j) if _num_j else None
+                        if _acc_j and _acc_j.get("chef"):
+                            _urgence_store.prendre_service(
+                                _num_j, _acc_j["chef"], True)
+                    except Exception as _e_uj:
+                        _log(f"[URGENCE] mise en service KO : {_e_uj!r}",
+                             ORANGE)
 
                 # Envoyer la liste complete des autres joueurs.
                 existing = [
@@ -1728,6 +3275,16 @@ async def handler(ws):
                     "my_profile": None,
                     # [P4] Ticket a renvoyer au serveur audio lors du join audio.
                     "audio_ticket": audio_ticket,
+                    # [PORTS CONFIGURABLES 26/07/2026] Le client n'a plus a
+                    # deviner le port audio : on le lui annonce ici. Il ne
+                    # connait a l'avance que le point de rendez-vous
+                    # (ip:port du serveur de positions), qu'il a saisi.
+                    # Un client v0.3 ignore simplement cette cle.
+                    "audio_port": AUDIO_PORT,
+                    # [DISCORD 30/07/2026] Le joueur recoit SON numero, et
+                    # rien d'autre : l'annuaire est reserve a l'admin.
+                    # None si le serveur tourne sans comptes.
+                    "my_numero": (_account or {}).get("numero"),
                 }
                 # Ajout des permissions a False (cf. _build_my_profile_msg
                 # qui renvoie False pour profile=None).
@@ -1742,6 +3299,15 @@ async def handler(ws):
                     "profile": None,
                     "prox_short": False,
                 }))
+                # [QUEUE 03/08/2026] Rejeu du differe. APRES le welcome :
+                # le client doit avoir son propre numero et son etat avant
+                # de recevoir des messages, sinon il les traite dans un
+                # ecran pas encore construit. Tache separee pour ne pas
+                # retarder l'entree en jeu -- le rejeu peut durer plusieurs
+                # secondes si des images l'etalent.
+                if _QUEUE_ENABLED:
+                    asyncio.create_task(_queue_rejouer(
+                        ws, name, (_account or {}).get("numero")))
 
             elif msg_type == "pos":
                 if ws not in clients:
@@ -1879,6 +3445,24 @@ async def handler(ws):
                     caller = clients[ws]["name"]
                     target = data.get("target")
 
+                    # [CONTACTS 31/07/2026] Appel par NUMERO. Le client
+                    # n'envoie plus de pseudo : il ne le connait pas.
+                    # "target" reste accepte pour les clients anterieurs.
+                    _num = data.get("target_numero")
+                    _numero_appele = None
+                    if _num is not None:
+                        _numero_appele = str(_num).strip()
+                        target = _numero_to_pseudo(_numero_appele)
+                        if target is None:
+                            # Numero inattribue : on fait SONNER DANS LE
+                            # VIDE au lieu de repondre "inexistant".
+                            # Sans ca, le clavier deviendrait un outil de
+                            # recensement : 10 000 numeros, un script, et
+                            # on saurait lesquels existent. Un numero
+                            # inattribue et un joueur hors ligne doivent
+                            # etre indistinguables.
+                            target = f"#{_numero_appele}"
+
                     # Garde-fous basiques. Le client ne devrait pas
                     # envoyer ces requetes invalides, mais le serveur
                     # reste autoritaire et ne fait jamais confiance.
@@ -1894,10 +3478,10 @@ async def handler(ws):
                         # (le client n'aurait pas du proposer le bouton).
                         _log(f"[PHONE] {caller} : phone_call_request "
                              f"ignore (deja en appel)", ORANGE)
-                    elif _find_ws_by_name(target) is None:
-                        # Cible hors ligne -> 'occupe' (le client D1 ne
-                        # distingue pas hors-ligne et occupe ; un seul
-                        # retour suffit pour revenir au repos).
+                    elif (_find_ws_by_name(target) is None
+                          and _numero_appele is None):
+                        # Appel par pseudo (client ancien) : comportement
+                        # historique, 'occupe' immediat.
                         _log(f"[PHONE] {caller} -> {target} : cible hors "
                              f"ligne", ORANGE)
                         _phone_log_event("busy", call_id=None,
@@ -1905,7 +3489,7 @@ async def handler(ws):
                                          cause="offline")
                         await ws.send(json.dumps({
                             "type": "phone_call_busy",
-                            "target": target,
+                            "target_numero": _numero_of_name(target),
                             "cause": "offline",
                         }))
                     elif _find_active_call_for(target) is not None:
@@ -1917,7 +3501,7 @@ async def handler(ws):
                                          cause="in_call")
                         await ws.send(json.dumps({
                             "type": "phone_call_busy",
-                            "target": target,
+                            "target_numero": _numero_of_name(target),
                             "cause": "in_call",
                         }))
                     else:
@@ -1942,13 +3526,23 @@ async def handler(ws):
                         await ws.send(json.dumps({
                             "type": "phone_call_ringing",
                             "call_id": call_id,
-                            "target": target,
+                            "target_numero": _numero_of_name(target),
                         }))
                         # Notification d'appel entrant a l'appele.
+                        # [RP 04/08/2026] Le NUMERO, et RIEN QUE le numero.
+                        # Le pseudo etait encore envoye "pour les clients
+                        # anterieurs" : le client avait donc DEUX sources
+                        # pour la meme information, et la reconstruction
+                        # d'ecran depuis l'etat prenait la mauvaise -> le
+                        # pseudo s'affichait des que l'overlay etait ouvert
+                        # apres le debut de la sonnerie. Cf. §5 ter du
+                        # PROJET.md : pas de compatibilite non demandee.
+                        # C'est le client qui substitue le nom, a partir de
+                        # SES contacts locaux.
                         await _send_to_name(target, {
                             "type": "phone_call_incoming",
                             "call_id": call_id,
-                            "caller": caller,
+                            "caller_numero": _numero_of_name(caller),
                         })
 
             elif msg_type == "phone_call_accept":
@@ -1985,11 +3579,25 @@ async def handler(ws):
                         # Les DEUX parties recoivent phone_call_accepted :
                         # l'appelant passe de 'sonne' a 'en appel',
                         # l'appele confirme son propre passage en appel.
+                        # [RP 04/08/2026] Numeros pour l'AFFICHAGE.
+                        #
+                        # Les deux champs *_audio_id portent encore le
+                        # pseudo, et c'est volontaire : le core filtre les
+                        # trames 0x03 de l'appel sur le pseudo emetteur
+                        # (sender != state.phone_peer). Sans lui, plus de
+                        # son en appel.
+                        #
+                        # Ils sont NOMMES pour ca, pour qu'aucun ecran ne
+                        # puisse les afficher par megarde -- cf. §5 ter,
+                        # point 3, du PROJET.md. Le jour ou le filtrage
+                        # audio passera par le call_id, ils disparaitront.
                         accepted_msg = {
                             "type": "phone_call_accepted",
                             "call_id": call_id,
-                            "caller": caller,
-                            "callee": callee,
+                            "caller_numero": _numero_of_name(caller),
+                            "callee_numero": _numero_of_name(callee),
+                            "caller_audio_id": caller,
+                            "callee_audio_id": callee,
                         }
                         await _send_to_name(caller, accepted_msg)
                         await _send_to_name(callee, accepted_msg)
@@ -2045,9 +3653,44 @@ async def handler(ws):
                         _log(f"[PHONE] Raccroche par {cname} : "
                              f"{caller} <-> {callee} (call_id={call_id}, "
                              f"etat={call['state']})", ORANGE)
+
+                        # [MISSED 06/08/2026] Abandon pendant la sonnerie :
+                        # l'appel devient un appel MANQUE s'il a dure au
+                        # moins PHONE_MISSED_MIN_S.
+                        #
+                        # Conditions cumulees, chacune pour une raison :
+                        #   - etat "ringing" : un appel decroche puis
+                        #     raccroche est une conversation, pas un manque ;
+                        #   - raccroche par l'APPELANT : si c'est l'appele
+                        #     qui raccroche, il a vu l'appel -- lui deposer
+                        #     un "manque" serait faux ;
+                        #   - duree >= 5 s : en dessous, c'est un numero
+                        #     compose de travers et corrige aussitot.
+                        _duree = 0.0
+                        try:
+                            _duree = time.time() - float(
+                                call.get("created_at") or 0.0)
+                        except Exception:
+                            _duree = 0.0
+                        if (call["state"] == "ringing"
+                                and cname == caller
+                                and _duree >= PHONE_MISSED_MIN_S):
+                            _log(f"[PHONE] Abandon apres {_duree:.1f}s -> "
+                                 f"appel manque : {caller} -> {callee}",
+                                 ORANGE)
+                            _phone_log_event("hangup", call_id,
+                                             caller=caller, callee=callee,
+                                             by=cname,
+                                             prev_state=call["state"],
+                                             duree=round(_duree, 1))
+                            await _phone_declare_missed(
+                                call_id, caller, callee, "abandon")
+                            continue
+
                         _phone_log_event("hangup", call_id,
                                          caller=caller, callee=callee,
-                                         by=cname, prev_state=call["state"])
+                                         by=cname, prev_state=call["state"],
+                                         duree=round(_duree, 1))
                         _phone_clear_call(call_id)
                         # L'autre partie est notifiee de la fin d'appel.
                         await _send_to_name(other, {
@@ -2088,6 +3731,26 @@ async def handler(ws):
                     sender = clients[ws]["name"]
                     target = data.get("target")
                     body   = data.get("body")
+
+                    # [CONTACTS 31/07/2026] Envoi par NUMERO. Le client
+                    # ne connait plus le pseudo du destinataire : il n'a
+                    # que le numero, donne en jeu ou lu dans son
+                    # historique. "target" reste accepte pour les clients
+                    # anterieurs.
+                    _num_msg = data.get("target_numero")
+                    _numero_dest = None
+                    if _num_msg is not None:
+                        _numero_dest = str(_num_msg).strip()
+                        target = _numero_to_pseudo(_numero_dest)
+                        if target is None:
+                            # Numero inattribue : traite comme une cible
+                            # hors ligne (message perdu, silencieusement).
+                            # Repondre "ce numero n'existe pas" ferait de
+                            # la messagerie un outil de recensement.
+                            _log(f"[PHONE-MSG] {sender} -> #{_numero_dest} : "
+                                 f"numero inattribue, message perdu", ORANGE)
+                            target = None
+
                     # Garde-fous : champs valides + longueur + auto-msg.
                     if not isinstance(target, str) or not target:
                         _log(f"[PHONE-MSG] {sender} : ignore "
@@ -2103,12 +3766,45 @@ async def handler(ws):
                         # (defense en profondeur, le client la valide deja).
                         _log(f"[PHONE-MSG] {sender} -> {target} : ignore "
                              f"(body > 500 char : {len(body)})", ORANGE)
+                    elif not await _queue_verdict(ws, sender, len(body)):
+                        # Anti-spam : deja logue et notifie a l'emetteur.
+                        pass
                     elif _find_ws_by_name(target) is None:
-                        _log(f"[PHONE-MSG] {sender} -> {target} : cible "
-                             f"hors ligne, message perdu", ORANGE)
-                        _phone_log_event("msg_lost", call_id=None,
-                                         sender=sender, target=target,
-                                         len=len(body))
+                        # [QUEUE 03/08/2026] Cible hors ligne : au lieu de
+                        # perdre le message, on le depose dans sa file.
+                        # Un numero INATTRIBUE ne passe pas ici (target
+                        # vaut None et part en "target invalide") : on ne
+                        # materialise jamais sur disque un numero qui
+                        # n'existe pas.
+                        _dest = (_numero_dest if _numero_dest is not None
+                                 else _pseudo_to_numero(target))
+                        etat = _queue_depot(_dest, _K_MSG, sender, body)
+                        if etat == "ok":
+                            _log(f"[PHONE-MSG] {sender} -> {target} : hors "
+                                 f"ligne, mis en differe", BLUE)
+                            _phone_log_event("msg_queued", call_id=None,
+                                             sender=sender, target=target,
+                                             len=len(body))
+                        else:
+                            # "plein" : l'emetteur DOIT etre prevenu, un
+                            # refus silencieux lui laisse croire qu'il a
+                            # ete delivre. Libelle NEUTRE : dire "la file
+                            # de ce joueur est pleine" confirmerait que le
+                            # numero existe et que la personne est absente
+                            # depuis longtemps.
+                            _log(f"[PHONE-MSG] {sender} -> {target} : "
+                                 f"differe refuse ({etat})", ORANGE)
+                            _phone_log_event("msg_lost", call_id=None,
+                                             sender=sender, target=target,
+                                             len=len(body), cause=etat)
+                            try:
+                                await ws.send(json.dumps({
+                                    "type": "phone_message_refused",
+                                    "reason": "undelivered",
+                                    "retry_in": 0,
+                                }))
+                            except Exception:
+                                pass
                     else:
                         # Route au destinataire. Timestamp serveur (source
                         # de verite : evite les triches d'horloge client).
@@ -2118,12 +3814,58 @@ async def handler(ws):
                         _phone_log_event("msg_sent", call_id=None,
                                          sender=sender, target=target,
                                          len=len(body))
+                        # [RP 04/08/2026] Le NUMERO seul. Le destinataire
+                        # l'affiche tel quel, substitue par un nom
+                        # uniquement s'il l'a dans SON carnet.
                         await _send_to_name(target, {
                             "type":   "phone_message_received",
-                            "sender": sender,
+                            "sender_numero": _numero_of_name(sender),
                             "body":   body,
                             "ts":     ts,
                         })
+
+            elif msg_type and msg_type.startswith("groupe_"):
+                # [GROUPES 19/08/2026] Point d'entree unique, meme raison
+                # que pour travail_* et urgence_*.
+                if ws in clients:
+                    await _groupes_handle(ws, msg_type, data)
+
+            elif msg_type and msg_type.startswith("urgence_"):
+                # [URGENCE 15/08/2026] Point d'entree unique, meme raison
+                # que pour travail_* : une action ajoutee plus tard dans
+                # une branche a part oublierait la verification du numero
+                # ou le renvoi de l'etat, et laisserait un joueur avec un
+                # ecran perime sans que rien ne casse de visible.
+                if ws in clients:
+                    await _urgence_handle(ws, msg_type, data)
+
+            elif msg_type and msg_type.startswith("travail_"):
+                # [TRAVAIL 10/08/2026] Toutes les trames de l'app Travail
+                # passent par un point d'entree UNIQUE.
+                #
+                # Les repartir en six branches elif garantirait qu'une
+                # septieme, ajoutee plus tard, oublie la verification du
+                # numero ou l'envoi de la liste a jour -- et un oubli de
+                # ce genre ne casse rien de visible : il laisse juste un
+                # joueur avec un ecran perime.
+                if ws in clients:
+                    await _travail_handle(ws, msg_type, data)
+
+            elif msg_type == "phone_queue_ack":
+                # [QUEUE 03/08/2026] Le client confirme avoir ENREGISTRE
+                # les evenements rejoues. Rien n'est retire avant : une
+                # deconnexion en cours de rejeu doit pouvoir reprendre.
+                if ws in clients and _QUEUE_ENABLED:
+                    _num_ack = clients[ws].get("numero")
+                    _ids = data.get("ids")
+                    if _num_ack is not None and isinstance(_ids, list):
+                        try:
+                            n = _queue_store.ack(_num_ack, _ids)
+                        except Exception:
+                            n = 0
+                        if n:
+                            _log(f"[QUEUE] {clients[ws]['name']} : "
+                                 f"{n} evenement(s) acquitte(s)", BLUE)
 
             elif msg_type == "phone_image_send":
                 # Un joueur envoie un SCREENSHOT (JPEG base64) a un autre.
@@ -2135,6 +3877,15 @@ async def handler(ws):
                     sender = clients[ws]["name"]
                     target = data.get("target")
                     b64    = data.get("data")
+                    # [CONTACTS 31/07/2026] Meme routage par numero que
+                    # les messages texte.
+                    _num_img = data.get("target_numero")
+                    if _num_img is not None:
+                        _n = str(_num_img).strip()
+                        target = _numero_to_pseudo(_n)
+                        if target is None:
+                            _log(f"[PHONE-IMG] {sender} -> #{_n} : numero "
+                                 f"inattribue, image perdue", ORANGE)
                     if not isinstance(target, str) or not target:
                         _log(f"[PHONE-IMG] {sender} : ignore "
                              f"(target invalide)", ORANGE)
@@ -2147,12 +3898,40 @@ async def handler(ws):
                     elif len(b64) > 900_000:
                         _log(f"[PHONE-IMG] {sender} -> {target} : ignore "
                              f"(image trop lourde : {len(b64)} b64)", ORANGE)
+                    elif not await _queue_verdict(ws, sender, len(b64)):
+                        # Anti-spam : deja logue et notifie a l'emetteur.
+                        pass
                     elif _find_ws_by_name(target) is None:
-                        _log(f"[PHONE-IMG] {sender} -> {target} : cible "
-                             f"hors ligne, image perdue", ORANGE)
-                        _phone_log_event("img_lost", call_id=None,
-                                         sender=sender, target=target,
-                                         len=len(b64))
+                        # [QUEUE 03/08/2026] Image stockee en base64 TEL
+                        # QUEL, sans re-encodage : a cette echelle la place
+                        # ne coute rien, et le re-encodage reste une
+                        # decision interne au serveur, ajoutable plus tard
+                        # sans toucher au protocole ni aux clients.
+                        _dest_i = (str(_num_img).strip()
+                                   if _num_img is not None
+                                   else _pseudo_to_numero(target))
+                        etat = _queue_depot(_dest_i, _K_IMG, sender, b64)
+                        if etat == "ok":
+                            _log(f"[PHONE-IMG] {sender} -> {target} : hors "
+                                 f"ligne, mise en differe "
+                                 f"({len(b64)} b64)", BLUE)
+                            _phone_log_event("img_queued", call_id=None,
+                                             sender=sender, target=target,
+                                             len=len(b64))
+                        else:
+                            _log(f"[PHONE-IMG] {sender} -> {target} : "
+                                 f"differe refuse ({etat})", ORANGE)
+                            _phone_log_event("img_lost", call_id=None,
+                                             sender=sender, target=target,
+                                             len=len(b64), cause=etat)
+                            try:
+                                await ws.send(json.dumps({
+                                    "type": "phone_message_refused",
+                                    "reason": "undelivered",
+                                    "retry_in": 0,
+                                }))
+                            except Exception:
+                                pass
                     else:
                         ts = time.time()
                         _log(f"[PHONE-IMG] {sender} -> {target} "
@@ -2162,7 +3941,7 @@ async def handler(ws):
                                          len=len(b64))
                         await _send_to_name(target, {
                             "type":   "phone_image_received",
-                            "sender": sender,
+                            "sender_numero": _numero_of_name(sender),
                             "data":   b64,
                             "ts":     ts,
                         })
@@ -2261,6 +4040,29 @@ async def handler(ws):
                     requester     = clients[ws]["name"]
                     target        = data.get("target")
                     if_none_match = data.get("if_none_match")
+
+                    # [CONTACTS 31/07/2026] Demande par NUMERO. Le client
+                    # affiche une photo pour tout appel, y compris d'un
+                    # numero inconnu de ses contacts -- il ne connait donc
+                    # pas le pseudo. Le serveur resout en interne et
+                    # repond avec le NUMERO en cle : le pseudo ne sort
+                    # pas, l'annuaire ne fuit pas.
+                    _cle_reponse = None
+                    _num_photo = data.get("numero")
+                    if _num_photo is not None:
+                        _cle_reponse = str(_num_photo).strip()
+                        target = _numero_to_pseudo(_cle_reponse)
+                        if target is None:
+                            # Numero inattribue : "none", comme un joueur
+                            # sans photo. Indistinguable, volontairement.
+                            await ws.send(json.dumps({
+                                "type": "profile_photo_response",
+                                "target": _cle_reponse,
+                                "numero": _cle_reponse,
+                                "status": "none",
+                            }))
+                            continue
+
                     if not isinstance(target, str) or not target:
                         # Reponse minimale "none" pour debloquer le client
                         # sans causer d'erreur.
@@ -2272,7 +4074,8 @@ async def handler(ws):
                     elif not _is_safe_pseudo_for_file(target):
                         await ws.send(json.dumps({
                             "type": "profile_photo_response",
-                            "target": target,
+                            "target": (_cle_reponse or target),
+                            "numero": _cle_reponse,
                             "status": "none",
                         }))
                     else:
@@ -2280,7 +4083,8 @@ async def handler(ws):
                         if not entry:
                             await ws.send(json.dumps({
                                 "type": "profile_photo_response",
-                                "target": target,
+                                "target": (_cle_reponse or target),
+                                "numero": _cle_reponse,
                                 "status": "none",
                             }))
                         else:
@@ -2291,7 +4095,8 @@ async def handler(ws):
                                 # Le demandeur a deja la bonne version.
                                 await ws.send(json.dumps({
                                     "type": "profile_photo_response",
-                                    "target": target,
+                                    "target": (_cle_reponse or target),
+                                    "numero": _cle_reponse,
                                     "status": "unchanged",
                                     "hash": stored_hash,
                                 }))
@@ -2311,7 +4116,8 @@ async def handler(ws):
                                     _profile_photos_save_index()
                                     await ws.send(json.dumps({
                                         "type": "profile_photo_response",
-                                        "target": target,
+                                        "target": (_cle_reponse or target),
+                                        "numero": _cle_reponse,
                                         "status": "none",
                                     }))
                                 else:
@@ -2321,7 +4127,8 @@ async def handler(ws):
                                     ).decode("ascii")
                                     await ws.send(json.dumps({
                                         "type": "profile_photo_response",
-                                        "target": target,
+                                        "target": (_cle_reponse or target),
+                                        "numero": _cle_reponse,
                                         "status": "ok",
                                         "hash": stored_hash,
                                         "data_b64": data_b64,
@@ -2371,6 +4178,33 @@ async def handler(ws):
             _log(f"LEAVE : {name}  ({len(clients)} connecté(s))", ORANGE)
             if _ui:
                 _ui.remove_player(name)
+            # [URGENCE 15/08/2026] Deconnecte = signal abandonne. La
+            # demande meurt, le service tombe, et les prises que ce
+            # joueur avait sur d'autres signaux sont relachees.
+            #
+            # Prevenir les preneurs est indispensable : sans ca, un
+            # secouriste continuerait de voler vers un signal dont la
+            # victime a quitte le jeu. Et la victime dont le secouriste
+            # part doit revoir "en attente" -- laisser "les secours
+            # arrivent" alors que plus personne n'est en route est le
+            # pire affichage possible, elle cesserait de chercher une
+            # autre solution.
+            if _URGENCE_ENABLED:
+                try:
+                    _num_urg = (_leaving or {}).get("numero")
+                    if _num_urg:
+                        _sig_mort = _urgence_store.deconnecter(_num_urg)
+                        _a_prev = list((_sig_mort or {}).get("preneurs")
+                                       or [])
+                        _role_urg = _urgence_role(_num_urg)
+                        if _role_urg:
+                            _a_prev += _urgence_collegues(_role_urg,
+                                                          _num_urg)
+                        if _a_prev:
+                            await _urgence_pousser_etat(_a_prev)
+                except Exception as _e_urg:
+                    _log(f"[URGENCE] deconnexion KO : {_e_urg!r}", ORANGE)
+
             # CircusPhone : couper les appels en cours de ce joueur
             # AVANT d'annoncer son leave. L'autre partie recevra
             # phone_call_ended (reason=peer_disconnect).
@@ -2430,6 +4264,16 @@ async def _server_main():
     except Exception:
         pass
     cleanup_task = asyncio.create_task(_cleanup_loop())
+    # [QUEUE 03/08/2026] Purge de la retention (au demarrage puis /24 h).
+    if _QUEUE_ENABLED:
+        asyncio.create_task(_queue_purge_loop())
+    # [URGENCE 15/08/2026] Purge des signaux expires, toutes les minutes.
+    # Rythme propre : un signal vit 1 h, la boucle quotidienne le
+    # laisserait mort et visible pendant 23 heures.
+    if _URGENCE_ENABLED:
+        asyncio.create_task(_urgence_purge_loop())
+    # [OBS1] Boucle de mesure du debit (push admin 5s, log 30s).
+    stats_task = asyncio.create_task(_report_pos_stats())
 
     # ─────────────────────────────────────────────
     #  [P1 - TLS] Chiffrement de la connexion (auto)

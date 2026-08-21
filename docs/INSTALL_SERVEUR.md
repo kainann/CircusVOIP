@@ -16,7 +16,8 @@ reverse proxy, pas de conteneur**. Deux services, deux ports.
 
 - Un serveur Linux (Ubuntu 24.04 recommandé), accès `root` ou `sudo`.
 - Python 3.12 (fourni de base sur Ubuntu 24.04).
-- Deux ports TCP ouvrables : **8888** (positions) et **8889** (audio).
+- Deux ports TCP ouvrables : **8888** (positions) et **8889** (audio) par
+  défaut. Depuis le 26/07/2026 ils sont **configurables** : voir §4.
 - Aucun nom de domaine requis : les clients se connectent à l'adresse IP.
 
 Dimensionnement : un petit VPS (2 vCPU / 2 Go) suffit largement pour un
@@ -56,11 +57,26 @@ Copier ces fichiers depuis `server/` du dépôt vers `/home/circusvoip/app/` :
 
 | Fichier | Rôle |
 |---|---|
-| `circusvoip_server.py` | serveur de positions (port 8888) |
+| `circusvoip_server.py` | serveur de positions (port 8888 par défaut) |
 | `circusvoip_mp_server.py` | lobbies multijoueur — **importé** par le précédent, pas un service |
-| `circusvoip_audio_server.py` | serveur audio (port 8889) |
-| `circusvoip_server_config.py` | gestion du token d'accès |
+| `circusvoip_audio_server.py` | serveur audio (port 8889 par défaut) |
+| `circusvoip_server_config.py` | token d'accès **et ports** |
 | `circusvoip_security.py` | TLS, tickets d'authentification |
+| `circusvoip_accounts.py` | comptes joueurs, annuaire, attribution des numéros |
+| `circusvoip_accounts_ws.py` | liaison Discord côté serveur |
+| `circusvoip_discord_auth.py` | échange OAuth Discord (moitié serveur) |
+| `circusvoip_phone_queue.py` | messagerie différée + anti-spam |
+
+Les quatre derniers sont apparus avec la v0.4.0 (builds 66 et 69).
+
+> ⚠ `circusvoip_accounts.py` et `circusvoip_accounts_ws.py` contiennent
+> l'annuaire complet : ils ne doivent **jamais** être distribués aux clients.
+> `circusvoip_discord_auth.py`, lui, est partagé — il vit des deux côtés.
+
+> ℹ️ Ces quatre fichiers sont **facultatifs**. Sans eux le serveur démarre et
+> fonctionne, simplement sans comptes Discord ni messagerie différée : les
+> imports sont gardés. C'est ce qui permet de déployer en deux temps — mais
+> l'absence est **silencieuse**, donc vérifiez plutôt deux fois.
 
 ```bash
 sudo chown -R circusvoip:circusvoip /home/circusvoip/app
@@ -79,7 +95,25 @@ Au premier lancement, le serveur crée tout seul :
 - `cert.pem` / `key.pem` — certificat TLS auto-signé ;
 - `circusvoip_profiles.json`, `circusvoip_channels.json`,
   `circusvoip_highscores.json`, `circusvoip_auth_tickets.json`,
-  `profile_photos/` — état runtime, créés vides.
+  `profile_photos/` — état runtime, créés vides ;
+- `circusvoip_accounts.json` — **comptes joueurs** : identité Discord, pseudo
+  et numéro attribué. C'est le fichier le plus précieux du serveur : le
+  perdre réattribue des numéros à tout le monde ;
+- `phone_queue/` — messagerie différée, un fichier JSON par numéro de
+  destinataire. Créé au démarrage, vide.
+
+### Changer les ports
+
+`circusvoip_server_config.json` contient aussi les ports :
+
+```json
+{ "port_positions": 8888, "port_audio": 8889, "port_update": 8080 }
+```
+
+Les modifier puis redémarrer les services suffit. Pensez à ouvrir les
+nouveaux ports au pare-feu (§6) **et** à prévenir les joueurs : un client
+configuré sur l'ancien port ne se connectera plus, avec un simple « serveur
+injoignable » qui ne dit pas que le port est en cause.
 
 Le token joueurs est affiché dans les logs au démarrage : c'est lui que les
 joueurs saisiront dans leur client, avec l'adresse IP du serveur.
@@ -131,6 +165,10 @@ sudo ufw allow 8889/tcp     # audio (wss)
 sudo ufw enable
 ```
 
+Adaptez les numéros si vous avez changé les ports (§4). Vérifiez aussi le
+pare-feu **de l'hébergeur** (groupe de sécurité) : il est distinct d'`ufw` et
+c'est la cause la plus fréquente de « les clients ne se connectent pas ».
+
 ## 7. Dossiers de logs (optionnel)
 
 ```bash
@@ -154,6 +192,29 @@ sudo journalctl -u circusvoip-audio  -n 30 --no-pager
 Vous devez voir le démarrage, la ligne TLS, le port d'écoute et le token.
 Côté client : saisir l'adresse IP du serveur et le token, puis se connecter.
 
+### Vérifier la messagerie différée
+
+Le module ne s'annonce pas au démarrage, et la purge de rétention ne logue
+que si elle supprime quelque chose : sur un serveur neuf, **le silence est
+normal** et ne prouve rien. Le témoin fiable est le dossier, créé au
+chargement du module :
+
+```bash
+ls -ld /home/circusvoip/app/phone_queue/
+```
+
+S'il existe et appartient à `circusvoip`, le module est chargé. S'il manque
+alors que `circusvoip_phone_queue.py` est bien présent, l'import a échoué —
+et le serveur tourne alors comme avant, sans le dire.
+
+En fonctionnement, la file d'un joueur hors ligne apparaît sous son numéro
+(`425874.json`) et disparaît après son retour :
+
+```bash
+ls -l /home/circusvoip/app/phone_queue/
+journalctl -u circusvoip-server -f | grep -E 'QUEUE|PHONE-'
+```
+
 ## Notes
 
 - **Certificat auto-signé** : c'est normal et suffisant. Le client ne vérifie
@@ -166,8 +227,15 @@ Côté client : saisir l'adresse IP du serveur et le token, puis se connecter.
   Pour appliquer une nouvelle version, copiez les fichiers puis
   `sudo systemctl restart circusvoip-server circusvoip-audio`.
 - **Sauvegarde** : conservez `circusvoip_server_config.json`,
-  `circusvoip_admin_token.json` et les JSON d'état. Perdre le token joueurs
-  oblige tous les joueurs à en saisir un nouveau.
+  `circusvoip_admin_token.json`, `circusvoip_accounts.json` et les JSON
+  d'état. Perdre le token joueurs oblige tous les joueurs à en saisir un
+  nouveau ; perdre `circusvoip_accounts.json` réattribue les numéros de tout
+  le monde, ce qui invalide les carnets de contacts de chacun.
+- **Messagerie différée** : les messages en attente sont conservés **30
+  jours** à partir de leur envoi, puis purgés automatiquement (au démarrage,
+  puis toutes les 24 h). Plafond de **20 Mo par joueur** ; au-delà, les
+  nouveaux envois vers cette personne sont refusés et l'expéditeur en est
+  informé. Les anciens ne sont jamais effacés pour faire de la place.
 
 ## Dépannage
 
@@ -177,3 +245,7 @@ Côté client : saisir l'adresse IP du serveur et le token, puis se connecter.
 | Les clients ne se connectent pas | port fermé côté pare-feu **ou** côté hébergeur (groupe de sécurité) |
 | « token invalide » | le token saisi ne correspond pas à `circusvoip_server_config.json` |
 | Tracebacks `InvalidUpgrade` dans les logs audio | connexions non-WebSocket (scans de ports) rejetées : inoffensif |
+| « serveur injoignable » alors que le service tourne | port changé dans `circusvoip_server_config.json` sans que les clients le sachent, ou non ouvert au pare-feu |
+| Les messages vers un joueur hors ligne se perdent encore | `circusvoip_phone_queue.py` absent de `/home/circusvoip/app/` : l'import est gardé, donc l'échec est silencieux |
+| Un joueur ne peut plus se connecter sans raison | blocage anti-spam automatique, borné dans le temps. Vérifier `blocked_until` sur sa fiche dans `circusvoip_accounts.json` |
+| Le mannequin ou un test de charge se fait bloquer | son compte n'est pas marqué compte de service (`discord_id` préfixé `local:`), donc il n'est pas exempté de quota |

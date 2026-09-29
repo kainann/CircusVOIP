@@ -37,7 +37,7 @@ inutile.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QSize, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, QSize, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
@@ -478,6 +478,7 @@ class AppelsApp(PhoneApp):
         self._ed_num.setPlaceholderText("42••••")
         self._ed_num.textChanged.connect(self._sur_saisie)
         self._ed_num.returnPressed.connect(self._valider_saisie)
+        self._ed_num.installEventFilter(self)
         vc.addWidget(self._ed_num)
 
         # Nom du contact si le numero compose est connu. Ne remplace pas
@@ -898,6 +899,30 @@ class AppelsApp(PhoneApp):
             pass
         self._peindre_cible()
 
+    # -- suivi du focus reel ---------------------------------------------
+    #
+    # [CLAVIER 03/09/2026] `_dans_champ` n'etait arme que par le chemin
+    # D-pad (_entrer_dans_champ). Un clic souris donne le focus a Qt sans
+    # passer par la : le drapeau restait faux, l'overlay traitait l'app
+    # comme hors champ, et Retour arriere -- supprime au niveau OS avant
+    # d'atteindre le widget -- repartait en "retour". Regle ecrite dans
+    # CIRCUSVOIP_PROJET.md, 5 ter, "Contrat clavier des apps a champ de
+    # saisie". Meme correctif que Travail et Urgence.
+
+    def eventFilter(self, obj, ev):
+        try:
+            if obj is self._ed_num:
+                if ev.type() == QEvent.FocusIn:
+                    self._dans_champ = True
+                    self._cible = 0
+                    self._peindre_cible()
+                elif ev.type() == QEvent.FocusOut:
+                    self._dans_champ = False
+                    self._peindre_cible()
+        except Exception:
+            pass
+        return super().eventFilter(obj, ev)
+
     def _nav_historique(self, direction: str) -> bool:
         """Navigation de l'onglet Historique.
 
@@ -1079,6 +1104,7 @@ class ContactsApp(PhoneApp):
         self._ed_nom.setMaxLength(20)
         self._ed_nom.setStyleSheet(self._style_champ())
         self._ed_nom.textChanged.connect(self._verifier_ajout)
+        self._ed_nom.installEventFilter(self)
         va.addWidget(self._ed_nom)
 
         va.addSpacing(8)
@@ -1088,6 +1114,7 @@ class ContactsApp(PhoneApp):
         self._ed_num.setPlaceholderText("42••••")
         self._ed_num.setStyleSheet(self._style_champ())
         self._ed_num.textChanged.connect(self._verifier_ajout)
+        self._ed_num.installEventFilter(self)
         va.addWidget(self._ed_num)
 
         self._msg_ajout = QLabel("")
@@ -1362,6 +1389,20 @@ class ContactsApp(PhoneApp):
                 pass
         self._peindre_cible()
 
+    def eventFilter(self, obj, ev):
+        try:
+            if obj is self._ed_nom or obj is self._ed_num:
+                if ev.type() == QEvent.FocusIn:
+                    self._dans_champ = True
+                    self._cible = 0 if obj is self._ed_nom else 1
+                    self._peindre_cible()
+                elif ev.type() == QEvent.FocusOut:
+                    self._dans_champ = False
+                    self._peindre_cible()
+        except Exception:
+            pass
+        return super().eventFilter(obj, ev)
+
     def _sortir_du_champ(self):
         self._dans_champ = False
         for w in (self._ed_nom, self._ed_num):
@@ -1630,6 +1671,7 @@ class MessagerieApp(PhoneApp):
         self._ed_num.setMaxLength(6)
         self._ed_num.setPlaceholderText("42••••")
         self._ed_num.textChanged.connect(self._verifier)
+        self._ed_num.installEventFilter(self)
         vf.addWidget(self._ed_num)
         self._msg = QLabel("")
         self._msg.setWordWrap(True)
@@ -1668,6 +1710,7 @@ class MessagerieApp(PhoneApp):
         # code ne le restreint.
         self._ed_nom.setPlaceholderText("...")
         self._ed_nom.textChanged.connect(self._verifier_grp)
+        self._ed_nom.installEventFilter(self)
         vg.addWidget(self._ed_nom)
 
         self._lbl_membres = QLabel("Membres")
@@ -2593,6 +2636,30 @@ class MessagerieApp(PhoneApp):
             except Exception:
                 pass
         self._peindre_boutons()
+
+    # -- suivi du focus reel ---------------------------------------------
+    #
+    # [CLAVIER 03/09/2026] Meme correctif que Appels et Contacts, voir le
+    # commentaire d'AppelsApp.eventFilter. Ici deux champs selon la page
+    # (_ed_num pour les messages, _ed_nom pour un groupe) ; c'est
+    # champ_courant_vide qui choisit lequel lire via _page_groupe, donc
+    # aucune cible a realigner. La liste deroulante ouverte prend le
+    # focus a sa maniere : dans_champ() la couvre deja par
+    # _liste_ouverte, un FocusOut du champ pendant qu'elle est ouverte
+    # ne change rien au verdict.
+
+    def eventFilter(self, obj, ev):
+        try:
+            if obj is self._ed_num or obj is self._ed_nom:
+                if ev.type() == QEvent.FocusIn:
+                    self._dans_champ = True
+                    self._peindre_boutons()
+                elif ev.type() == QEvent.FocusOut:
+                    self._dans_champ = False
+                    self._peindre_boutons()
+        except Exception:
+            pass
+        return super().eventFilter(obj, ev)
 
     def handle_back(self) -> bool:
         if self._dans_champ:

@@ -62,13 +62,20 @@ import os
 import time
 import traceback
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
     QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from circusvoip_phone_apps import PhoneApp
+
+# [31/08/2026] Fabrique d'icones vectorielles. Import protege, comme dans
+# les autres apps : si elle manque, on retombe sur le glyphe.
+try:
+    from circusvoip_phone_apps import LazyPhoneIcon as _LazyPhoneIcon
+except Exception:
+    _LazyPhoneIcon = None
 import circusvoip_phone_urgence as U
 
 # Palette : reprise a l'identique de l'app Travail. Redefinir une teinte
@@ -428,7 +435,16 @@ class UrgenceApp(PhoneApp):
 
     APP_ID   = "urgence"
     APP_NAME = "Urgence"
-    APP_ICON = "\U0001F198"   # SOS
+    # [31/08/2026] SVG embarque au lieu du glyphe brut.
+    #
+    # L'app declarait "\U0001F198" en dur, donc l'icone etait rendue par la
+    # POLICE SYSTEME : emoji couleur sur certains postes, carre vide sur
+    # d'autres si la police manque -- et une rupture visuelle avec les
+    # icones voisines, qui sont dessinees.
+    #
+    # Le glyphe reste en repli, jamais atteint en pratique.
+    APP_ICON = (_LazyPhoneIcon("urgence", "\U0001F198")
+                if _LazyPhoneIcon is not None else "\U0001F198")
 
     # Etapes de la page principale.
     _ETAPE_CHOIX    = 0
@@ -565,6 +581,7 @@ class UrgenceApp(PhoneApp):
             f"border:none;border-radius:10px;padding:6px;font-size:11px;}}")
         self._texte.setStyleSheet(self._texte_base)
         self._texte.textChanged.connect(self._borner_texte)
+        self._suivre_focus(self._texte)
         # Hauteur FIXE, environ un tiers de l'ecran. Un champ extensible
         # repoussait les boutons contre le bas et les collait l'un a
         # l'autre : dans l'urgence, on vise sans regarder, et deux
@@ -598,7 +615,16 @@ class UrgenceApp(PhoneApp):
         self._erreur = QLabel("")
         self._erreur.setWordWrap(True)
         self._erreur.setAlignment(Qt.AlignCenter)
-        self._erreur.setStyleSheet(f"color:{_ROUGE};font-size:11px;")
+        # [28/08/2026] 13px et non 11.
+        #
+        # C'est ce libelle qui porte "Aucun secouriste n'est actuellement
+        # disponible" -- la phrase qui decide si un blesse attend des
+        # secours ou cherche autre chose. A 11px, en rouge sur blanc,
+        # dans un telephone affiche a l'echelle de l'ecran de jeu, elle
+        # etait signalee comme illisible. 13px aligne ce texte sur les
+        # boutons de l'app, qui sont deja a cette taille.
+        self._erreur.setStyleSheet(
+            f"color:{_ROUGE};font-size:13px;font-weight:600;")
         self._erreur.setVisible(False)
         v.addWidget(self._erreur)
 
@@ -849,8 +875,31 @@ class UrgenceApp(PhoneApp):
 
         self._s_tendance = QLabel("")
         self._s_tendance.setAlignment(Qt.AlignCenter)
+        # [29/08/2026] Sans retour a la ligne, le message d'absence de
+        # distance -- 110 caracteres -- s'affichait sur UNE ligne qui
+        # debordait de l'ecran des deux cotes : le secouriste n'en lisait
+        # que le milieu, donc rien d'exploitable.
+        self._s_tendance.setWordWrap(True)
         self._s_tendance.setStyleSheet(f"color:{_MUTED};font-size:11px;")
         v.addWidget(self._s_tendance)
+
+        # [28/08/2026] Compte a rebours de la prochaine mesure.
+        #
+        # Il existait deja, mais partait dans un setToolTip() : sur un
+        # overlay en jeu, une infobulle ne s'affiche jamais -- il faudrait
+        # laisser un curseur souris immobile sur le libelle. Le secouriste
+        # voyait donc une distance figee sans pouvoir distinguer "la
+        # mesure tourne, patiente" de "c'est bloque".
+        #
+        # Libelle SEPARE et non ajout a _s_age : celui-ci porte "Signal
+        # emis il y a ...", que _rendre_suivi() reecrit a chaque etat
+        # pousse par le serveur. Les deux se seraient effaces l'un
+        # l'autre au hasard des trames.
+        self._s_prochaine = QLabel("")
+        self._s_prochaine.setAlignment(Qt.AlignCenter)
+        self._s_prochaine.setWordWrap(True)
+        self._s_prochaine.setStyleSheet(f"color:{_MUTED};font-size:11px;")
+        v.addWidget(self._s_prochaine)
 
         v.addStretch(1)
 
@@ -937,13 +986,18 @@ class UrgenceApp(PhoneApp):
         pos = sig.get("position")
         if not moi or not pos:
             return None
+        # [SYSTEME 03/09/2026] L'identifiant tranche d'abord. Il ne
+        # depend d'aucune coordonnee, donc il repond meme quand la ligne
+        # SolarSystem n'a pas ete lue en entier.
+        if U.meme_systeme(pos, moi) is False:
+            return ("Autre système", _ROUGE)
         det = U.distance_detail(pos, moi)
         if det.get("distance") is not None and det.get("fiable"):
             return ("Sur place", _VERT)
         # Repli systeme, assume et approximatif.
         a = (pos or {}).get("system")
         b = (moi or {}).get("system")
-        if not a or not b:
+        if not a or not b or a.get("x") is None or b.get("x") is None:
             return ("Position inconnue", _MUTED)
         try:
             d = ((float(a["x"]) - float(b["x"])) ** 2
@@ -1073,6 +1127,7 @@ class UrgenceApp(PhoneApp):
             f"QLineEdit{{background:{_GRISE};color:{_TXT};border:none;"
             f"border-radius:8px;padding:6px;font-size:11px;}}")
         self._champ_numero.setStyleSheet(self._champ_numero_base)
+        self._suivre_focus(self._champ_numero)
         hc.addWidget(self._champ_numero, 1)
         self._btn_recruter = QPushButton("Ajouter")
         self._btn_recruter.setMinimumHeight(30)
@@ -1103,7 +1158,12 @@ class UrgenceApp(PhoneApp):
 
         self._a_erreur = QLabel("")
         self._a_erreur.setWordWrap(True)
-        self._a_erreur.setStyleSheet(f"color:{_ROUGE};font-size:10px;")
+        # Meme raison que _erreur : les refus d'attribution ("Ce joueur a
+        # deja l'autre role", "Aucun joueur ne porte ce numero") sont la
+        # seule reponse que recoit le chef, et 10px les rendait faciles a
+        # manquer.
+        self._a_erreur.setStyleSheet(
+            f"color:{_ROUGE};font-size:12px;font-weight:600;")
         self._a_erreur.setVisible(False)
         v.addWidget(self._a_erreur)
         return page
@@ -1175,7 +1235,28 @@ class UrgenceApp(PhoneApp):
             # l'etat de connexion des autres n'est pas son affaire.
             membres = [{"numero": n, "chef": False, "en_service": True}
                        for n in e.collegues]
-            self._a_titre.setText(f"{len(membres)} collègue(s) en service")
+            # [31/08/2026] Le joueur figure dans SA PROPRE liste.
+            #
+            # `collegues` vient du serveur et exclut volontairement soi --
+            # ce sont les collegues, et cette meme liste sert a decider qui
+            # prevenir : s'y inclure enverrait un etat a soi-meme en double.
+            #
+            # Mais a l'ecran, un secouriste de garde lisait « en service »
+            # sans y trouver son nom, et en deduisait qu'il n'etait pas
+            # pointe. La seule chose qui le lui disait etait le bouton
+            # au-dessus, « Quitter mon service » -- une information qu'il
+            # faut interpreter a l'envers.
+            #
+            # On l'ajoute donc ICI, a l'affichage seulement, et en TETE :
+            # c'est lui le premier concerne.
+            moi = self._mon_numero()
+            if moi and e.en_service:
+                membres.insert(0, {"numero": moi, "chef": False,
+                                   "en_service": True, "moi": True})
+            dispo = len(membres)
+            self._a_titre.setText(
+                f"{dispo} secouriste(s) en service"
+                if dispo != 1 else "1 secouriste en service")
 
         for i, m in enumerate(membres):
             self._a_liste.insertWidget(i, self._ligne_membre(m, chef))
@@ -1191,8 +1272,20 @@ class UrgenceApp(PhoneApp):
 
         num = str(membre.get("numero") or "")
         nom = self._nom_affiche(num)
+        if membre.get("moi"):
+            # Le pseudo du client, pas le repertoire : celui-ci ne
+            # contient pas son propre numero, donc _nom_affiche rendrait
+            # six chiffres bruts -- ce qui ne confirme rien.
+            #
+            # Repli sur « Vous » si le service ne rend rien : mieux vaut
+            # un mot juste qu'un numero qu'on ne reconnait pas.
+            mien = getattr(self.services, "my_name", None)
+            nom = str(mien).strip() if mien else ""
+            nom = nom or "Vous"
         lbl = QLabel(nom + ("  ★" if membre.get("chef") else ""))
-        lbl.setStyleSheet(f"color:{_TXT};font-size:13px;border:none;")
+        lbl.setStyleSheet(
+            f"color:{_TXT};font-size:13px;border:none;"
+            + ("font-weight:600;" if membre.get("moi") else ""))
         h.addWidget(lbl)
 
         if membre.get("en_service"):
@@ -1479,8 +1572,11 @@ class UrgenceApp(PhoneApp):
             self._s_distance.setText("Zone OCR introuvable")
             return
         self._pour_liste = bool(pour_liste)
+        # Le minuteur n'est PAS arrete ici : une mesure en cours ne
+        # remplace pas la planification de la suivante.
         self._decompte.stop()
         self._echeance = None
+        self._s_prochaine.setText("Mesure en cours…")
         self._btn_situer.setEnabled(False)
         self._btn_situer.setText("Lecture…")
         # Lecture SIMPLE : le secouriste se deplace, et il remesure
@@ -1510,7 +1606,17 @@ class UrgenceApp(PhoneApp):
             return
         det = U.distance_detail(sig.get("position"), self._ma_position)
         d = det.get("distance")
-        if d is None:
+        if det.get("autre_systeme"):
+            # [SYSTEME 03/09/2026] Les identifiants SolarSystem
+            # different. Inutile de chercher ici : il faut d'abord
+            # changer de systeme. Avant, l'ecran invitait a rejoindre
+            # la zone, et le secouriste pouvait parcourir un systeme
+            # entier avant de comprendre.
+            self._s_distance.setText("Autre système")
+            self._s_tendance.setText(
+                "La victime n'est pas dans votre système stellaire. "
+                "Rejoignez le sien avant de chercher.")
+        elif d is None:
             # Regle STRICTE sur l'ecran de suivi : pas de referentiel
             # commun, pas de nombre. La distance systeme derive avec
             # l'orbite, et un chiffre credible mais faux enverrait le
@@ -1552,15 +1658,32 @@ class UrgenceApp(PhoneApp):
         self._decompte.start()
         self._tic_decompte()
 
+    def _arreter_decompte(self, libelle=""):
+        """Arrete le compte a rebours ET efface son libelle.
+
+        Les trois vont ensemble. Les separer laisserait un "Prochaine
+        mesure dans 12 s" fige a l'ecran apres avoir quitte le suivi --
+        un texte qui ment d'autant plus qu'il ne bouge plus.
+        """
+        self._minuteur.stop()
+        self._decompte.stop()
+        self._echeance = None
+        self._s_prochaine.setText(libelle)
+
     def _tic_decompte(self):
         if self._echeance is None:
             self._decompte.stop()
+            self._s_prochaine.clear()
             return
         reste = self._echeance - time.monotonic()
         if reste <= 0:
             self._decompte.stop()
+            # Pendant la mesure elle-meme : sans ce libelle, l'ecran
+            # resterait muet le temps de la lecture OCR, qui prend
+            # plusieurs secondes.
+            self._s_prochaine.setText("Mesure en cours…")
             return
-        self._s_age.setToolTip(f"Prochaine mesure dans {reste:.0f} s")
+        self._s_prochaine.setText(f"Prochaine mesure dans {reste:.0f} s")
 
     # -----------------------------------------------------------------
     #  Etat pousse par le serveur
@@ -1577,15 +1700,30 @@ class UrgenceApp(PhoneApp):
         """
         avant_demande = self._etat.ma_demande
         avait_suivi = self._signal_suivi() is not None
+        avait_role = bool(self._etat.role)
         self._etat.appliquer(data)
         err = (data or {}).get("erreur") or ""
 
         # La barre d'onglets n'apparait qu'avec un role : un joueur
         # ordinaire n'a qu'un ecran, et une barre a un seul onglet est du
         # decor qui coute de la place.
-        avait_barre = self._barre.isVisible()
+        #
+        # [28/08/2026] Le repli se decide sur l'ETAT, plus sur
+        # self._barre.isVisible().
+        #
+        # En Qt, isVisible() rend False des qu'un ANCETRE est masque --
+        # et l'overlay du telephone l'est la plupart du temps en jeu. Un
+        # joueur destitue pendant que son telephone etait ferme gardait
+        # donc la page ou il se trouvait : observe le 28/08, un ancien
+        # chef restait sur la liste des demandes, sans barre d'onglets
+        # pour en sortir et donc sans aucun moyen de declencher une
+        # urgence.
+        #
+        # avait_role vient de l'etat precedent, capte avant appliquer().
+        # Il ne depend d'aucun widget, donc le telephone peut etre ouvert
+        # ou ferme sans rien changer.
         self._barre.setVisible(bool(self._etat.role))
-        if avait_barre and not self._etat.role:
+        if avait_role and not self._etat.role:
             self._aller_page(self._PAGE_DEMANDE)
 
         self._rendre_liste()
@@ -1604,9 +1742,7 @@ class UrgenceApp(PhoneApp):
                 self._derniere_mesure = None
                 self._lancer_mesure()
         elif avait_suivi:
-            self._minuteur.stop()
-            self._decompte.stop()
-            self._echeance = None
+            self._arreter_decompte()
 
         # Erreur d'attribution : elle appartient a l'onglet du chef.
         if err and self._pages.currentIndex() == self._PAGE_ADMIN:
@@ -1687,8 +1823,8 @@ class UrgenceApp(PhoneApp):
                 L.append(f"      local=({d.get('x')}, {d.get('y')}, "
                          f"{d.get('z')})")
             sysc = hier.get("system") or {}
-            L.append(f"  SolarSystem : ({sysc.get('x')}, {sysc.get('y')}, "
-                     f"{sysc.get('z')})")
+            L.append(f"  SolarSystem : cid={sysc.get('container_id')!r} "
+                     f"({sysc.get('x')}, {sysc.get('y')}, {sysc.get('z')})")
             L.append("")
             L.append(f"PHRASE : {U.phrase_position(self._derniere_position)}")
             tech = U.phrase_technique(self._derniere_position)
@@ -1816,9 +1952,7 @@ class UrgenceApp(PhoneApp):
         # que personne ne regarde.
         if not (k == self._PAGE_LISTE
                 and self._vues_dem.currentIndex() == 1):
-            self._minuteur.stop()
-            self._decompte.stop()
-            self._echeance = None
+            self._arreter_decompte()
         self._cible = 0
         self._construire_nav()
 
@@ -1895,6 +2029,86 @@ class UrgenceApp(PhoneApp):
             return True
         return not (txt or "").strip()
 
+    # -- contrat clavier attendu par l'overlay ---------------------------
+    #
+    # [CORRECTIF 01/09/2026] Ces deux methodes MANQUAIENT. Elles sont lues
+    # par _PhoneNavKeyListener via getattr : une app qui ne les expose pas
+    # est silencieusement traitee comme "jamais dans un champ", sans
+    # erreur ni trace. Consequences observees en jeu :
+    #
+    #   - sous Windows, le filtre win32 supprime Retour arriere au niveau
+    #     OS des que _is_text_field() est faux. La touche n'atteignait donc
+    #     JAMAIS le widget : impossible de corriger une faute de frappe ;
+    #   - la touche repartait en "esc" -> handle_back, d'ou l'impression
+    #     de "retour" au lieu d'un effacement ;
+    #   - les fleches etaient volees au curseur de saisie par le D-pad.
+    #
+    # La machinerie interne (_dans_champ, _champ_vide, _sortir_du_champ)
+    # existait deja : seuls les accesseurs publics manquaient. L'app
+    # Travail nomme son drapeau `_dans_champ_` avec un souligne final pour
+    # eviter la collision avec la methode ; ici les deux noms different
+    # deja, rien a renommer.
+    #
+    # NB : le commentaire de handle_back date du 13/08 affirme que Retour
+    # arriere arrive "EN PLUS d'etre recu par le champ". C'etait faux tant
+    # que ces methodes manquaient -- la touche etait supprimee avant. Ca
+    # ne le devient qu'a partir de ce correctif, et seulement champ vide.
+
+    def dans_champ(self) -> bool:
+        """True quand un champ de saisie a le focus clavier."""
+        return bool(self._dans_champ)
+
+    def champ_courant_vide(self) -> bool:
+        """True si le champ focalise est vide.
+
+        Champ NON vide : Retour arriere efface. Champ vide : il ressort
+        de la saisie. Meme regle que les apps Travail et Annuaire.
+        """
+        if not self._dans_champ:
+            return False
+        return self._champ_vide()
+
+    # -- suivi du focus reel ---------------------------------------------
+
+    def _suivre_focus(self, widget):
+        """Fait suivre `_dans_champ` au focus REEL du widget.
+
+        [CORRECTIF 01/09/2026] `_dans_champ` n'etait arme que par le
+        chemin D-pad (handle_nav "enter" -> _entrer_dans_champ). Un clic
+        souris donne le focus a Qt sans passer par la, le drapeau restait
+        faux et Retour arriere repartait en "retour". D'ou un defaut qui
+        paraissait intermittent : au clavier ca marchait, a la souris
+        jamais.
+        """
+        try:
+            widget.installEventFilter(self)
+        except Exception:
+            pass
+
+    def eventFilter(self, obj, ev):
+        try:
+            champs = (getattr(self, "_texte", None),
+                      getattr(self, "_champ_numero", None))
+            if obj in champs and obj is not None:
+                if ev.type() == QEvent.FocusIn:
+                    self._dans_champ = True
+                    self._champ_actif = obj
+                    # Aligner la cible D-pad sur le champ clique, sinon le
+                    # contour reste sur un autre widget et on ne voit pas
+                    # ou l'on tape.
+                    for i, (w, _b) in enumerate(self._nav):
+                        if w is obj:
+                            self._cible = i
+                            break
+                    self._peindre_nav()
+                elif ev.type() == QEvent.FocusOut:
+                    self._dans_champ = False
+                    self._champ_actif = None
+                    self._peindre_nav()
+        except Exception:
+            pass
+        return super().eventFilter(obj, ev)
+
     def _sortir_du_champ(self):
         w = getattr(self, "_champ_actif", None) or self._texte
         self._dans_champ = False
@@ -1963,6 +2177,4 @@ class UrgenceApp(PhoneApp):
         #
         # La mesure secouriste, elle, s'arrete : elle prend de l'OCR a la
         # boucle de proximite pour un ecran que personne ne regarde.
-        self._minuteur.stop()
-        self._decompte.stop()
-        self._echeance = None
+        self._arreter_decompte()

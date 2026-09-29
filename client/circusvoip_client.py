@@ -2587,6 +2587,9 @@ class NetWorker(QObject):
                 pass
 
     async def _ws_client(self, server_ip: str, name: str, token: str):
+        # Refus serveur d'une tentative PRECEDENTE : ne doit pas masquer
+        # l'erreur de celle-ci (cf. account_error).
+        self._refus_compte = None
         if not _WS_AVAILABLE:
             self.sig_status.emit(False, "Module 'websockets' manquant")
             self.sig_log.emit("[NET] pip install websockets")
@@ -2692,7 +2695,11 @@ class NetWorker(QObject):
             # Le log garde le texte BRUT : c'est lui qu'on relit pour
             # diagnostiquer. Seul le bandeau est traduit.
             self.sig_log.emit(f"[NET] Connexion echouee : {e}")
-            self.sig_status.emit(False, self._message_refus(e))
+            # Le message du serveur, s'il y en a eu un, prime sur la
+            # traduction de l'exception de fermeture qui le suit.
+            self.sig_status.emit(
+                False, getattr(self, "_refus_compte", None)
+                or self._message_refus(e))
             # Bug fix : avant, le finally en dessous emettait
             # sig_status(False, "") qui ECRASAIT le message d'erreur.
             # L'utilisateur voyait l'erreur 1ms puis "Deconnecte" sans
@@ -2733,6 +2740,14 @@ class NetWorker(QObject):
     # mieux vaut un message technique qu'un message faux, et ca laisse
     # une prise pour diagnostiquer un cas non prevu.
     _REFUS_CONNUS = {
+        # [BANS 22/09/2026] EN TETE : la recherche se fait par
+        # sous-chaine, dans l'ordre, et « banned » (verrouillage
+        # temporaire anti-force-brute) est contenu dans
+        # « account_banned ». Place apres, le ban definitif serait
+        # annonce comme un blocage temporaire.
+        "account_banned":
+            "Vous avez ete banni de ce serveur. "
+            "Contactez un administrateur.",
         "account_unknown":
             "Votre compte n'est plus reconnu par ce serveur. "
             "Cliquez sur \u00ab RELIER A NOUVEAU \u00bb pour le rattacher "
@@ -2778,8 +2793,12 @@ class NetWorker(QObject):
 
         # Multijoueur (mp_*) et scores partages (hs_*) : vers l'overlay
         # (app courante, qui expose handle_server_msg).
+        # [ANNONCES 21/09/2026] annonces_* par le meme chemin : l'app n'a
+        # ni badge ni son, elle redemande la liste a chaque ouverture --
+        # seule l'app AFFICHEE a besoin de l'etat. Pas de signal dedie.
         if isinstance(msg_type, str) and (msg_type.startswith("mp_")
-                                          or msg_type.startswith("hs_")):
+                                          or msg_type.startswith("hs_")
+                                          or msg_type.startswith("annonces_")):
             self.sig_phone_server_msg.emit(data)
             return
 
@@ -2791,6 +2810,11 @@ class NetWorker(QObject):
             msg = data.get("message", "Compte refuse")
             self.sig_log.emit(f"[COMPTE] Refus ({reason}) : {msg}")
             self.sig_status.emit(False, msg)
+            # [22/09/2026] Memorise : le serveur ferme juste apres, et
+            # cette fermeture remonte en exception -- dont la traduction
+            # generique ECRASAIT le message du serveur (motif du ban
+            # compris) dans le bandeau.
+            self._refus_compte = msg
             self._stop_requested = True
             return
 
@@ -9790,6 +9814,98 @@ class PhoneOverlayWindow(QWidget):
         if self._page_home is not None:
             self._stack.setCurrentWidget(self._page_home)
 
+        self._build_voile_reseau()
+
+    # ------------------------------------------------------------------
+    # [RESEAU 28/08/2026] Voile « Réseau non disponible »
+    # ------------------------------------------------------------------
+    def _build_voile_reseau(self):
+        """Voile noir plein ecran, pose PAR-DESSUS tout le telephone.
+
+        Hors connexion, le CircusPhone continuait de s'ouvrir normalement
+        et de montrer des ecrans peuples de donnees perimees : annuaire
+        avec des pastilles vertes, missions, groupes. Toutes les actions
+        partaient dans le vide -- l'envoi echoue en silence -- donc le
+        telephone semblait casse plutot qu'hors reseau.
+
+        Enfant DIRECT de l'ecran et non membre du layout : il doit
+        recouvrir la pile d'ecrans, pas prendre place a cote d'elle. Sa
+        geometrie est donc posee a la main, et raise_() le garde au-dessus
+        des pages ajoutees ensuite.
+
+        Il intercepte aussi les clics : un QWidget opaque ne laisse pas
+        passer les evenements souris vers ce qu'il couvre. C'est voulu --
+        cliquer sur une app injoignable n'a aucun sens.
+        """
+        self._voile_reseau = QWidget(self._screen)
+        self._voile_reseau.setObjectName("PhoneVoileReseau")
+        self._voile_reseau.setGeometry(
+            0, 0, self._screen_w, self._screen_h)
+        self._voile_reseau.setStyleSheet(
+            f"QWidget#PhoneVoileReseau {{ background:#000000; "
+            f"border-radius:{self._screen_rad}px; }}")
+        v = QVBoxLayout(self._voile_reseau)
+        v.setContentsMargins(16, 16, 16, 16)
+        v.addStretch(1)
+
+        # Taille proportionnelle a l'ecran : le telephone s'adapte a la
+        # resolution, un corps fixe serait minuscule en 4K.
+        pt = max(10, int(self._screen_h * 0.038))
+        titre = QLabel("Réseau non disponible")
+        titre.setAlignment(Qt.AlignCenter)
+        titre.setWordWrap(True)
+        titre.setStyleSheet(
+            f"color:#ffffff;font-size:{pt}px;font-weight:700;"
+            f"background:transparent;")
+        v.addWidget(titre)
+
+        sous = QLabel("Connectez-vous à un serveur pour "
+                      "utiliser le CircusPhone.")
+        sous.setAlignment(Qt.AlignCenter)
+        sous.setWordWrap(True)
+        sous.setStyleSheet(
+            f"color:#9aa0a6;font-size:{max(8, int(pt * 0.6))}px;"
+            f"background:transparent;")
+        v.addWidget(sous)
+
+        v.addStretch(1)
+        self._voile_reseau.hide()
+
+    def set_reseau_disponible(self, disponible: bool):
+        """Montre ou cache le voile. Idempotent, ne leve jamais.
+
+        Le raise_() est refait a chaque fois : des ecrans et des apps
+        sont ajoutes a la pile APRES la construction du voile, et le
+        dernier widget ajoute passe devant s'il n'est pas remis au-dessus.
+        """
+        voile = getattr(self, "_voile_reseau", None)
+        if voile is None:
+            return
+        try:
+            if disponible:
+                voile.hide()
+                return
+            voile.setGeometry(0, 0, self._screen_w, self._screen_h)
+            voile.show()
+            voile.raise_()
+            # Retour a l'accueil AVANT de laisser le voile en place.
+            #
+            # Le garde de _on_nav_key ne couvre pas les apps marquees
+            # CAPTURES_KEYBOARD -- les jeux : elles recoivent leurs
+            # touches par le focus Qt, sans passer par la repartition du
+            # D-pad. Une partie lancee avant la coupure continuerait donc
+            # de tourner et de reagir derriere un ecran noir.
+            #
+            # _go_home appelle on_hide() sur l'app courante, ce qui
+            # arrete aussi ses minuteurs et ses mesures OCR -- inutiles
+            # sans reseau.
+            try:
+                self._go_home()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # [v0.3] Home (grille d'apps) + lazy-load + cycle de vie des apps
     # ------------------------------------------------------------------
@@ -9837,6 +9953,19 @@ class PhoneOverlayWindow(QWidget):
                       file=sys.stderr)
                 if _CORE_AVAILABLE:
                     try: _core._dbg_log(f"[PHONE] app Travail KO : {_e_trav}")
+                    except Exception: pass
+
+            # [ANNONCES 21/09/2026] Import SEPARE, meme raison que
+            # Travail : une erreur dans cette app ne doit emporter
+            # qu'elle.
+            try:
+                from circusvoip_phone_annonces_app import AnnoncesApp
+            except Exception as _e_ann2:
+                AnnoncesApp = None
+                print(f"[PHONE] App Annonces indisponible ({_e_ann2}).",
+                      file=sys.stderr)
+                if _CORE_AVAILABLE:
+                    try: _core._dbg_log(f"[PHONE] app Annonces KO : {_e_ann2}")
                     except Exception: pass
 
             try:
@@ -9971,6 +10100,14 @@ class PhoneOverlayWindow(QWidget):
                 TravailApp.APP_ID, TravailApp.APP_NAME,
                 _icon("travail", TravailApp.APP_ICON),
                 (lambda C: (lambda: self._launch_app(C)))(TravailApp)))
+        # [ANNONCES 21/09/2026] Petites annonces publiques. L'icone est
+        # injectee dans la table de phone_apps par le module de l'app,
+        # importe plus haut : make_phone_icon("annonces") la trouve.
+        if AnnoncesApp is not None:
+            entries.append(HomeEntry(
+                AnnoncesApp.APP_ID, AnnoncesApp.APP_NAME,
+                _icon("annonces", "\U0001F4E2"),
+                (lambda C: (lambda: self._launch_app(C)))(AnnoncesApp)))
         # Apps v0.3 (lazy-load via la fabrique _launch_app).
         entries += build_app_entries(
             PHONE_APPS, lambda C: (lambda: self._launch_app(C))
@@ -10008,7 +10145,8 @@ class PhoneOverlayWindow(QWidget):
         # tres difficile a relier a ce tri.
         _ORDRE_HOME = (
             "appels", "contacts", "messagerie", "wallet", "blueprints",
-            "games", "photo", "travail", "urgence", "photos", "settings",
+            "games", "photo", "travail", "annonces", "urgence", "photos",
+            "settings",
         )
         _rang = {aid: n for n, aid in enumerate(_ORDRE_HOME)}
         # Les inconnues prennent le rang de Parametres moins un epsilon :
@@ -11715,7 +11853,22 @@ class PhoneOverlayWindow(QWidget):
     def _on_nav_key(self, direction: str):
         """Slot main-thread : route une touche D-pad selon l'ecran courant.
         Ecran conversation -> _nav_convo ; app -> handle_nav.
-        Les autres ecrans ne sont pas navigables au clavier (scope actuel)."""
+        Les autres ecrans ne sont pas navigables au clavier (scope actuel).
+        """
+        # [RESEAU 28/08/2026] Rien ne passe derriere le voile.
+        #
+        # Il bloque la souris par construction -- un widget opaque
+        # n'transmet pas les clics -- mais le D-pad, lui, arrive par un
+        # raccourci global et ne connait pas la pile de widgets. Sans ce
+        # garde, un joueur deconnecte naviguait dans des apps invisibles
+        # et declenchait des actions qu'il ne voyait pas echouer.
+        #
+        # TOUT est avale, y compris "esc" : le telephone doit etre inerte.
+        # Sa fermeture passe par le raccourci global du client, traite en
+        # dehors d'ici, donc le joueur n'est jamais enferme.
+        voile = getattr(self, "_voile_reseau", None)
+        if voile is not None and voile.isVisible():
+            return
         try:
             cur = self._stack.currentWidget()
             # [v0.3] Home : grille d'apps.
@@ -13267,9 +13420,13 @@ class MainWindow(QMainWindow):
         # ils ne sont plus ajoutes au layout donc invisibles.
         # POUR REACTIVER (build de dev) : decommenter les deux lignes.
         # [DEV 26/07/2026] REACTIVE pour les builds de test v0.4.
-        # A RECOMMENTER avant toute release stable destinee aux joueurs.
-        v_upd.addWidget(self.btn_check_update)
-        v_left.addWidget(gb_upd)
+        # [RELEASE 29/09/2026] RE-MASQUE : on repart vers une release
+        # stable. La verification automatique au demarrage, elle, reste
+        # active -- c'est le bouton MANUEL qui disparait, pas la mise a
+        # jour. Pour un prochain build de dev, decommenter les deux
+        # lignes ci-dessous.
+        # v_upd.addWidget(self.btn_check_update)
+        # v_left.addWidget(gb_upd)
 
         v_left.addStretch(1)
         cols.addWidget(col_left, stretch=1)
@@ -13511,13 +13668,34 @@ class MainWindow(QMainWindow):
         self._page_settings = scroll
 
     def _phone_log(self, msg: str):
-        """Stub : anciennement loggue dans txt_phone_log de la page Phone
-        Debug supprimee. On garde la methode car elle est invoquee par tous
-        les _phone_do_* (decroche, refuse, raccroche, etc.) qui restent
-        indispensables au vrai CircusPhone. Aucune action visible : si tu
-        veux retrouver ces logs, ils sont aussi dans le log debug global
-        via les exceptions et events serveur."""
-        pass
+        """Trace les transitions d'appel dans le journal de debogage.
+
+        [CORRECTIF 03/09/2026] C'etait un STUB VIDE depuis la suppression
+        de la page Phone Debug. Sa docstring affirmait que ces traces se
+        retrouvaient "dans le log debug global via les exceptions et
+        events serveur" : c'etait faux. Verifie sur les 7239 lignes du
+        journal du 03/09 -- AUCUNE trace d'appel. Toutes les fonctions
+        _phone_do_* (decroche, refuse, raccroche) ecrivaient dans le
+        vide.
+
+        Le serveur, lui, journalise bien la sequence complete
+        ([PHONE] Appel / Decroche / Raccroche). Mais lui seul : il ne
+        peut pas dire quel etat CHAQUE client s'est donne, et c'est
+        exactement ce qui manquait pour le defaut du 03/09 -- Skywat
+        entendait Kainan apres le raccroche, l'inverse pas. Un client
+        reste en "in_call" quand l'autre est repasse en "idle" : le
+        filtre 0x03 est asymetrique, le repos jette les trames telephone
+        tandis que l'appel laisse passer la proximite.
+
+        Ecrit avec le prefixe [PHONE] pour se filtrer comme le reste :
+            Select-String -Pattern '\\[PHONE\\]' <journal>
+        """
+        try:
+            if _CORE_AVAILABLE:
+                _core._dbg_log(f"[PHONE] {msg}")
+        except Exception:
+            # Une trace ne doit jamais casser un appel en cours.
+            pass
 
     def _phone_refresh_ui(self):
         """Stub : anciennement mettait a jour les widgets de la page Phone
@@ -13539,6 +13717,19 @@ class MainWindow(QMainWindow):
         # meme si le serveur fait deja le cleanup sur phone_call_ended).
         was_hp_active = bool(getattr(self, "_phone_speaker_on", False)) and \
                         self._phone_state == "in_call"
+
+        # [CORRECTIF 03/09/2026] Tracer la transition ELLE-MEME. C'est
+        # elle qui decide du routage audio : state.phone_in_call commande
+        # le flag d'emission (0x03 en appel, 0x00 en proximite) ET le
+        # filtre de reception. Deux clients qui divergent sur cet etat
+        # produisent une asymetrie que rien ne signalait -- l'un entend
+        # l'autre sans reciproque. Le journal du serveur ne peut pas la
+        # voir : il ignore l'etat que chaque client s'est donne.
+        _avant = getattr(self, "_phone_state", "?")
+        if _avant != new_state:
+            self._phone_log(
+                f"etat {_avant} -> {new_state} "
+                f"(peer={peer!r} call_id={call_id!r})")
 
         self._phone_state   = new_state
         # [RP 04/08/2026] DEUX champs, et il faut les distinguer :
@@ -14339,6 +14530,53 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._on_log(f"[GROUPES] creation KO : {e}")
 
+    def _detecter_prise_mission(self, data: dict):
+        """Prévient l'auteur quand une de SES missions vient d'être prise.
+
+        [TRAVAIL 03/09/2026] Il n'y a rien à ajouter à la trame : le
+        serveur pousse déjà `travail_etat` à l'auteur après un
+        `travail_prendre` (a_pousser), et chaque mission de `miennes`
+        porte son `executant`. L'information arrivait donc, mais rien ne
+        la remarquait : la liste se mettait à jour en silence.
+
+        Le serveur, lui, envoie une trame dédiée pour l'ABANDON
+        (`travail_abandon`) -- un retrait est plus difficile à voir
+        qu'un ajout. Résultat avant ce correctif : on était prévenu
+        quand on abandonnait votre mission, pas quand on la prenait,
+        soit l'inverse de ce qui est utile.
+
+        Détecté ICI et non dans l'app : `appliquer_etat` n'est appelée
+        que si l'app Travail est ouverte, et c'est justement fermée
+        qu'on a besoin d'être prévenu.
+
+        On compare l'ancien état au nouveau, sur l'`executant` seul :
+        vide -> non vide = quelqu'un vient de prendre. Le premier état
+        reçu ne déclenche rien -- sans point de comparaison, toutes les
+        missions déjà prises paraîtraient l'être à l'instant.
+        """
+        try:
+            ancien = getattr(self, "_travail_etat", None)
+            if not ancien:
+                return
+            avant = {}
+            for m in (ancien.get("miennes") or []):
+                avant[str(m.get("id"))] = str(m.get("executant") or "")
+            for m in ((data or {}).get("miennes") or []):
+                mid = str(m.get("id"))
+                if mid not in avant:
+                    continue            # mission nouvelle : rien a comparer
+                if avant[mid]:
+                    continue            # deja prise avant
+                if not str(m.get("executant") or ""):
+                    continue            # toujours pas prise
+                self._on_travail_notif(
+                    "prise",
+                    f"Mission prise : {m.get('titre', '')}")
+        except Exception as e:
+            if _CORE_AVAILABLE:
+                try: _core._dbg_log(f"[TRAVAIL] detection prise KO : {e!r}")
+                except Exception: pass
+
     @Slot(dict)
     def _on_travail_etat(self, data: dict):
         """Etat de l'app Travail pousse par le serveur.
@@ -14350,6 +14588,7 @@ class MainWindow(QMainWindow):
         affichee ferait perdre precisement la premiere reponse, celle qui
         remplit l'ecran.
         """
+        self._detecter_prise_mission(data)
         self._travail_etat = dict(data or {})
         ov = self._phone_overlay
         if ov is None:
@@ -14586,6 +14825,18 @@ class MainWindow(QMainWindow):
             # CircusPhone (D4 etape 4) : initialiser l'affichage des
             # raccourcis sous les boutons d'appel a partir de state.
             self._phone_refresh_overlay_shortcuts()
+            # [RESEAU 28/08/2026] Etat du voile des la creation.
+            #
+            # L'overlay est cree PARESSEUSEMENT, au premier appui sur le
+            # raccourci. Un joueur qui ouvre son telephone alors qu'il
+            # n'est pas connecte n'a donc jamais vu passer le
+            # _on_status(False) qui pose le voile -- il aurait eu un
+            # telephone d'apparence normale, dont rien ne marche.
+            try:
+                ov.set_reseau_disponible(
+                    bool(_CORE_AVAILABLE and state.connected))
+            except Exception:
+                pass
         except Exception as e:
             self._on_log(f"[PHONE] Echec creation overlay : {e}")
             self._phone_overlay = None
@@ -14850,7 +15101,12 @@ class MainWindow(QMainWindow):
         ov = self._phone_overlay
         if ov is not None and getattr(ov, "_convo_pseudo", "") == target:
             try:
-                items = _phone_merge_messages(self._phone_messages, target)
+                # [CORRECTIF 19/08/2026] La substitution du nom manquait
+                # ICI : elle n'etait branchee que sur l'ouverture. Les
+                # bulles repassaient donc en numeros des le premier
+                # rafraichissement.
+                items = self._phone_items_groupe(
+                    _phone_merge_messages(self._phone_messages, target))
                 ov.refresh_conversation(items)
             except Exception:
                 pass
@@ -15132,8 +15388,14 @@ class MainWindow(QMainWindow):
                     if _phone_mark_read(self._phone_messages, sender):
                         _phone_save_messages(self._phone_messages)
                     try:
-                        items = _phone_merge_messages(
-                            self._phone_messages, sender
+                        # [CORRECTIF 19/08/2026] Substitution manquante
+                        # ici aussi. C'est CE chemin que le joueur voyait :
+                        # noms corrects a l'ouverture, numeros des qu'un
+                        # message arrivait.
+                        items = self._phone_items_groupe(
+                            _phone_merge_messages(
+                                self._phone_messages, sender
+                            )
                         )
                         ov.refresh_conversation(items)
                     except Exception:
@@ -17152,28 +17414,12 @@ class MainWindow(QMainWindow):
         )
         v.addWidget(self.cb_noise_suppression)
 
-        # [PROXIMITE VERTICALE 28/07/2026] Test opt-in, desactive par
-        # defaut. Dans un vaisseau, l'ecart vertical entre deux joueurs
-        # est multiplie avant le calcul de distance : quelqu'un 2 m
-        # au-dessus, sur le pont superieur, passe de 100 % a 16 % de
-        # volume au lieu d'etre entendu comme s'il etait a cote.
-        # Sans effet ailleurs (stations, hangars, planetes, grottes,
-        # espace) ni a l'horizontale.
-        self.cb_vertical_prox = QCheckBox(
-            "Attenuation verticale dans les vaisseaux (test)"
-        )
-        self.cb_vertical_prox.setChecked(
-            bool(self._cfg.get("vertical_prox_enabled", False))
-        )
-        self.cb_vertical_prox.setToolTip(
-            "Attenue la voix des joueurs situes sur un autre pont du meme "
-            "vaisseau.\nSans effet dans les stations, hangars, planetes et "
-            "grottes."
-        )
-        self.cb_vertical_prox.toggled.connect(
-            self._on_vertical_prox_toggled
-        )
-        v.addWidget(self.cb_vertical_prox)
+        # [PROXIMITE VERTICALE 22/09/2026] La case a disparu : la
+        # fonction est TOUJOURS active (cf. chargement de la config).
+        # Elle etait en test opt-in depuis le 28/07 ; tous les joueurs du
+        # test du 21/09 l'avaient cochee, et un reglage que chacun peut
+        # couper rend la proximite asymetrique -- l'un entend l'autre
+        # etouffe, l'autre l'entend en clair, dans le meme vaisseau.
 
         # ----- Sliders volume (v0.2) ----------------------------------
         # 3 sliders 0..200 % (defaut 100 %) qui controlent les sons
@@ -17263,20 +17509,27 @@ class MainWindow(QMainWindow):
             "sl_phone_ring_vol",
         )
 
-        # ──────────────────────────────────────────────────────────────
-        # Diagnostic crackling : log audio RX detaille (ajout 02/06/2026)
-        # ──────────────────────────────────────────────────────────────
+        parent_layout.addWidget(box)
+        # [LOGS 29/09/2026] Encart a part, juste apres Audio : ni le
+        # journal de debogage ni le log audio detaille ne sont des
+        # reglages d'ecoute. Audio ne garde que ce qu'on regle pour
+        # s'entendre ; le diagnostic a son propre encart, qu'on n'ouvre
+        # que quand on en a besoin.
+        self._build_logs_panel(parent_layout)
+
+    def _build_logs_panel(self, parent_layout):
+        """Encart « Logs » : diagnostic et envoi du journal au serveur."""
+        box = QGroupBox("Logs")
+        box.setStyleSheet("QGroupBox { font-weight: bold; padding-top: 14px; }")
+        v = QVBoxLayout(box)
+        v.setSpacing(6)
+
+        # Diagnostic crackling : log audio RX detaille (02/06/2026).
         # Active un log CSV separe (circusvoip_debug/audio_rx/) qui trace
         # chaque trame audio recue + chaque callback sounddevice + des
         # stats agregees 30s. Volume eleve (~80-160 MB/h) donc desactive
         # par defaut. A activer ponctuellement pour diagnostiquer un
         # probleme de crackling/pop.
-        sep_audio_diag = QFrame()
-        sep_audio_diag.setFrameShape(QFrame.HLine)
-        sep_audio_diag.setFrameShadow(QFrame.Sunken)
-        sep_audio_diag.setStyleSheet("color: #444;")
-        v.addWidget(sep_audio_diag)
-
         self.cb_audio_rx_log = QCheckBox(
             "Activer le log audio detaille (diagnostic crackling)"
         )
@@ -17304,6 +17557,81 @@ class MainWindow(QMainWindow):
         self.lbl_audio_rx_log_info.setWordWrap(True)
         self._refresh_audio_rx_log_info()
         v.addWidget(self.lbl_audio_rx_log_info)
+
+        sep_logs = QFrame()
+        sep_logs.setFrameShape(QFrame.HLine)
+        sep_logs.setFrameShadow(QFrame.Sunken)
+        sep_logs.setStyleSheet("color: #444;")
+        v.addWidget(sep_logs)
+
+        # ----- [LOGS JOUEURS 24/08/2026] Remontee du journal -----------
+        #
+        # [22/09/2026] DECOCHEE par defaut. Elle etait cochee depuis le
+        # 24/08 au motif de l'alpha ; mais le journal contient des donnees
+        # personnelles (positions, pseudos croises), et leur envoi doit
+        # venir d'un choix du joueur, pas d'un reglage qu'il n'a jamais vu.
+        # Le bouton « Envoyer mon journal maintenant » reste disponible :
+        # cliquer vaut accord pour cet envoi-la.
+        #
+        # Mais l'infobulle dit EXACTEMENT ce qui part, y compris les
+        # positions en jeu. Un envoi automatique de donnees personnelles
+        # sans le dire serait un repli silencieux d'un autre genre.
+        self.cb_debug_upload = QCheckBox(
+            "Envoyer le journal de débogage à la fermeture"
+        )
+        self.cb_debug_upload.setChecked(
+            bool(self._cfg.get("debug_upload", False))
+        )
+        self.cb_debug_upload.setToolTip(
+            "Aide à corriger les bugs qui ne se voient que chez vous.\n\n"
+            "Ce qui est envoyé : le journal technique de la session, avec "
+            "vos positions en jeu,\nles zones traversées et les pseudos des "
+            "joueurs croisés.\n"
+            "Ce qui n'est JAMAIS dans ce journal : vos messages et vos "
+            "contacts.\n\n"
+            "Fichier compressé, envoyé au seul serveur auquel vous êtes "
+            "connecté."
+        )
+        self.cb_debug_upload.toggled.connect(self._on_debug_upload_toggled)
+        v.addWidget(self.cb_debug_upload)
+
+        # [LOGS JOUEURS 22/09/2026] Envoi a la DEMANDE, sans attendre la
+        # fermeture. Sert quand un bug se produit en pleine session : le
+        # joueur l'envoie tout de suite, avec les minutes qui viennent de
+        # se passer, au lieu de compter sur une fermeture propre qui n'a
+        # parfois pas lieu (client tue, PC eteint -- cas probable de Hugo
+        # le 21/09).
+        #
+        # Independant de la case : cliquer EST le consentement. Et il ne
+        # remplace pas l'envoi a la fermeture, qui partira quand meme
+        # avec le journal complet.
+        h_partage = QHBoxLayout()
+        h_partage.setSpacing(8)
+        self.btn_partager_journal = QPushButton(
+            "Envoyer mon journal maintenant")
+        self.btn_partager_journal.setStyleSheet(
+            "QPushButton {"
+            f" background: {THEME_BG_ROW};"
+            f" color: {THEME_TEXT};"
+            f" border: 1px solid {THEME_BORDER};"
+            " border-radius: 3px;"
+            " padding: 5px 10px;"
+            " }"
+            "QPushButton:hover {"
+            f" border: 1px solid {THEME_MUTED};"
+            " }")
+        self.btn_partager_journal.setToolTip(
+            "Envoie tout de suite le journal de la session en cours au "
+            "serveur.\nUtile juste apres un bug : indiquez l'heure a "
+            "l'administrateur.\n\nMeme contenu que l'envoi a la fermeture "
+            "(positions, zones, pseudos croises).")
+        self.btn_partager_journal.clicked.connect(
+            self._partager_journal_maintenant)
+        h_partage.addWidget(self.btn_partager_journal)
+        self.lbl_partage_journal = QLabel("")
+        self.lbl_partage_journal.setWordWrap(True)
+        h_partage.addWidget(self.lbl_partage_journal, stretch=1)
+        v.addLayout(h_partage)
 
         parent_layout.addWidget(box)
 
@@ -17928,23 +18256,13 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _on_vertical_prox_toggled(self, checked: bool):
-        """Active/desactive la ponderation verticale de la proximite.
-
-        Le flag est lu par la boucle de calcul de distance dans core, a
-        chaque tour : le changement prend effet immediatement, sans
-        reconnexion.
-        """
+    def _on_debug_upload_toggled(self, checked: bool):
+        """Memorise le choix. [LOGS JOUEURS 24/08/2026]"""
+        self._cfg["debug_upload"] = bool(checked)
         try:
-            if _CORE_AVAILABLE:
-                _core.state.vertical_prox_enabled = bool(checked)
+            self._save_cfg()
         except Exception as e:
-            self._on_log(f"[PROX] toggle vertical KO : {e}")
-        self._cfg["vertical_prox_enabled"] = bool(checked)
-        self._on_log(
-            "[PROX] Attenuation verticale dans les vaisseaux : "
-            + ("activee" if checked else "desactivee")
-        )
+            self._on_log(f"[CONFIG] Echec ecriture debug_upload : {e}")
 
     def _on_noise_suppression_toggled(self, checked: bool):
         """Toggle suppression de bruit (RNNoise via pyrnnoise).
@@ -18522,6 +18840,15 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText("Deconnexion...")
         self._set_status_style(False, warning=True)
         self.btn_toggle.setEnabled(False)
+        # [LOGS JOUEURS 03/09/2026] AVANT request_stop() : celle-ci
+        # planifie ws.close(), donc le socket est encore vivant ici et
+        # c'est la derniere occasion d'envoyer. Apres, le finally du
+        # thread reseau met state.connected a False et _ws_send_safe
+        # sort a sa premiere ligne.
+        try:
+            self._remonter_journal_debug()
+        except Exception:
+            pass
         self._worker.request_stop()
 
     @Slot(bool, str)
@@ -18532,6 +18859,26 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("Connecte")
             self._set_status_style(True)
             self.btn_toggle.setText("DECONNECTER")
+            # [LOGS JOUEURS 03/09/2026] Nouvelle session : le journal de
+            # celle-ci n'a pas encore ete remonte.
+            self._journal_remonte = False
+            # Renvoi de ce qui n'avait pas pu partir aux sessions
+            # precedentes. Ici plutot qu'a la fermeture : la connexion
+            # vient d'etre etablie, elle est saine, et il n'y a aucun
+            # delai a regler. Differe de 1 s pour laisser le welcome se
+            # traiter d'abord.
+            try:
+                QTimer.singleShot(
+                    1000, lambda: self._renvoyer_journaux_en_attente()
+                )
+            except Exception:
+                pass
+            # Le telephone redevient utilisable.
+            try:
+                if self._phone_overlay is not None:
+                    self._phone_overlay.set_reseau_disponible(True)
+            except Exception:
+                pass
             # Demarrer les threads OCR + WS audio + heartbeat
             self._start_core_threads_if_needed(message)
             # [D5] Si la photo locale n'est pas synchronisee avec le
@@ -18586,11 +18933,46 @@ class MainWindow(QMainWindow):
                 self._phone_on_disconnect()
             except Exception:
                 pass
+            # ...et on barre l'ecran du telephone : sans reseau, aucune
+            # de ses apps ne peut aboutir.
+            try:
+                if self._phone_overlay is not None:
+                    self._phone_overlay.set_reseau_disponible(False)
+            except Exception:
+                pass
             # Vider les cards joueurs
             for name in list(self._player_cards.keys()):
                 card = self._player_cards.pop(name)
                 self._players_layout.removeWidget(card)
                 card.deleteLater()
+
+            # [28/08/2026] ...et l'ETAT qui les alimente.
+            #
+            # Retirer les cards ne vidait que l'affichage : state.players
+            # et ses dictionnaires derives n'etaient purges QU'A la
+            # reception d'un welcome (cf. le bloc "Players" du handler).
+            # Entre une deconnexion et la connexion suivante, le client
+            # gardait donc en memoire la liste complete des joueurs du
+            # serveur qu'il venait de quitter -- positions, canaux,
+            # profils, etat de casque.
+            #
+            # Deux consequences : toute reconstruction d'ecran les
+            # faisait reapparaitre, et l'annuaire du CircusPhone, qui
+            # calcule le statut en ligne en croisant avec state.players,
+            # affichait tout le monde connecte alors que le reseau etait
+            # coupe.
+            #
+            # Memes cles que le welcome, volontairement : deux endroits
+            # qui vident le meme etat doivent vider la MEME chose, sinon
+            # l'un des deux laissera une trainee.
+            try:
+                state.players.clear()
+                state.player_channels = {}
+                state.player_profiles = {}
+                state.player_prox_short = {}
+                state.helmet_remote = {}
+            except Exception:
+                pass
             # Cards videes + plus connecte -> cacher le label "aucun".
             self._refresh_no_other_players_label()
             # Reset du statut audio : pas de connexion -> pas d'audio
@@ -18824,8 +19206,24 @@ class MainWindow(QMainWindow):
                     dist_str = f"{d/1000:.1f} km"
                 else:
                     dist_str = f"{d/1_000_000:.2f} Mkm"
-                if name in state.players and isinstance(state.players[name], dict):
-                    state.players[name]["dist"] = d
+                # [CORRECTIF 26/08/2026] NE PLUS ecrire dans "dist".
+                #
+                # `dist` est la distance qui decide du VOLUME AUDIO, et le
+                # coeur l'ecrit avec la ponderation verticale
+                # (z_weight=x10 dans un vaisseau). Le calcul ci-dessus est
+                # celui de l'AFFICHAGE : il appelle distance() sans
+                # z_weight, donc sans ponderation.
+                #
+                # Les deux boucles tournant en parallele, elles se
+                # marchaient dessus : le coeur ecrivait 47,5 m (attenue),
+                # l'affichage l'ecrasait par 7,5 m (non attenue), et la
+                # boucle audio appliquait ce qu'elle trouvait. Resultat
+                # mesure le 26/08 dans un Starlancer : volume oscillant
+                # entre 0 % et 100 % plusieurs fois par seconde, des DEUX
+                # cotes de la conversation.
+                #
+                # L'affichage n'a aucune raison d'ecrire cette valeur : il
+                # la consomme, il ne la produit pas.
             except Exception as e:
                 dist_str = "?"
                 d_meters = None
@@ -19369,7 +19767,10 @@ class MainWindow(QMainWindow):
                 # Format axes avec unite par axe (cf _format_axes).
                 pos_str = _format_axes(pos)
                 card.set_position(str(zone), pos_str, dist_str, dist_meters=d)
-                state.players[name]["dist"] = d
+                # [CORRECTIF 26/08/2026] NE PLUS ecrire dans "dist" : meme
+                # raison qu'au-dessus. Cette valeur decide du volume audio
+                # et appartient au coeur, qui seul applique la ponderation
+                # verticale.
             except Exception as e:
                 if _CORE_AVAILABLE:
                     try:
@@ -19688,9 +20089,9 @@ class MainWindow(QMainWindow):
             # [PROXIMITE VERTICALE 28/07/2026] Appliquer aussi au boot,
             # pas seulement au clic dans les Parametres : sinon le
             # reglage etait perdu a chaque relancement.
-            state.vertical_prox_enabled = bool(
-                core_cfg.get("vertical_prox_enabled", False)
-            )
+            # [22/09/2026] Toujours actif : la cle de config est ignoree
+            # (cf. retrait de la case dans les Parametres).
+            state.vertical_prox_enabled = True
             self._on_log(
                 f"[CONFIG] Chargee : radio_key={state.radio_key!r} "
                 f"profile_key={state.profile_radio_key!r} "
@@ -20166,6 +20567,424 @@ class MainWindow(QMainWindow):
                 self._user_resized = True
             self._last_pos = cur_pos
 
+    def _comptes_rendus_urgence(self, max_total=256 * 1024, max_fichiers=30):
+        """Comptes rendus de capture d'urgence de CETTE session.
+
+        Rend des octets prets a etre concatenes au journal, ou b"" s'il
+        n'y a rien -- une session sans balise ne doit ajouter aucune
+        ligne.
+
+        Bornes : seuls les fichiers ecrits DEPUIS le demarrage du client
+        sont pris, et l'ensemble est plafonne. Sans ces deux limites, un
+        dossier jamais purge finirait par renvoyer des mois d'archives a
+        chaque fermeture.
+
+        Les plus RECENTS d'abord : si le plafond coupe, il vaut mieux
+        perdre la premiere balise de la soiree que la derniere, qui est
+        celle dont on parle.
+        """
+        import os
+        try:
+            from circusvoip_phone_urgence_app import _dossier_logs
+        except Exception:
+            return b""
+        dossier = _dossier_logs()
+        if not dossier or not os.path.isdir(dossier):
+            return b""
+
+        # Debut de session : la date de creation du fichier journal
+        # lui-meme. Il est ouvert au demarrage du client, donc il date la
+        # session sans qu'on ait a maintenir un attribut de plus -- et il
+        # est deja sous la main, c'est celui qu'on est en train
+        # d'envoyer.
+        depuis = None
+        try:
+            import circusvoip_core as _core_cr
+            _f = (getattr(_core_cr, "_DEBUG_DIR", None)
+                  / getattr(_core_cr, "_log_filename", ""))
+            if _f and _f.exists():
+                depuis = os.path.getctime(str(_f))
+        except Exception:
+            depuis = None
+        fichiers = []
+        for nom in os.listdir(dossier):
+            if not (nom.startswith("urgence_") and nom.endswith(".txt")):
+                continue
+            chemin = os.path.join(dossier, nom)
+            try:
+                mtime = os.path.getmtime(chemin)
+            except OSError:
+                continue
+            if depuis is not None and mtime < depuis:
+                continue
+            fichiers.append((mtime, chemin, nom))
+        if not fichiers:
+            return b""
+        fichiers.sort(reverse=True)
+
+        morceaux, total, nb = [], 0, 0
+        for _mtime, chemin, nom in fichiers[:max_fichiers]:
+            try:
+                with open(chemin, "r", encoding="utf-8",
+                          errors="replace") as f:
+                    contenu = f.read()
+            except OSError:
+                continue
+            bloc = (f"\n\n===== COMPTE RENDU URGENCE : {nom} =====\n"
+                    f"{contenu}\n").encode("utf-8", "replace")
+            if total + len(bloc) > max_total:
+                morceaux.append(
+                    b"\n[URGENCE] comptes rendus suivants omis "
+                    b"(plafond atteint)\n")
+                break
+            morceaux.append(bloc)
+            total += len(bloc)
+            nb += 1
+        if not nb:
+            return b""
+        entete = (f"\n\n===== {nb} COMPTE(S) RENDU(S) D'URGENCE "
+                  f"DE LA SESSION =====\n").encode("utf-8")
+        return entete + b"".join(morceaux)
+
+    # ------------------------------------------------------------------
+    # [LOGS JOUEURS 03/09/2026] File d'attente sur disque
+    # ------------------------------------------------------------------
+    #
+    # Trois sorties possibles au lieu d'une seule. Chacune bouche le trou
+    # des autres :
+    #
+    #   1. deconnexion VOLONTAIRE (bouton) -> _do_disconnect remonte le
+    #      journal tant que le socket est vivant ;
+    #   2. fermeture -> closeEvent, comme avant ;
+    #   3. tout le reste -- coupure reseau, serveur injoignable, arret
+    #      brutal -- le paquet part en attente sur disque et est renvoye
+    #      au prochain join.
+    #
+    # La 3 est le filet : elle ne depend d'aucun reseau. Sans elle, une
+    # coupure comme celle du 31/08 a 21:59 perd la session entiere, et
+    # c'est justement la session qu'on voudrait lire.
+    #
+    # Le renvoi se fait apres le JOIN, pas a la fermeture : la connexion
+    # y est fraiche et etablie, il n'y a aucun delai a regler, et ca
+    # evite une reconnexion fantome qui ferait un join/leave parasite
+    # dans le salon des autres joueurs.
+
+    _ATTENTE_MAX = 5          # paquets gardes au plus
+    _ATTENTE_AGE_J = 14       # jours au-dela desquels on jette
+
+    def _dossier_attente(self):
+        import circusvoip_core as _core_lg
+        base = getattr(_core_lg, "_DEBUG_DIR", None)
+        if base is None:
+            return None
+        d = base / "en_attente"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _garder_journal_en_attente(self, nom_fichier, paquet) -> bool:
+        """Ecrit le paquet base64 sur disque. Best-effort."""
+        try:
+            d = self._dossier_attente()
+            if d is None:
+                return False
+            # Le nom du journal suffit a l'identifier : il porte deja le
+            # pseudo et l'horodatage de session.
+            (d / f"{nom_fichier}.b64").write_text(paquet, encoding="ascii")
+            self._purger_attente()
+            return True
+        except Exception as e:
+            try:
+                self._on_log(f"[LOGS] mise en attente KO : {e}")
+            except Exception:
+                pass
+            return False
+
+    def _purger_attente(self):
+        """Borne la file : pas plus de _ATTENTE_MAX, rien de trop vieux.
+
+        Sans borne, un joueur durablement hors ligne accumulerait des
+        centaines de Mo sans jamais s'en apercevoir.
+        """
+        try:
+            d = self._dossier_attente()
+            if d is None:
+                return
+            fichiers = sorted(d.glob("*.b64"),
+                              key=lambda p: p.stat().st_mtime,
+                              reverse=True)
+            limite = time.time() - self._ATTENTE_AGE_J * 86400
+            for i, f in enumerate(fichiers):
+                if i >= self._ATTENTE_MAX or f.stat().st_mtime < limite:
+                    try:
+                        f.unlink()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _renvoyer_journaux_en_attente(self):
+        """Renvoie ce qui n'avait pas pu partir. Appele apres le join.
+
+        Le serveur n'accepte qu'UN journal par connexion
+        (_JOUEUR_LOG_RECU) : on envoie donc le plus recent seulement, et
+        les autres attendront les sessions suivantes. Envoyer le plus
+        recent d'abord est le bon ordre -- c'est celui qu'on veut lire.
+        """
+        try:
+            import circusvoip_core as _core_lg
+            d = self._dossier_attente()
+            if d is None:
+                return
+            self._purger_attente()
+            fichiers = sorted(d.glob("*.b64"),
+                              key=lambda p: p.stat().st_mtime,
+                              reverse=True)
+            if not fichiers:
+                return
+            f = fichiers[0]
+            paquet = f.read_text(encoding="ascii")
+            if not paquet:
+                f.unlink()
+                return
+            nom = f.name[:-4]          # retire ".b64"
+            if _core_lg._ws_send_safe({
+                    "type": "debug_log",
+                    "fichier": nom,
+                    "donnees": paquet}):
+                f.unlink()
+                reste = len(fichiers) - 1
+                self._on_log(
+                    f"[LOGS] journal en attente envoyé : {nom}"
+                    + (f" ({reste} encore en attente)" if reste else ""))
+            else:
+                self._on_log("[LOGS] renvoi du journal en attente : "
+                             "pas de connexion, on réessaiera")
+        except Exception as e:
+            try:
+                self._on_log(f"[LOGS] renvoi en attente KO : {e}")
+            except Exception:
+                pass
+
+    # [LOGS JOUEURS 22/09/2026] Delai entre deux envois manuels. Le
+    # serveur en accepte quelques-uns par connexion (cf.
+    # _JOUEUR_LOG_MAX_PAR_CONNEXION) : un double-clic ne doit pas les
+    # consommer.
+    _PARTAGE_DELAI_S = 60
+
+    def _partager_journal_maintenant(self):
+        """Bouton « Envoyer mon journal maintenant ». Thread Qt.
+
+        N'arme PAS _journal_remonte : le journal complet repartira a la
+        fermeture, et c'est voulu -- celui-ci n'est qu'un instantane.
+        """
+        import time as _t
+        reste = (getattr(self, "_partage_dernier", 0.0)
+                 + self._PARTAGE_DELAI_S - _t.monotonic())
+        if reste > 0:
+            self.lbl_partage_journal.setText(
+                f"Patientez {int(reste) + 1} s avant un nouvel envoi.")
+            return
+        try:
+            import circusvoip_core as _core_lg
+            if not getattr(_core_lg.state, "connected", False):
+                self.lbl_partage_journal.setText(
+                    "Pas connecté au serveur : connectez-vous d'abord.")
+                return
+            prep = self._preparer_paquet_journal()
+            if prep is None:
+                self.lbl_partage_journal.setText(
+                    "Aucun journal à envoyer pour cette session.")
+                return
+            nom, taille_brute, paquet = prep
+            # Prefixe visible dans la liste de l'admin : un envoi manuel
+            # se distingue de celui de la fermeture.
+            ok = _core_lg._ws_send_safe({
+                "type": "debug_log",
+                "fichier": f"manuel_{nom}",
+                "donnees": paquet,
+            })
+        except Exception as e:
+            self._on_log(f"[LOGS] envoi manuel KO : {e}")
+            self.lbl_partage_journal.setText("Envoi impossible.")
+            return
+        if ok:
+            self._partage_dernier = _t.monotonic()
+            heure = _t.strftime("%H:%M")
+            self.lbl_partage_journal.setText(
+                f"Envoyé à {heure} ({len(paquet) // 1024} Ko).")
+            self._on_log(f"[LOGS] journal envoyé manuellement "
+                         f"({taille_brute // 1024} Ko -> "
+                         f"{len(paquet) // 1024} Ko)")
+        else:
+            self.lbl_partage_journal.setText(
+                "Échec de l'envoi : connexion perdue ?")
+
+    def _preparer_paquet_journal(self):
+        """(nom, taille_brute, paquet_base64) du journal courant, ou None.
+
+        Extrait de _remonter_journal_debug le 22/09/2026 pour servir aussi
+        l'envoi manuel : les deux doivent envoyer EXACTEMENT la meme
+        chose, troncature et comptes rendus d'urgence compris.
+        """
+        import circusvoip_core as _core_lg
+        if not getattr(_core_lg, "DEBUG_OCR", False):
+            return None
+        chemin = (getattr(_core_lg, "_DEBUG_DIR", None)
+                  / getattr(_core_lg, "_log_filename", ""))
+        if not chemin or not chemin.exists():
+            return None
+        entier = chemin.read_bytes()
+        if not entier:
+            return None
+        import gzip as _gz, base64 as _b64
+
+        def _fabriquer(garde: int):
+            """(taille_brute, paquet_base64) en gardant `garde` octets de FIN.
+
+            La FIN et non le debut : c'est la qu'est ce qui vient de se
+            passer (cf. commentaire historique dans
+            _remonter_journal_debug).
+            """
+            brut = entier
+            if len(brut) > garde:
+                coupe = len(brut) - garde
+                brut = brut[coupe:]
+                # On repart d'une ligne entiere : une ligne coupee en deux
+                # se lit comme une donnee fausse, pas comme un manque.
+                _saut = brut.find(b"\n")
+                if 0 <= _saut < 4096:
+                    brut = brut[_saut + 1:]
+                brut = (f"=== JOURNAL TRONQUE : {coupe // 1024} Ko de debut "
+                        f"retires (session longue) ===\n"
+                        ).encode("utf-8") + brut
+            try:
+                brut += self._comptes_rendus_urgence()
+            except Exception:
+                pass
+            return len(brut), _b64.b64encode(
+                _gz.compress(brut, 9)).decode("ascii")
+
+        # Plafond sur le paquet COMPRESSE, et non sur le texte brut.
+        #
+        # [LOGS JOUEURS 29/09/2026] Le seul plafond etait de 4 Mo de texte
+        # brut, en pariant sur la compression. Le pari ne tient pas : un
+        # journal domine par des lignes [POS] (coordonnees flottantes, la
+        # matiere premiere de l'app) ne compresse qu'a ~3,6x. Mesure sur
+        # 4 Mo de positions denses : 1123 Ko de gzip, 1497 Ko de base64 --
+        # au-dela de la limite de trame de websockets, qui est de 1 Mio par
+        # defaut et que le serveur ne releve pas.
+        #
+        # Le serveur ferme alors la connexion en 1009, et le client vient
+        # d'ecrire « Envoye a 10:31 » : _ws_send_safe a bien rendu True,
+        # la trame a quitte la machine. Le joueur lit un succes puis se
+        # fait deconnecter, et le journal qui expliquerait la panne est
+        # justement celui qui ne passe pas.
+        #
+        # 700 Ko de base64 = ~525 Ko de gzip : sous la trame de 1 Mio ET
+        # sous le plafond serveur _JOUEUR_LOG_MAX_OCTETS (800 Ko de gzip).
+        # Les deux bornes n'etaient pas alignees -- la trame mordait la
+        # premiere, a 768 Ko de gzip.
+        _B64_MAX = 700 * 1024
+        garde = 4 * 1024 * 1024
+        taille, paquet = _fabriquer(garde)
+        # Bornee : on divise la fenetre par deux a chaque tour. Six tours
+        # ramenent 4 Mo a 64 Ko ; si meme ca ne passe pas, mieux vaut
+        # envoyer un paquet trop gros que rien du tout -- le serveur le
+        # refusera, mais au moins la boucle ne tourne pas indefiniment sur
+        # le fil de l'interface.
+        for _ in range(6):
+            if len(paquet) <= _B64_MAX:
+                break
+            garde //= 2
+            taille, paquet = _fabriquer(garde)
+        return chemin.name, taille, paquet
+
+    def _remonter_journal_debug(self):
+        """Envoie le journal de debogage au serveur. Best-effort.
+        [LOGS JOUEURS 24/08/2026] La proximite se calcule des DEUX cotes :
+        le journal d'un joueur ne dit rien du volume entendu par l'autre.
+        Sans les deux, tout diagnostic de fuite audio reste une hypothese
+        -- constat fait le 24/08 sur l'attenuation verticale, ou l'analyse
+        a tourne en rond faute du journal d'en face.
+
+        Ne fait RIEN si :
+          - le debogage est desactive (pas de fichier a envoyer) ;
+          - le joueur a refuse la remontee (cle `debug_upload`) ;
+          - la connexion est deja tombee.
+
+        Aucune exception ne remonte : un echec d'envoi ne doit jamais
+        empecher le client de se fermer.
+        """
+        try:
+            # [03/09/2026] Deux points de sortie appellent desormais cette
+            # fonction : _do_disconnect (bouton) et closeEvent. Sans ce
+            # garde, fermer apres s'etre deconnecte remonterait deux fois
+            # -- le serveur n'en accepte qu'un par connexion, le second
+            # partirait donc en attente et ferait un doublon.
+            if getattr(self, "_journal_remonte", False):
+                return
+            if not self._cfg.get("debug_upload", False):
+                return
+            import circusvoip_core as _core_lg
+            # [22/09/2026] Preparation commune avec l'envoi manuel (cf.
+            # _preparer_paquet_journal) : troncature a 4 Mo en gardant la
+            # FIN, comptes rendus d'urgence ajoutes apres, gzip + base64.
+            # Les raisons de chaque etape sont restees ecrites la-bas.
+            prep = self._preparer_paquet_journal()
+            if prep is None:
+                return
+            nom_journal, taille_brute, paquet = prep
+            chemin = _core_lg._DEBUG_DIR / nom_journal
+            envoye = _core_lg._ws_send_safe({
+                "type": "debug_log",
+                "fichier": chemin.name,
+                "donnees": paquet,
+            })
+            # [LOGS JOUEURS 03/09/2026] Le retour de _ws_send_safe etait
+            # IGNORE : le message de succes s'ecrivait dans tous les cas,
+            # avec des tailles calculees sur le paquet local -- justes
+            # meme quand rien ne partait.
+            #
+            # _ws_send_safe sort a sa premiere ligne si state.connected
+            # est faux. Or le finally du thread reseau met connected a
+            # False AVANT d'ecrire "[NET] Deconnecte". Deux sessions
+            # perdues sans le savoir :
+            #   31/08 : deconnexion a 21:59, fermeture a 23:24 -- 1h25
+            #           sans connexion, journal jamais parti ;
+            #   03/09 : "[NET] Deconnecte" a 19:15:34, remontee a
+            #           19:15:36 -- deux secondes trop tard.
+            # Dans les deux cas le journal affichait
+            # "journal remonte (850 Ko -> 115 Ko)".
+            #
+            # Un echec qui ressemble a un succes : c'est le motif de la
+            # regle 5 ter, et il a coute deux jours de recherche du
+            # mauvais cote (script de recuperation, plafond serveur).
+            if envoye:
+                self._journal_remonte = True
+                self._on_log(f"[LOGS] journal remonté "
+                             f"({taille_brute//1024} Ko -> "
+                             f"{len(paquet)//1024} Ko)")
+            else:
+                # Filet : le paquet est ecrit A COTE du journal. Il ne
+                # depend d'aucun reseau, donc il ne peut pas rater, et
+                # il sera renvoye au prochain join (cf.
+                # _renvoyer_journaux_en_attente).
+                garde = self._garder_journal_en_attente(chemin.name, paquet)
+                if garde:
+                    self._journal_remonte = True
+                    self._on_log(
+                        f"[LOGS] pas de connexion : journal mis en attente "
+                        f"({len(paquet)//1024} Ko), envoi au prochain "
+                        f"démarrage")
+                else:
+                    self._on_log("[LOGS] pas de connexion, et mise en "
+                                 "attente impossible : journal perdu")
+        except Exception as e:
+            try:
+                self._on_log(f"[LOGS] remontée impossible : {e}")
+            except Exception:
+                pass
+
     def closeEvent(self, event):
         # 0a. Confirmation utilisateur. Si on est dans une fermeture
         # automatique (relance pour MAJ, crash recovery, ...), on bypass :
@@ -20196,6 +21015,12 @@ class MainWindow(QMainWindow):
                 # plutot que de bloquer l'app.
                 print(f"[CLOSE] Popup confirmation KO : {e}",
                       file=sys.stderr)
+
+        # [LOGS JOUEURS 24/08/2026] Remonter le journal de debogage AVANT
+        # de couper quoi que ce soit : la connexion WebSocket doit encore
+        # etre vivante. Place apres la confirmation, donc jamais envoye si
+        # le joueur annule la fermeture.
+        self._remonter_journal_debug()
 
         # 0. Signaler aux threads daemon (OCR, watchdog, audio_ws,
         # heartbeat, gamelog, helmet_scan, volume_safety) qu'on demande

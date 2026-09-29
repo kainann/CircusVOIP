@@ -447,5 +447,35 @@ def paiement_texte(paiement) -> str:
     return p if p else "À négocier"
 
 
+def echeance_texte(cree_le, maintenant=None) -> str:
+    """"Expire dans X" pour une annonce ouverte, "" si c'est encore loin.
+
+    [TRAVAIL 28/08/2026] Les missions disparaissent au bout de 30 jours
+    et RIEN ne l'indiquait. Un auteur ne pouvait pas savoir que son
+    annonce allait s'effacer, ni la republier a temps -- elle
+    disparaissait simplement un jour, ce qui ressemble a une perte de
+    donnees plutot qu'a une regle.
+
+    Muet tant qu'il reste plus d'une semaine : une annonce postee hier
+    n'a pas besoin d'un compte a rebours, et l'afficher partout ferait
+    du bruit sur l'ecran le plus charge de l'app. On ne parle que quand
+    l'echeance devient une information utile.
+
+    Rend "" pour une mission expiree : ce n'est plus une echeance, et la
+    purge s'en occupe.
+    """
+    ts = float(maintenant if maintenant is not None else time.time())
+    reste = EXPIRATION_S - (ts - float(cree_le or 0.0))
+    if reste <= 0 or reste > 7 * 24 * 3600:
+        return ""
+    jours = int(reste // (24 * 3600))
+    if jours >= 2:
+        return f"Expire dans {jours} jours"
+    if jours == 1:
+        return "Expire demain"
+    heures = max(1, int(reste // 3600))
+    return f"Expire dans {heures} h"
+
+
 def libelle_metier(metier) -> str:
     return LIBELLES.get(str(metier or "").lower(), str(metier or ""))

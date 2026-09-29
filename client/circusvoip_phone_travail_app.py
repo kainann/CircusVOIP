@@ -44,7 +44,7 @@ la plupart du temps.
 from __future__ import annotations
 
 from PySide6.QtCore import (
-    QEasingCurve, QPropertyAnimation, QRect, Qt,
+    QEasingCurve, QEvent, QPropertyAnimation, QRect, Qt,
 )
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea,
@@ -314,7 +314,8 @@ class _Bandeau(QFrame):
 class _Carte(QFrame):
     """Une annonce dans une liste."""
 
-    def __init__(self, mission, actions, parent=None):
+    def __init__(self, mission, actions, parent=None, bandeau=None,
+                 nom_auteur=None, bandeau_couleur=None):
         super().__init__(parent)
         # Nomme pour que le halo ne vise QUE ce cadre : sans selecteur,
         # la bordure de selection descendrait sur tous les enfants.
@@ -360,12 +361,32 @@ class _Carte(QFrame):
         pay.setStyleSheet(f"color:{_VERT};font-size:9pt;font-weight:600;")
         bas.addWidget(pay)
         bas.addStretch(1)
-        meta = QLabel(f"{mission.get('auteur', '')}  ·  "
+        meta = QLabel(f"{nom_auteur or mission.get('auteur', '')}  ·  "
                       f"{T.age_texte(mission.get('cree_le'))}")
         meta.setStyleSheet(f"color:{_MUTED};font-size:8pt;")
         bas.addWidget(meta)
         v.addLayout(bas)
 
+        # [28/08/2026] Bandeau d'etat A L'INTERIEUR de la carte.
+        #
+        # Il etait auparavant ajoute au-dessus d'elle par l'appelant,
+        # donc visuellement detache : avec deux missions publiees, plus
+        # moyen de dire laquelle etait prise.
+        if bandeau:
+            b = QLabel(bandeau)
+            b.setWordWrap(True)
+            coul = bandeau_couleur or _VERT
+            b.setStyleSheet(f"color:{coul};font-size:8pt;font-weight:600;")
+            v.addWidget(b)
+
+        # [CORRECTIF 03/09/2026] Les boutons sont desormais exposes.
+        # Seule la CARTE etait enregistree dans _nav, avec une action
+        # unique : ses boutons internes n'existaient que pour la souris.
+        # Tant qu'il n'y en avait qu'un ("Retirer"), l'action de la carte
+        # suffisait. Avec la confirmation de retrait il y en a deux, et
+        # "Confirmer le retrait" etait INATTEIGNABLE au D-pad -- le halo
+        # restait sur la carte.
+        self.boutons = []
         if actions:
             barre = QHBoxLayout()
             barre.setSpacing(6)
@@ -379,6 +400,7 @@ class _Carte(QFrame):
                     f"background:transparent;border-radius:8px;"
                     f"padding:4px 12px;font-size:9pt;}}")
                 b.clicked.connect(lambda _=False, f=fonction: f())
+                self.boutons.append((b, fonction))
                 barre.addWidget(b)
             v.addLayout(barre)
 
@@ -450,6 +472,12 @@ class TravailApp(PhoneApp):
         self._deploye = False    # le bandeau couvre l'onglet actif
         self._nav = []           # [(widget, style_base, action)]
         self._dans_champ_ = False
+        # [CONFIRMATION 03/09/2026] Id de la mission dont le retrait
+        # attend confirmation, "" sinon. Retirer etait immediat et
+        # irreversible : un clic de trop effacait une annonce sans aucun
+        # moyen de la recuperer. Meme motif que la sortie de groupe dans
+        # la Messagerie.
+        self._confirm_retrait = ""
 
         v = QVBoxLayout(self)
         v.setContentsMargins(8, 6, 8, 8)
@@ -513,6 +541,60 @@ class TravailApp(PhoneApp):
             if val:
                 return str(val)
         return ""
+
+    def _nom_ou_numero(self, numero):
+        """Nom du contact si on l'a enregistre, numero sinon.
+
+        [TRAVAIL 28/08/2026] L'app affichait partout des numeros a six
+        chiffres -- « Prise par 425124 », « Contact : 425124 ». Le
+        repertoire local sait deja faire la substitution : sa methode
+        afficher() se decrit comme le point d'entree UNIQUE du couple
+        nom/numero, par lequel tout ce qui montre un correspondant est
+        cense passer. Cette app etait la seule a ne pas y passer.
+
+        Le numero reste affiche quand le contact est inconnu, et c'est
+        voulu : le CircusPhone est un telephone, ce numero est ce qu'on
+        compose pour appeler. On ne reconnait quelqu'un que si on l'a
+        note -- l'annuaire du serveur reste hors de portee des joueurs.
+        """
+        num = str(numero or "")
+        rep = getattr(self.services, "repertoire", None)
+        if rep is None or not num:
+            return num
+        try:
+            return rep.afficher(num)
+        except Exception:
+            return num
+
+    def _appeler(self, numero):
+        """Lance un appel vers ce numero, si le telephone le permet."""
+        num = str(numero or "")
+        fn = getattr(self.services, "appeler", None)
+        if callable(fn) and num:
+            try:
+                fn(num)
+            except Exception:
+                pass
+
+    def _peut_appeler(self):
+        return callable(getattr(self.services, "appeler", None))
+
+    def _ajouter_contact(self, numero):
+        """Bascule vers Contacts, numero pre-rempli."""
+        num = str(numero or "")
+        fn = getattr(self.services, "ouvrir_ajout_contact", None)
+        if callable(fn) and num:
+            try:
+                fn(num)
+            except Exception:
+                pass
+
+    def _connu(self, numero):
+        rep = getattr(self.services, "repertoire", None)
+        try:
+            return bool(rep and rep.contient(str(numero or "")))
+        except Exception:
+            return False
 
     # -- navigation --
 
@@ -647,6 +729,58 @@ class TravailApp(PhoneApp):
         except Exception:
             pass
 
+    # -- suivi du focus reel ---------------------------------------------
+    #
+    # [CORRECTIF 01/09/2026] `_dans_champ_` n'etait arme que par le chemin
+    # D-pad : handle_nav("enter") -> _entrer_dans_champ(). Un clic souris
+    # donne le focus a Qt sans passer par la, et le drapeau restait faux.
+    #
+    # Consequence, signalee sur le formulaire de creation de mission :
+    # le joueur clique dans le champ Titre, tape, puis corrige au retour
+    # arriere. Comme _is_text_field() repond faux cote overlay, la touche
+    # est SUPPRIMEE au niveau OS par le filtre win32 -- elle n'atteint
+    # jamais le QLineEdit -- et repart en "esc" vers handle_back(), qui
+    # remet `_creation` a faux. Le formulaire se referme, et comme
+    # _peindre_formulaire() reconstruit `_ed_titre` a chaque rafraichis-
+    # sement, tout ce qui avait ete tape est perdu : il faut rouvrir un
+    # formulaire vierge.
+    #
+    # `_cible` est reajustee sur le champ qui prend le focus, sinon le
+    # halo de selection reste sur un autre widget et on ne voit plus ou
+    # l'on ecrit -- et `_widget_champ()`, qui lit `_nav[_cible][3]`,
+    # interrogerait le mauvais champ pour decider si Retour arriere
+    # efface ou ressort.
+
+    def _suivre_focus(self, widget):
+        """Fait suivre `_dans_champ_` au focus REEL du widget."""
+        try:
+            widget.installEventFilter(self)
+        except Exception:
+            pass
+
+    def eventFilter(self, obj, ev):
+        try:
+            t = ev.type()
+            if t in (QEvent.FocusIn, QEvent.FocusOut):
+                # Les champs sont reconstruits a chaque _rafraichir() : on
+                # cherche l'objet dans _nav plutot que de garder une liste
+                # qui pointerait sur des widgets detruits.
+                index = -1
+                for i, entree in enumerate(self._nav):
+                    if len(entree) > 3 and entree[3] is obj:
+                        index = i
+                        break
+                if index >= 0:
+                    if t == QEvent.FocusIn:
+                        self._dans_champ_ = True
+                        self._cible = index
+                    else:
+                        self._dans_champ_ = False
+                    self._peindre_cible()
+        except Exception:
+            pass
+        return super().eventFilter(obj, ev)
+
     def handle_nav(self, direction):
         if self._dans_champ_:
             # Dans un champ, seules deux touches nous concernent ; le
@@ -777,8 +911,55 @@ class TravailApp(PhoneApp):
             self._cible = j
             self._peindre_cible()
 
+    def _demander_retrait(self, m):
+        """Arme la confirmation. N'envoie rien."""
+        self._confirm_retrait = str(m.get("id") or "")
+        self._rafraichir()
+
+    def _annuler_retrait(self):
+        """Referme la confirmation sans rien envoyer."""
+        self._confirm_retrait = ""
+        self._rafraichir()
+
+    def _confirmer_retrait(self, m):
+        """Envoie la demande. Rien n'est retire localement.
+
+        La mission disparait quand le SERVEUR a confirme et renvoye
+        l'etat : la retirer tout de suite la ferait disparaitre puis
+        reapparaitre si l'envoi echouait. Meme regle que la sortie de
+        groupe.
+        """
+        mid = m.get("id")
+        self._confirm_retrait = ""
+        self._demander("travail_retirer", id=mid)
+
     def handle_back(self):
-        """Retour : ferme d'abord le formulaire, puis quitte l'app."""
+        """Retour : sort du champ, puis ferme le formulaire, puis l'app.
+
+        [CORRECTIF 03/09/2026] Le test `_dans_champ_` MANQUAIT, et c'est
+        ici qu'il compte : l'overlay route "esc" vers handle_back(), pas
+        vers handle_nav(). La branche `esc` de handle_nav ci-dessus n'est
+        donc jamais atteinte -- elle attend une touche qui ne vient pas.
+
+        Consequence signalee au test du 77 : dans le formulaire de
+        creation, Retour arriere sur un champ VIDE annulait toute la
+        saisie au lieu de deselectionner le champ. Le hook ne rend la
+        main au QLineEdit que si le champ est NON vide ; vide, il envoie
+        "esc", et handle_back fermait le formulaire d'un coup.
+
+        Les apps Urgence et Messagerie commencent deja leur handle_back
+        par ce test. Voir CIRCUSVOIP_PROJET.md 5 ter.
+        """
+        if self._dans_champ_:
+            self._sortir_du_champ()
+            self._peindre_cible()
+            return True
+        if self._confirm_retrait:
+            # Retour = renoncer. Sans ce test, on quittait l'ecran en
+            # laissant la confirmation armee, et elle reapparaissait au
+            # retour sans qu'on comprenne pourquoi.
+            self._annuler_retrait()
+            return True
         if self._deploye:
             self._deploye = False
             self._cible = -2
@@ -791,7 +972,54 @@ class TravailApp(PhoneApp):
             return True
         return False
 
+    def on_hide(self):
+        """Replie le panneau deployé avant de rendre la main.
+
+        [28/08/2026] Le panneau se positionne en geometrie ABSOLUE,
+        calculee a partir du bandeau (_geo_panneau). Tant que l'app etait
+        la seule a pouvoir le fermer -- en recliquant le bandeau -- ca ne
+        posait pas de probleme.
+
+        Le bouton « Appeler » a change ca : il donne la main a
+        l'application Appels, panneau ouvert. Au retour, la geometrie est
+        recalculee alors que le bandeau n'a pas encore repris sa taille,
+        et le panneau atterrit par-dessus la barre d'onglets. Observe le
+        29/08 apres un appel vers un auteur deconnecte.
+
+        Replier ici plutot que corriger la geometrie au retour : un
+        panneau ouvert sur un ecran qu'on quitte n'a de toute facon plus
+        de raison d'etre affiche.
+        """
+        self._deploye = False
+        self._cible = -2
+        try:
+            self._anim.stop()
+            self._debrancher_fin()
+            self._panneau.hide()
+        except Exception:
+            pass
+
     def on_show(self):
+        # [28/08/2026] Repli du panneau A L'OUVERTURE aussi, et pas
+        # seulement dans on_hide.
+        #
+        # Le passage a l'ecran d'appel se fait par un simple
+        # setCurrentWidget sur la pile du telephone
+        # (show_screen_outgoing) : on_hide() n'est PAS appele sur l'app
+        # qu'on quitte. Un panneau laisse ouvert avant un appel revenait
+        # donc se poser en travers de la barre d'onglets.
+        #
+        # Ce repli-ci ne depend d'aucun appelant : quel que soit le
+        # chemin de sortie, l'app rouvre a plat.
+        self._deploye = False
+        self._cible = -2
+        try:
+            self._anim.stop()
+            self._debrancher_fin()
+            self._panneau.hide()
+        except Exception:
+            pass
+
         # Les missions et l'age affiche changent hors de l'app : on
         # reconstruit a chaque ouverture plutot que de garder un ecran
         # fige sur l'etat d'il y a une heure.
@@ -799,6 +1027,10 @@ class TravailApp(PhoneApp):
         # plutot que de reafficher celui d'il y a une heure. Les missions
         # des autres joueurs ont bouge entre-temps.
         self._creation = False
+        # [03/09/2026] Une confirmation de retrait armee ne survit pas a
+        # la fermeture de l'app : la retrouver au retour, sans se
+        # souvenir de l'avoir demandee, invite a valider par reflexe.
+        self._confirm_retrait = ""
         self._rafraichir()
         _envoyer({"type": "travail_liste"})
 
@@ -1067,13 +1299,53 @@ class TravailApp(PhoneApp):
             d.setStyleSheet(f"color:{_TXT};font-size:9pt;")
             v.addWidget(d)
 
-        # Le numero de l'auteur est l'information la plus utile de cet
+        # Le contact de l'auteur est l'information la plus utile de cet
         # ecran : c'est lui qu'on appelle pour dire qu'on arrive.
-        contact = QLabel(f"Contact : {m.get('auteur', '')}"
+        #
+        # [28/08/2026] Nom si on l'a en contact, numero sinon -- et un
+        # bouton pour appeler directement. Avant, il fallait retenir six
+        # chiffres, quitter l'app, ouvrir Appels et les composer, alors
+        # que le telephone sait le faire d'un clic.
+        auteur = m.get("auteur", "")
+        contact = QLabel(f"Contact : {self._nom_ou_numero(auteur)}"
                          f"   ·   Prise {T.age_texte(m.get('pris_le'))}")
         contact.setWordWrap(True)
         contact.setStyleSheet(f"color:{_MUTED};font-size:9pt;")
         v.addWidget(contact)
+
+        if auteur and self._peut_appeler():
+            ligne = QHBoxLayout()
+            ligne.setSpacing(6)
+            b_app = QPushButton("Appeler")
+            b_app.setCursor(Qt.PointingHandCursor)
+            b_app.setMinimumHeight(30)
+            b_app.setStyleSheet(
+                f"QPushButton{{border:1px solid {_ACCENT};color:{_ACCENT};"
+                f"background:transparent;border-radius:8px;"
+                f"padding:4px 12px;font-size:9pt;font-weight:600;}}")
+            act_app = (lambda n=auteur: self._appeler(n))
+            b_app.clicked.connect(lambda _=False, f=act_app: f())
+            ligne.addWidget(b_app)
+            # Enregistre AVANT le bouton suivant : _nav_add construit
+            # l'ordre de parcours au clavier, et il doit suivre l'ordre
+            # a l'ecran, pas l'ordre du code.
+            self._nav_add(b_app, act_app)
+            # Propose seulement si le numero est INCONNU : sur un contact
+            # deja enregistre, ce bouton n'aurait rien a faire.
+            if not self._connu(auteur):
+                b_add = QPushButton("Ajouter aux contacts")
+                b_add.setCursor(Qt.PointingHandCursor)
+                b_add.setMinimumHeight(30)
+                b_add.setStyleSheet(
+                    f"QPushButton{{border:1px solid {_SEP};color:{_MUTED};"
+                    f"background:transparent;border-radius:8px;"
+                    f"padding:4px 12px;font-size:9pt;}}")
+                act_add = (lambda n=auteur: self._ajouter_contact(n))
+                b_add.clicked.connect(lambda _=False, f=act_add: f())
+                ligne.addWidget(b_add)
+                self._nav_add(b_add, act_add)
+            ligne.addStretch(1)
+            v.addLayout(ligne)
 
         # [TRAVAIL 11/08/2026] Un seul bouton : ABANDONNER.
         #
@@ -1128,7 +1400,8 @@ class TravailApp(PhoneApp):
                 action_nav = (lambda mm=m: self._demander(
                     "travail_prendre", id=mm.get("id")))
                 actions.append(("Prendre", action_nav, False))
-            carte = _Carte(m, actions)
+            carte = _Carte(m, actions,
+                           nom_auteur=self._nom_ou_numero(m.get("auteur")))
             v.addWidget(carte)
             # La CARTE entiere est la cible, pas son bouton : c'est elle
             # qu'on lit, et la surligner montre de quelle annonce on
@@ -1158,23 +1431,71 @@ class TravailApp(PhoneApp):
         for m in liste:
             actions = []
             action_nav = None
+            bandeau = None
+            coul_bandeau = None
             if m.get("etat") == T.ETAT_OUVERTE:
-                action_nav = (lambda mm=m: self._demander(
-                    "travail_retirer", id=mm.get("id")))
-                actions.append(("Retirer", action_nav, True))
+                if str(m.get("id")) == self._confirm_retrait:
+                    # La carte devient sa propre confirmation : pas de
+                    # page separee, l'app redessine tout a chaque
+                    # _rafraichir(). L'annonce reste lisible pendant
+                    # qu'on decide -- on voit CE qu'on supprime.
+                    #
+                    # "Annuler" en premier et en action de navigation :
+                    # sur une action irreversible, une Entree tapee trop
+                    # vite ne doit pas la declencher. Meme regle que la
+                    # sortie de groupe.
+                    action_nav = self._annuler_retrait
+                    actions.append(("Annuler", self._annuler_retrait, False))
+                    actions.append(
+                        ("Confirmer le retrait",
+                         (lambda mm=m: self._confirmer_retrait(mm)), True))
+                    bandeau = "Retirer cette mission ?"
+                    coul_bandeau = _ROUGE
+                else:
+                    action_nav = (lambda mm=m: self._demander_retrait(mm))
+                    actions.append(("Retirer", action_nav, True))
+                    # Echeance : seul l'auteur peut republier, donc lui
+                    # seul a besoin de la voir. Muette tant qu'il reste
+                    # plus d'une semaine.
+                    bandeau = T.echeance_texte(m.get("cree_le")) or None
+                    coul_bandeau = _ROUGE
             else:
                 # Prise : on ne peut plus retirer, seulement terminer.
-                # Le numero de l'executant est affiche pour pouvoir
-                # l'appeler -- c'est tout l'interet de l'annonce.
-                pris = QLabel(f"Prise par {m.get('executant', '')}")
-                pris.setStyleSheet(f"color:{_VERT};font-size:8pt;")
-                v.addWidget(pris)
+                #
+                # [28/08/2026] Ce libelle etait ajoute AVANT la carte,
+                # donc il flottait au-dessus d'elle : avec deux missions
+                # publiees, on ne savait plus laquelle etait prise. Il est
+                # desormais passe a la carte, qui le pose a l'interieur.
+                #
+                # Nom du contact plutot que six chiffres bruts, avec le
+                # numero conserve entre parentheses quand on ne connait
+                # pas la personne -- c'est lui qu'on compose pour appeler.
+                ex = m.get("executant", "")
+                bandeau = f"Prise par {self._nom_ou_numero(ex)}"
                 action_nav = (lambda mm=m: self._demander(
                     "travail_clore", id=mm.get("id")))
                 actions.append(("Terminer", action_nav, False))
-            carte = _Carte(m, actions)
+            carte = _Carte(m, actions, bandeau=bandeau,
+                           bandeau_couleur=coul_bandeau)
             v.addWidget(carte)
-            self._nav_add(carte, action_nav)
+            if str(m.get("id")) == self._confirm_retrait:
+                # [CORRECTIF 03/09/2026] En confirmation, ce sont les
+                # BOUTONS qui sont les cibles, pas la carte : deux
+                # actions opposees ne peuvent pas se partager une seule
+                # entree de navigation. On enregistre Annuler puis
+                # Confirmer, dans cet ordre -- le halo se pose donc sur
+                # Annuler, et atteindre Confirmer demande un geste
+                # delibere.
+                # Les deux boutons sont COTE A COTE : sans `grille`,
+                # gauche/droite ne font rien (cf. handle_nav) et le
+                # D-pad reste bloque sur Annuler. Meme mecanisme que la
+                # grille des metiers, sur une seule rangee de deux
+                # colonnes.
+                for b, fonction in getattr(carte, "boutons", []):
+                    self._nav_add(b, fonction,
+                                  grille=f"confirm:{m.get('id')}")
+            else:
+                self._nav_add(carte, action_nav)
 
     def _ouvrir_formulaire(self):
         self._creation = True
@@ -1216,6 +1537,7 @@ class TravailApp(PhoneApp):
         self._ed_titre.setStyleSheet(_STYLE_CHAMP)
         v.addWidget(self._ed_titre)
         self._nav_add(self._ed_titre, champ=self._ed_titre)
+        self._suivre_focus(self._ed_titre)
 
         self._ed_paiement = QLineEdit()
         # Texte libre : "part du butin", "à discuter", "500k + carburant".
@@ -1228,6 +1550,7 @@ class TravailApp(PhoneApp):
         self._ed_paiement.setStyleSheet(_STYLE_CHAMP)
         v.addWidget(self._ed_paiement)
         self._nav_add(self._ed_paiement, champ=self._ed_paiement)
+        self._suivre_focus(self._ed_paiement)
 
         self._ed_desc = QTextEdit()
         self._ed_desc.setPlaceholderText("Description (facultative)")
@@ -1236,6 +1559,7 @@ class TravailApp(PhoneApp):
         self._ed_desc.setStyleSheet(_STYLE_CHAMP)
         v.addWidget(self._ed_desc)
         self._nav_add(self._ed_desc, champ=self._ed_desc)
+        self._suivre_focus(self._ed_desc)
 
         h = QHBoxLayout()
         h.setSpacing(6)

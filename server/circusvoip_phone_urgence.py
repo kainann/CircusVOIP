@@ -802,10 +802,27 @@ def position_depuis_hierarchie(hier, maintenant=None, lecture_simple=False):
     if not hier:
         return None
     sysc = hier.get("system") or {}
-    if sysc.get("x") is None:
-        # Sans coordonnees systeme, pas de repli possible entre deux
-        # containers differents. On garde quand meme la chaine : savoir
-        # OU aller vaut mieux que rien.
+    # [SYSTEME 03/09/2026] Le HUD nomme le niveau systeme avec son
+    # identifiant d'instance : "SolarSystem_783323188128". L'OCR le lit
+    # (l'underscore devient une espace, _PAT_FIRST_CONTAINER accepte
+    # les deux), le parseur le range dans container_id... et cette
+    # fonction le jetait en ne recopiant que x/y/z. Chaque systeme
+    # stellaire porte un identifiant different : le comparer suffit a
+    # savoir si deux joueurs sont dans le meme systeme, sans distance.
+    #
+    # Le bloc n'est plus jete quand seules les COORDONNEES manquent.
+    # C'est le cas de Skywat : le mot "SolarSystem" est lu, seuls les
+    # nombres echouent. L'identifiant reste alors utilisable, et c'est
+    # precisement la ou il sert le plus.
+    sys_cid = sysc.get("container_id")
+    if sys_cid is not None and str(sys_cid).startswith("name:"):
+        # Pas de nombre lu : "name:solarsystem" ne designe aucun
+        # systeme en particulier.
+        sys_cid = None
+    coords_ok = sysc.get("x") is not None
+    if not coords_ok and not sys_cid:
+        # Ni coordonnees ni identifiant : rien a transporter. On garde
+        # quand meme la chaine : savoir OU aller vaut mieux que rien.
         sysc = None
     chaine = []
     for d in (hier.get("chain") or []):
@@ -814,10 +831,17 @@ def position_depuis_hierarchie(hier, maintenant=None, lecture_simple=False):
             "cid":  d.get("container_id"),
             "x": d.get("x"), "y": d.get("y"), "z": d.get("z"),
         })
+    systeme = None
+    if sysc:
+        systeme = {
+            "x": float(sysc["x"]) if coords_ok else None,
+            "y": float(sysc["y"]) if coords_ok else None,
+            "z": float(sysc["z"]) if coords_ok else None,
+            "cid": (str(sys_cid) if sys_cid else None),
+        }
     return {
         "chain": chaine,
-        "system": ({"x": float(sysc["x"]), "y": float(sysc["y"]),
-                    "z": float(sysc["z"])} if sysc else None),
+        "system": systeme,
         "capture_le": float(maintenant if maintenant is not None
                             else time.time()),
         # [13/08/2026] Vrai quand la double lecture a echoue et qu'on a
@@ -1001,6 +1025,34 @@ def phrase_technique(position) -> str:
     return " › ".join(reversed(bruts))
 
 
+def _chiffres_divergents(ka: str, kb: str) -> bool:
+    """Deux cles `name:` different-elles par un CHIFFRE contre un CHIFFRE ?
+
+    [SYSTEME 03/09/2026] La tolerance de deux caracteres existe pour
+    absorber les confusions OCR : `l` lu `1`, `o` lu `0`, une lettre
+    manquante. Elle est juste pour ca. Mais un chiffre qui differe d'un
+    autre chiffre n'est pas une faute de lecture : c'est le NOM.
+
+      pyro4 / pyro5                                -> deux planetes
+      rock01_occu_001_size03 / rock01_occu_002_... -> deux grottes
+      rs_int_p3l1 / rs_int_p2l4                    -> deux stations
+
+    Sans ce garde, l'ecran affichait "Sur place" avec une distance
+    marquee fiable entre Pyro IV et Pyro V.
+
+    Regle : meme longueur, et a une position au moins les deux
+    caracteres sont des chiffres et different. Une lettre contre un
+    chiffre (`l`/`1`, `o`/`0`) reste toleree ; une longueur differente
+    (lettre manquante) reste a la charge de la tolerance generale.
+    """
+    if len(ka) != len(kb):
+        return False
+    for x, y in zip(ka, kb):
+        if x != y and x.isdigit() and y.isdigit():
+            return True
+    return False
+
+
 def _memes_containers(a, b) -> bool:
     """Deux niveaux designent-ils le meme container ?
 
@@ -1014,6 +1066,11 @@ def _memes_containers(a, b) -> bool:
     d'ecart : c'est ce qui evite qu'un `l` lu `1` separe deux joueurs
     reellement au meme endroit. Le module OCR est absent du serveur, d'ou
     le repli sur une egalite stricte -- plus severe, jamais faux.
+
+    [SYSTEME 03/09/2026] Exception : deux cles `name:` qui different par
+    un chiffre designent deux lieux. Voir _chiffres_divergents. Les cids
+    numeriques (identifiants d'instance) gardent la tolerance : la, un
+    chiffre pour un autre EST une faute de lecture.
     """
     ca, cb = a.get("cid"), b.get("cid")
     if not ca or not cb:
@@ -1024,6 +1081,10 @@ def _memes_containers(a, b) -> bool:
         return False
     if ca == cb:
         return True
+    ka, kb = _cle_container(a), _cle_container(b)
+    if (str(ca).startswith("name:") and str(cb).startswith("name:")
+            and _chiffres_divergents(ka, kb)):
+        return False
     try:
         from circusvoip_sc_ocr import are_containers_similar
     except Exception:
@@ -1071,6 +1132,29 @@ def _chaine_orbitale(position) -> bool:
     return any(_est_orbital(d) for d in ((position or {}).get("chain") or []))
 
 
+def meme_systeme(position_a, position_b):
+    """Les deux positions sont-elles dans le meme systeme stellaire ?
+
+    [SYSTEME 03/09/2026] Compare les identifiants du niveau SolarSystem
+    ("SolarSystem_783323188128" dans le HUD). Chaque systeme -- Stanton,
+    Pyro, Nyx -- porte le sien.
+
+    Rend True, False, ou None quand un des deux cotes n'a pas
+    d'identifiant lisible : dans ce cas on ne sait pas, et on le dit.
+
+    L'identifiant est celui d'une instance : il change avec la shard.
+    Les joueurs partagent la meme shard, donc une difference signifie
+    bien un autre systeme. Si cette hypothese cessait d'etre vraie, le
+    symptome serait "Autre systeme" entre deux joueurs cote a cote.
+    """
+    sa = (position_a or {}).get("system") or {}
+    sb = (position_b or {}).get("system") or {}
+    ca, cb = sa.get("cid"), sb.get("cid")
+    if not ca or not cb:
+        return None
+    return str(ca) == str(cb)
+
+
 def distance_detail(position_a, position_b) -> dict:
     """Distance entre deux positions, et DANS QUEL REPERE.
 
@@ -1085,12 +1169,23 @@ def distance_detail(position_a, position_b) -> dict:
     ~600 m/s. `fiable` vaut alors False, et l'ecran doit le dire au lieu
     d'afficher un nombre qui inspire une confiance qu'il ne merite pas.
 
-    Retour : {"distance", "repere", "fiable"}. distance None = aucun
-    calcul possible.
+    Retour : {"distance", "repere", "fiable", "autre_systeme"}. distance
+    None = aucun calcul possible. autre_systeme True = les identifiants
+    SolarSystem different : aucune comparaison n'a de sens, et l'ecran
+    doit le dire plutot que laisser chercher.
     """
-    vide = {"distance": None, "repere": None, "fiable": False}
+    vide = {"distance": None, "repere": None, "fiable": False,
+            "autre_systeme": False}
     if not position_a or not position_b:
         return vide
+
+    # [SYSTEME 03/09/2026] Avant toute chose. Deux joueurs dans deux
+    # systemes n'ont ni container commun ni repere commun : les
+    # coordonnees SolarSystem sont relatives a CHAQUE systeme, et les
+    # comparer entre systemes peut donner un petit nombre parfaitement
+    # faux. On coupe ici, et on le fait savoir.
+    if meme_systeme(position_a, position_b) is False:
+        return dict(vide, autre_systeme=True)
 
     ca = (position_a or {}).get("chain") or []
     cb = (position_b or {}).get("chain") or []
@@ -1103,7 +1198,7 @@ def distance_detail(position_a, position_b) -> dict:
                 if d is not None:
                     return {"distance": d,
                             "repere": str(na.get("name") or "?"),
-                            "fiable": True}
+                            "fiable": True, "autre_systeme": False}
 
     # [13/08/2026] Repli SolarSystem : SEULEMENT si aucune des deux
     # chaines ne contient un niveau orbital.
@@ -1134,6 +1229,10 @@ def distance_detail(position_a, position_b) -> dict:
     sb = (position_b or {}).get("system")
     if not sa or not sb:
         return vide
+    # [SYSTEME 03/09/2026] Le bloc peut porter un identifiant sans
+    # coordonnees (ligne lue, nombres illisibles). Pas de repli alors.
+    if sa.get("x") is None or sb.get("x") is None:
+        return vide
     try:
         dx = float(sa["x"]) - float(sb["x"])
         dy = float(sa["y"]) - float(sb["y"])
@@ -1141,7 +1240,7 @@ def distance_detail(position_a, position_b) -> dict:
     except Exception:
         return vide
     return {"distance": (dx * dx + dy * dy + dz * dz) ** 0.5,
-            "repere": "SolarSystem", "fiable": False}
+            "repere": "SolarSystem", "fiable": False, "autre_systeme": False}
 
 
 def distance_m(position_a, position_b):

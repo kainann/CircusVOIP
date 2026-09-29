@@ -75,20 +75,45 @@ class UrgenceStore:
             self._en_service[numero] = role
             return True
 
-    def quitter_service(self, numero) -> bool:
+    def quitter_service(self, numero) -> list:
         """Retire du service, et relache les signaux pris.
 
         Les deux vont ensemble : un secouriste hors service n'est plus en
         route, et laisser son nom sur un signal ferait croire a la
         victime que quelqu'un vient. C'est le pire affichage possible --
         elle cesserait de chercher une autre solution.
+
+        [28/08/2026] Rend les numeros des VICTIMES dont le signal vient
+        d'etre relache, et non plus un booleen.
+
+        L'appelant doit les prevenir, sinon leur ecran continue d'annoncer
+        que quelqu'un vient. Les deux appelants tentaient bien de le
+        faire, mais en reconstituant la liste depuis visibles() et sa cle
+        "auteur" -- qui n'existe pas : cette vue expose `pris` et `mien`,
+        jamais l'auteur, precisement pour ne pas reveler qui a declenche.
+        La liste ne contenait donc que des None, eliminee par le filtre
+        de la ligne suivante, et AUCUNE victime n'etait prevenue.
+
+        Cette methode est le seul endroit qui sache lesquels sont
+        relaches : elle boucle deja dessus. C'est donc ici que la liste
+        doit se construire, pas chez l'appelant.
+
+        Le booleen rendu auparavant n'etait lu nulle part (verifie sur
+        les deux appels de circusvoip_server.py).
         """
         numero = str(numero)
+        auteurs = []
         with self._lock:
-            parti = self._en_service.pop(numero, None) is not None
+            self._en_service.pop(numero, None)
             for sig in self._signaux.values():
-                U.relacher(sig, numero)
-            return parti
+                # Tester AVANT de relacher : apres, le numero n'est plus
+                # dans la liste et on ne saurait plus s'il y etait.
+                if str(numero) in (sig.get("preneurs") or []):
+                    U.relacher(sig, numero)
+                    auteur = sig.get("auteur")
+                    if auteur:
+                        auteurs.append(str(auteur))
+        return auteurs
 
     def est_en_service(self, numero) -> bool:
         with self._lock:

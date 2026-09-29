@@ -808,8 +808,8 @@
   },
   "bp_craft_cds_combat_superheavy_backpack_01_03_01": {
     "category": "fpsgear/armour/$templates/combat",
-    "produced_item": "8f17c496-c12b-4f2e-93e2-c7b5c4ce9524",
-    "produced_display": "Cds Combat Superheavy Backpack 01 03 01",
+    "produced_item": "cds_combat_superheavy_backpack_01_03_01",
+    "produced_display": "H4-PBF Ammo Carrier Snow Camo",
     "craft_time": "0d 0h 3m 30s",
     "materials": [
       {
@@ -852,8 +852,8 @@
   },
   "bp_craft_cds_combat_superheavy_helmet_01_03_01": {
     "category": "fpsgear/armour/$templates/combat",
-    "produced_item": "a15e8a38-f90c-47e8-b68c-c81a700c47a5",
-    "produced_display": "Cds Combat Superheavy Helmet 01 03 01",
+    "produced_item": "cds_combat_superheavy_helmet_01_03_01",
+    "produced_display": "BUL-H4 Helmet Snow Camo",
     "craft_time": "0d 0h 3m 30s",
     "materials": [
       {
@@ -910,8 +910,8 @@
   },
   "bp_craft_cds_combat_superheavy_suit_01_03_01": {
     "category": "fpsgear/armour/$templates/combat",
-    "produced_item": "f2a15cd0-ada8-4b8a-ae25-18b7a6986fd1",
-    "produced_display": "Cds Combat Superheavy Suit 01 03 01",
+    "produced_item": "cds_combat_superheavy_suit_01_03_01",
+    "produced_display": "BUL-H4 Armor Snow Camo",
     "craft_time": "0d 0h 3m 30s",
     "materials": [
       {
@@ -1189,8 +1189,8 @@
   },
   "bp_craft_cds_combat_heavy_helmet_01_02_02": {
     "category": "fpsgear/armour/combat/heavy",
-    "produced_item": "97849417-fbb7-40b6-9599-e691761b7f77",
-    "produced_display": "Cds Combat Heavy Helmet 01 02 02",
+    "produced_item": "cds_combat_heavy_helmet_01_02_02",
+    "produced_display": "ADP-mk4 Helmet SecondWind",
     "craft_time": "0d 0h 4m 0s",
     "materials": [
       {
@@ -16587,7 +16587,7 @@
   "bp_craft_qrt_specialist_heavy_arms_01_01_13": {
     "category": "fpsgear/armour/hunter/heavy",
     "produced_item": "qrt_specialist_heavy_arms_01_01_13",
-    "produced_display": "Antium Helmet Jet",
+    "produced_display": "Antium Arms Maroon",
     "craft_time": "0d 0h 4m 30s",
     "materials": [
       {
@@ -16964,7 +16964,7 @@
   "bp_craft_qrt_specialist_heavy_helmet_01_01_12": {
     "category": "fpsgear/armour/hunter/heavy",
     "produced_item": "qrt_specialist_heavy_helmet_01_01_12",
-    "produced_display": "Antium Core Jet",
+    "produced_display": "Antium Helmet Jet",
     "craft_time": "0d 0h 4m 30s",
     "materials": [
       {
@@ -23659,8 +23659,8 @@
   },
   "bp_craft_cds_undersuit_01_02_02": {
     "category": "fpsgear/armour/undersuit",
-    "produced_item": "ae8958f2-b753-4891-bacb-8810950e5f07",
-    "produced_display": "Cds Undersuit 01 02 02",
+    "produced_item": "cds_undersuit_01_02_02",
+    "produced_display": "FBL-8u Undersuit SecondWind",
     "craft_time": "0d 0h 1m 30s",
     "materials": [
       {
@@ -29203,6 +29203,191 @@
         "quantity": "0.3",
         "unit": "SCU",
         "guid": "989f9b73-f636-4f35-a81d-579dcbe3f0ab"
+      }
+    ]
+  },
+  "bp_craft_cargo_shipmining_pod_golem": {
+    "category": "vehiclegear",
+    "produced_item": "cargo_shipmining_pod_golem",
+    "produced_display": "Drake Ore Pod",
+    "craft_time": "0d 0h 1m 35s",
+    "materials": [
+      {
+        "name": "iron",
+        "display": "Iron",
+        "quantity": "0.3",
+        "unit": "SCU",
+        "guid": "f386a33c-ac9a-400a-a7b8-fe1fc7c8d270"
+      }
+    ]
+  },
+  "bp_craft_cargo_shipmining_pod_golem_btgl": {
+    "category": "vehiclegear",
+    "produced_item": "cargo_shipmining_pod_golem_btgl",
+    "produced_display": "GOLEM MC-4 Ore Pod",
+    "craft_time": "0d 0h 1m 35s",
+    "materials": [
+      {
+        "name": "iron",
+        "display": "Iron",
+        "quantity": "0.3",
+        "unit": "SCU",
+        "guid": "f386a33c-ac9a-400a-a7b8-fe1fc7c8d270"
+      }
+    ]
+  },
+  "bp_craft_cargo_shipmining_pod_mole": {
+    "category": "vehiclegear",
+    "produced_item": "cargo_shipmining_pod_mole",
+    "produced_display": "Argo Ore Pod",
+    "craft_time": "0d 0h 1m 35s",
+    "materials": [
+      {
+        "name": "iron",
+        "display": "Iron",
+        "quantity": "0.7",
+        "unit": "SCU",
+        "guid": "f386a33c-ac9a-400a-a7b8-fe1fc7c8d270"
+      }
+    ]
+  },
+  "bp_craft_cargo_shipmining_pod_moleprospector_btgl": {
+    "category": "vehiclegear",
+    "produced_item": "cargo_shipmining_pod_moleprospector_btgl",
+    "produced_display": "MISC Enhanced Ore Pod",
+    "craft_time": "0d 0h 1m 35s",
+    "materials": [
+      {
+        "name": "iron",
+        "display": "Iron",
+        "quantity": "0.75",
+        "unit": "SCU",
+        "guid": "f386a33c-ac9a-400a-a7b8-fe1fc7c8d270"
+      }
+    ]
+  },
+  "bp_craft_cargo_shipmining_pod_prospector": {
+    "category": "vehiclegear",
+    "produced_item": "cargo_shipmining_pod_prospector",
+    "produced_display": "MISC Ore Pod",
+    "craft_time": "0d 0h 1m 35s",
+    "materials": [
+      {
+        "name": "iron",
+        "display": "Iron",
+        "quantity": "0.5",
+        "unit": "SCU",
+        "guid": "f386a33c-ac9a-400a-a7b8-fe1fc7c8d270"
+      }
+    ]
+  },
+  "bp_craft_mining_modules_active_clearcut": {
+    "category": "vehiclegear",
+    "produced_item": "mining_modules_active_clearcut",
+    "produced_display": "Clearcut Module",
+    "craft_time": "0d 0h 1m 35s",
+    "materials": [
+      {
+        "name": "iron",
+        "display": "Iron",
+        "quantity": "0.2",
+        "unit": "SCU",
+        "guid": "f386a33c-ac9a-400a-a7b8-fe1fc7c8d270"
+      },
+      {
+        "name": "copper",
+        "display": "Copper",
+        "quantity": "0.1",
+        "unit": "SCU",
+        "guid": "a789f57a-e12b-4bcd-8132-e0c03d84fc89"
+      }
+    ]
+  },
+  "bp_craft_mining_modules_active_stampede": {
+    "category": "vehiclegear",
+    "produced_item": "mining_modules_active_stampede",
+    "produced_display": "Stampede Module",
+    "craft_time": "0d 0h 1m 35s",
+    "materials": [
+      {
+        "name": "iron",
+        "display": "Iron",
+        "quantity": "0.2",
+        "unit": "SCU",
+        "guid": "f386a33c-ac9a-400a-a7b8-fe1fc7c8d270"
+      },
+      {
+        "name": "copper",
+        "display": "Copper",
+        "quantity": "0.1",
+        "unit": "SCU",
+        "guid": "a789f57a-e12b-4bcd-8132-e0c03d84fc89"
+      }
+    ]
+  },
+  "bp_craft_mining_modules_passive_deluge": {
+    "category": "vehiclegear",
+    "produced_item": "mining_modules_passive_deluge",
+    "produced_display": "Deluge Module",
+    "craft_time": "0d 0h 1m 35s",
+    "materials": [
+      {
+        "name": "iron",
+        "display": "Iron",
+        "quantity": "0.2",
+        "unit": "SCU",
+        "guid": "f386a33c-ac9a-400a-a7b8-fe1fc7c8d270"
+      },
+      {
+        "name": "copper",
+        "display": "Copper",
+        "quantity": "0.1",
+        "unit": "SCU",
+        "guid": "a789f57a-e12b-4bcd-8132-e0c03d84fc89"
+      }
+    ]
+  },
+  "bp_craft_mining_modules_passive_overrun": {
+    "category": "vehiclegear",
+    "produced_item": "mining_modules_passive_overrun",
+    "produced_display": "Overrun Module",
+    "craft_time": "0d 0h 1m 35s",
+    "materials": [
+      {
+        "name": "iron",
+        "display": "Iron",
+        "quantity": "0.2",
+        "unit": "SCU",
+        "guid": "f386a33c-ac9a-400a-a7b8-fe1fc7c8d270"
+      },
+      {
+        "name": "copper",
+        "display": "Copper",
+        "quantity": "0.1",
+        "unit": "SCU",
+        "guid": "a789f57a-e12b-4bcd-8132-e0c03d84fc89"
+      }
+    ]
+  },
+  "bp_craft_mining_modules_passive_torrent_mk3": {
+    "category": "vehiclegear",
+    "produced_item": "mining_modules_passive_torrent_mk3",
+    "produced_display": "Torrent III Module",
+    "craft_time": "0d 0h 1m 35s",
+    "materials": [
+      {
+        "name": "iron",
+        "display": "Iron",
+        "quantity": "0.2",
+        "unit": "SCU",
+        "guid": "f386a33c-ac9a-400a-a7b8-fe1fc7c8d270"
+      },
+      {
+        "name": "copper",
+        "display": "Copper",
+        "quantity": "0.1",
+        "unit": "SCU",
+        "guid": "a789f57a-e12b-4bcd-8132-e0c03d84fc89"
       }
     ]
   },
@@ -37679,7 +37864,7 @@
   "bp_craft_salvage_modifier_scraper_salvation_medium": {
     "category": "vehiclegear/salvage",
     "produced_item": "salvage_modifier_scraper_salvation_medium",
-    "produced_display": "Cinch Scraper Module",
+    "produced_display": "Comer Scraper Module",
     "craft_time": "0d 0h 4m 0s",
     "materials": [
       {
@@ -37708,7 +37893,7 @@
   "bp_craft_salvage_modifier_scraper_salvation_small": {
     "category": "vehiclegear/salvage",
     "produced_item": "salvage_modifier_scraper_salvation_small",
-    "produced_display": "Cinch Scraper Module",
+    "produced_display": "Hart Scraper Module",
     "craft_time": "0d 0h 3m 0s",
     "materials": [
       {

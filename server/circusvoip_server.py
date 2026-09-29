@@ -20,6 +20,7 @@ PATCHES SECURITE appliques :
 
 import asyncio
 import json
+import os
 import secrets
 import socket
 import sys
@@ -145,6 +146,32 @@ except Exception as _e_tr:
             pass
 
 
+# [ANNONCES 21/09/2026] Petites annonces publiques (recrutement,
+# evenement, vente). Meme dispositif que Travail : import garde, et
+# BRUYANT s'il manque -- une app qui ne repond jamais doit se voir cote
+# serveur.
+_ANNONCES_ENABLED = False
+_annonces_store = None
+try:
+    import circusvoip_phone_annonces as _AN
+    from circusvoip_annonces_store import AnnonceStore as _AnnonceStore
+    _annonces_store = _AnnonceStore()
+    _ANNONCES_ENABLED = True
+except Exception as _e_an:
+    import sys as _sys_an
+    for _st in (_sys_an.stderr, _sys_an.stdout):
+        try:
+            print("=" * 68, file=_st)
+            print("[ANNONCES] *** APP ANNONCES DESACTIVEE ***", file=_st)
+            print(f"[ANNONCES] Module indisponible : {_e_an!r}", file=_st)
+            print("[ANNONCES] Consequence : les joueurs voient l'app mais",
+                  file=_st)
+            print("[ANNONCES] aucune annonce ne circulera.", file=_st)
+            print("=" * 68, file=_st, flush=True)
+        except Exception:
+            pass
+
+
 try:
     import circusvoip_phone_urgence as _UR
     from circusvoip_urgence_store import UrgenceStore as _UrgenceStore
@@ -192,8 +219,49 @@ except Exception as _e_gr:
             pass
 
 
+# [ADMIN 07/09/2026] Preavis avant un redemarrage demande depuis
+# l'interface admin. Assez pour que l'avis parvienne aux joueurs et
+# que la reponse admin parte, assez court pour ne pas donner
+# l'impression que la commande a ete ignoree.
+_RESTART_DELAI_S = 3
+
 _ACCOUNTS_ENABLED = False
 _accounts_ctx = None
+
+
+def _diffuser_annuaire_admins():
+    """Repousse l'annuaire complet a tous les admins connectes.
+
+    [ANNUAIRE 07/09/2026] Branchee sur AccountStore.on_change, donc
+    appelee apres CHAQUE ecriture de l'annuaire : liaison Discord,
+    renommage, attribution de numero, rotation de jeton, blocage,
+    designation de chef, suppression. Avant, seule la suppression
+    poussait -- et seulement vers l'admin qui l'avait demandee. Un joueur
+    qui se liait pendant qu'un admin regardait l'annuaire n'apparaissait
+    jamais.
+
+    Definie AVANT la construction du store : celui-ci recoit le callback
+    des son __init__, et _load() ne declenche pas _save(), mais une
+    migration de schema le pourrait.
+
+    Silencieuse et non bloquante : elle s'execute dans le thread qui a
+    modifie l'annuaire, pas dans la boucle asyncio.
+    _broadcast_admins_threadsafe est faite pour ca -- elle pose la
+    coroutine sur la loop et rend la main. Sans admin connecte, elle ne
+    fait rien.
+    """
+    try:
+        if not _accounts_ctx or not admins:
+            return
+        _broadcast_admins_threadsafe(json.dumps({
+            "type": "annuaire_list",
+            "entries": _accounts_ctx.store.list_accounts(),
+        }))
+    except Exception:
+        # Une diffusion ratee ne doit jamais faire echouer la sauvegarde
+        # de l'annuaire qui l'a declenchee.
+        pass
+
 try:
     from circusvoip_accounts import AccountStore as _AccountStore
     from circusvoip_accounts_ws import (
@@ -208,7 +276,7 @@ try:
     except Exception:
         _DISCORD_CFG = {"client_id": "", "client_secret": ""}
     _accounts_ctx = _AccountsContext(
-        _AccountStore(),
+        _AccountStore(on_change=lambda: _diffuser_annuaire_admins()),
         _DISCORD_CFG.get("client_id", ""),
         _DISCORD_CFG.get("client_secret", ""),
         SERVER_TOKEN,
@@ -255,6 +323,53 @@ DEBUG_LOG_FILE  = _DEBUG_DIR / "circusvoip_server_debug.log"
 # accessible (pas root, droits manquants), on garde le comportement
 # historique (DEBUG_LOG_FILE ecrase a chaque demarrage).
 _POS_LOG_DIR = Path("/var/log/circusvoip-positions")
+
+# === [LOGS JOUEURS 24/08/2026] Remontee des journaux de debogage ===
+#
+# Un joueur envoie son journal a la FERMETURE du client. Le but est de
+# diagnostiquer ce qui ne se voit que chez lui : la proximite se calcule
+# des DEUX cotes, et le journal de l'un ne dit rien du volume entendu par
+# l'autre. Sans ca, tout diagnostic reste une hypothese.
+#
+# ⚠ Ces fichiers contiennent les POSITIONS EN JEU du joueur, les zones
+# qu'il traverse et les pseudos qu'il croise. Ils sont personnels : dossier
+# non servi par HTTP, et jamais publies.
+_JOUEUR_LOG_DIR = Path("/home/circusvoip/logs_joueurs")
+
+# Plafond par envoi, sur les octets COMPRESSES recus.
+#
+# Mesures reelles : 12 min de jeu = 200 Ko brut ; 3 h = 2200 Ko brut. Le
+# gzip ramene a ~13 %, soit ~290 Ko pour 3 h.
+#
+# 800 Ko couvrent donc une session de plus de 8 h. Au-dela, ce n'est plus
+# une session de jeu : c'est un client modifie ou un journal parti en
+# boucle, et le refus est le bon comportement.
+#
+# ⚠ Ce plafond porte sur le COMPRESSE, pas sur le brut. La vraie borne
+# est ailleurs : la trame WebSocket est limitee a 1 Mo par defaut, ce qui
+# correspond a ~5,9 Mo bruts apres gzip et base64. C'est le CLIENT qui
+# tronque avant d'envoyer (cf. _remonter_journal_debug) -- un plafond
+# serveur seul aurait juste transforme un envoi trop gros en echec
+# silencieux, exactement pour les sessions les plus longues.
+_JOUEUR_LOG_MAX_OCTETS = 800 * 1024
+
+# Envois bornes PAR CONNEXION. Sans ce garde-fou, un client boucle
+# remplirait le disque du VPS -- et un disque plein arrete le serveur VOIP
+# lui-meme, pas seulement la collecte.
+#
+# [22/09/2026] Etait « un seul par connexion ». Le client offre desormais
+# un envoi MANUEL en cours de session, en plus de celui de la fermeture
+# et du renvoi d'un journal en attente : trois envois legitimes sur une
+# meme connexion. 4 au plus -- soit 3,2 Mo par connexion dans le pire
+# cas, un client boucle ne va pas plus loin.
+#
+# Pas d'ecart minimal impose ICI : un envoi manuel suivi d'une fermeture
+# dans la foulee serait refuse, et c'est justement le journal COMPLET
+# qu'on perdrait -- sans que le client le sache, puisqu'il n'y a pas
+# d'accuse de reception. La cadence des envois manuels est bornee cote
+# client (60 s).
+_JOUEUR_LOG_MAX_PAR_CONNEXION = 4
+_JOUEUR_LOG_RECU: dict = {}     # ws -> nombre d'envois acceptes
 _debug_log_actual_path = None  # chemin reellement utilise (rempli par _debug_log_init)
 _debug_log_fp   = None
 _last_pos_time: dict = {}  # dernier timestamp par joueur (pour dt)
@@ -1144,6 +1259,11 @@ async def _cleanup_loop():
                 if now - info.get("last_seen", 0) > CLIENT_TIMEOUT]
         for ws in dead:
             info = clients.pop(ws, {})
+            # [LOGS JOUEURS 24/08/2026] Sans ce retrait, l'ensemble
+            # grossirait d'une entree par connexion pour toute la duree de
+            # vie du serveur -- une fuite lente, invisible, qui ne se
+            # verrait qu'apres des semaines de fonctionnement.
+            _JOUEUR_LOG_RECU.pop(ws, None)
             name = info.get("name", "?")
             _log(f"Timeout : {name}", ORANGE)
             if _ui:
@@ -1847,6 +1967,14 @@ async def _queue_purge_loop():
                 if nm:
                     _log(f"[TRAVAIL] Purge : {nm} mission(s) retiree(s)",
                          BLUE)
+            # [ANNONCES 21/09/2026] Meme boucle. Les expirees sont deja
+            # masquees a la lecture (AnnonceStore.toutes) : cette purge
+            # ne fait que vider le fichier.
+            if _ANNONCES_ENABLED:
+                na = _annonces_store.purger()
+                if na:
+                    _log(f"[ANNONCES] Purge : {na} annonce(s) expiree(s)",
+                         BLUE)
         except Exception as exc:
             _log(f"[QUEUE] Purge en echec : {exc}", ORANGE)
         await asyncio.sleep(24 * 3600)
@@ -1969,6 +2097,72 @@ async def _queue_rejouer(ws, name: str, numero):
         pass
 
 
+def _travail_destinataires_de(mission):
+    """Numeros dont la LISTE change quand cette mission change d'etat.
+
+    Ceux qui exercent le metier recherche, plus l'auteur -- sa page
+    « Mes missions » bouge aussi.
+
+    Enveloppe _travail_destinataires() pour lui epargner la lecture de
+    l'annuaire a chaque appelant, et pour ne jamais lever : une poussee
+    d'etat est un confort, elle ne doit pas faire echouer l'action qui
+    vient de reussir.
+    """
+    if not (_ACCOUNTS_ENABLED and _accounts_ctx is not None):
+        return []
+    try:
+        table = _accounts_ctx.store.metiers_par_numero()
+    except Exception:
+        return []
+    out = list(_travail_destinataires(mission, table))
+    auteur = mission.get("auteur")
+    if auteur:
+        out.append(auteur)
+    return out
+
+
+async def _travail_pousser_etat(numeros, sauf_ws=None):
+    """Pousse leur etat Travail aux joueurs CONNECTES, sans qu'ils demandent.
+
+    [TRAVAIL 28/08/2026] Comble un principe applique a moitie.
+
+    L'app annonce "le serveur decide, le client dessine" : chaque action
+    renvoie un etat COMPLET qui redessine la page. Mais cet etat ne
+    partait qu'a l'AUTEUR de l'action. Les autres joueurs concernes ne
+    recevaient au mieux qu'un texte de notification, jamais de donnees --
+    donc leur ecran restait faux jusqu'a ce qu'ils rouvrent l'app.
+
+    Quatre consequences observees le 28/08 :
+      - une mission prise ne prevenait pas son auteur ;
+      - une publication affichait "Nouvelle mission mecanicien : ..."
+        sans faire apparaitre la mission dans la liste ;
+      - une mission close ou retiree laissait le preneur avec un bandeau
+        de mission en cours qui n'existait plus ;
+      - seul l'abandon prevenait l'auteur -- la preuve que le besoin
+        etait connu, mais traite une fois sur quatre.
+
+    Calque sur _groupes_pousser_etat, y compris `sauf_ws` : celui qui a
+    agi recoit deja sa reponse par _travail_envoyer_etat, et lui pousser
+    un second etat lui ferait reconstruire son ecran deux fois.
+
+    Les joueurs hors ligne sont ignores : ils liront l'etat a jour a leur
+    prochaine ouverture d'app, puisqu'il est recalcule a chaque fois.
+    """
+    vus = set()
+    for num in numeros or []:
+        num = str(num or "")
+        if not num or num in vus:
+            continue
+        vus.add(num)
+        nom = _numero_to_pseudo(num)
+        if nom is None:
+            continue
+        for ws_m, info in list(clients.items()):
+            if ws_m is sauf_ws or info.get("name") != nom:
+                continue
+            await _travail_envoyer_etat(ws_m, num)
+
+
 async def _travail_envoyer_etat(ws, numero, erreur=""):
     """Renvoie au demandeur TOUT ce que son ecran doit afficher.
 
@@ -2036,6 +2230,70 @@ async def _travail_notifier(mission):
         })
 
 
+# ----------------------------------------------------------------------
+#  [MODERATION 21/09/2026] Travail : vue et retrait ADMIN
+# ----------------------------------------------------------------------
+
+_TRAVAIL_ACTIONS_MODIFIANTES = frozenset((
+    "travail_publier", "travail_prendre", "travail_abandonner",
+    "travail_clore", "travail_retirer",
+))
+
+
+def _travail_liste_admin():
+    """Missions ouvertes et prises, avec les pseudos. Jamais aux joueurs.
+
+    Les closes sont ecartees : elles ne sont plus visibles de personne
+    (gardees 7 jours pour l'historique), il n'y a rien a moderer.
+    Les expirees aussi, pour la meme raison -- la purge quotidienne ne
+    les a peut-etre pas encore retirees du fichier.
+    """
+    out = []
+    with _travail_store._lock:
+        brutes = [dict(m) for m in _travail_store._missions.values()]
+    for m in brutes:
+        if m.get("etat") == _TR.ETAT_CLOSE or _TR.est_expiree(m):
+            continue
+        m["pseudo_auteur"] = _numero_to_pseudo(m.get("auteur")) or ""
+        m["pseudo_executant"] = (_numero_to_pseudo(m.get("executant")) or ""
+                                 if m.get("executant") else "")
+        out.append(m)
+    out.sort(key=lambda m: m.get("cree_le") or 0, reverse=True)
+    return out
+
+
+def _travail_retirer_admin(mid):
+    """Supprime une mission, quel que soit son etat. None si absente.
+
+    Passe par les internes du store (_lock, _missions, _sauver) plutot
+    que par une methode ajoutee a circusvoip_travail_store.py : la
+    moderation ne touche ainsi QUE ce fichier-ci, et le store deploye
+    sur le VPS n'a pas a etre repousse. A deplacer dans le store le jour
+    ou on le retouche pour autre chose.
+
+    Supprimee, pas close : une mission close apparaitrait encore 7 jours
+    dans l'historique des deux parties, ce qu'on veut justement eviter
+    pour un contenu modere.
+    """
+    with _travail_store._lock:
+        m = _travail_store._missions.pop(str(mid), None)
+        if m is not None:
+            _travail_store._sauver()
+    return dict(m) if m else None
+
+
+async def _travail_pousser_admins():
+    if not admins or not _TRAVAIL_ENABLED:
+        return
+    try:
+        await _broadcast_admins(json.dumps({
+            "type": "travail_admin",
+            "missions": _travail_liste_admin(),
+        }))
+    except Exception:
+        pass
+
+
 async def _travail_handle(ws, msg_type, data):
     """Point d'entree unique des trames travail_*."""
     if not _TRAVAIL_ENABLED:
@@ -2059,6 +2317,7 @@ async def _travail_handle(ws, msg_type, data):
     mid = str(data.get("id") or "")
     erreur = ""
     publiee = None
+    a_pousser = []
 
     try:
         if msg_type == "travail_liste":
@@ -2068,7 +2327,11 @@ async def _travail_handle(ws, msg_type, data):
                 numero, data.get("metier"), data.get("titre"),
                 data.get("paiement"), data.get("description") or "")
         elif msg_type == "travail_prendre":
-            _travail_store.prendre(mid, numero)
+            m = _travail_store.prendre(mid, numero)
+            # L'auteur doit savoir que quelqu'un vient, et QUI : c'est
+            # tout l'interet d'avoir publie. Symetrique de l'abandon,
+            # juste en dessous, qui le prevenait deja.
+            a_pousser.append(m.get("auteur"))
         elif msg_type == "travail_abandonner":
             m = _travail_store.abandonner(mid, numero)
             # L'auteur attend quelqu'un qui ne viendra pas : il doit le
@@ -2078,10 +2341,22 @@ async def _travail_handle(ws, msg_type, data):
                 await _send_to_name(nom, {
                     "type": "travail_abandon",
                     "titre": m.get("titre")})
+            # La mission redevient ouverte : elle doit reapparaitre chez
+            # tous ceux qui exercent le metier recherche.
+            a_pousser.append(m.get("auteur"))
+            a_pousser += _travail_destinataires_de(m)
         elif msg_type == "travail_clore":
-            _travail_store.clore(mid, numero)
+            m = _travail_store.clore(mid, numero)
+            # Le preneur garderait sinon un bandeau de mission en cours
+            # sur une mission terminee, sans aucun moyen de s'en defaire.
+            a_pousser.append(m.get("executant"))
         elif msg_type == "travail_retirer":
-            _travail_store.retirer(mid, numero)
+            m = _travail_store.retirer(mid, numero)
+            # Retirer n'est possible que sur une mission OUVERTE, donc
+            # personne ne l'avait prise : ce sont les lecteurs de la
+            # liste qu'il faut rafraichir, pour qu'une annonce disparue
+            # ne reste pas cliquable.
+            a_pousser += _travail_destinataires_de(m)
         elif msg_type == "travail_metiers":
             if _ACCOUNTS_ENABLED and _accounts_ctx is not None:
                 acc = _accounts_ctx.store.get_by_numero(numero)
@@ -2101,10 +2376,233 @@ async def _travail_handle(ws, msg_type, data):
         erreur = "Action impossible pour le moment."
 
     await _travail_envoyer_etat(ws, numero, erreur)
+
+    # [TRAVAIL 28/08/2026] Journaliser TOUTES les actions, pas la seule
+    # publication. Sur les quatre journaux de la session du 28/08, l'app
+    # n'avait produit qu'UNE ligne : impossible de savoir si une mission
+    # avait ete prise, par qui, ni si la liste s'etait rafraichie. Le
+    # premier symptome remonte ("savoir qui a pris ma mission") est reste
+    # indiagnosticable faute de trace.
+    if erreur:
+        _log(f"[TRAVAIL] {msg_type} refuse ({numero}) : {erreur}", ORANGE)
+    elif msg_type != "travail_liste":
+        _log(f"[TRAVAIL] {numero} {msg_type}"
+             + (f" mission={mid}" if mid else "")
+             + (f" -> prevenir {len(set(a_pousser))}" if a_pousser else ""),
+             BLUE)
+
     if publiee is not None:
         _log(f"[TRAVAIL] {numero} publie « {publiee.get('titre')} » "
              f"-> {publiee.get('metier')}", BLUE)
         await _travail_notifier(publiee)
+        # La notification seule affichait "Nouvelle mission mecanicien"
+        # sans que la mission apparaisse dans la liste : le joueur
+        # cherchait une annonce invisible jusqu'a reouverture de l'app.
+        a_pousser += _travail_destinataires_de(publiee)
+
+    # Apres la reponse a l'auteur de l'action, et hors du try : une
+    # poussee qui echoue ne doit pas transformer une action REUSSIE en
+    # erreur affichee. sauf_ws l'ecarte, il vient d'etre servi.
+    if a_pousser:
+        try:
+            await _travail_pousser_etat(a_pousser, sauf_ws=ws)
+        except Exception as e:
+            _log(f"[TRAVAIL] poussee d'etat KO : {e!r}", ORANGE)
+
+    # [MODERATION 21/09/2026] L'onglet MISSIONS de l'admin suit chaque
+    # changement, comme celui des annonces.
+    if not erreur and msg_type in _TRAVAIL_ACTIONS_MODIFIANTES:
+        try:
+            await _travail_pousser_admins()
+        except Exception as e:
+            _log(f"[TRAVAIL] poussee admin KO : {e!r}", ORANGE)
+
+
+# ======================================================================
+#  [ANNONCES 21/09/2026] App Annonces
+# ======================================================================
+#
+# Tableau PUBLIC : tout joueur connecte voit toutes les annonces. Trois
+# trames joueur (annonces_liste / _publier / _retirer), un seul format
+# de reponse (annonces_etat), et deux commandes admin pour la
+# moderation.
+#
+# Le serveur n'envoie JAMAIS l'auteur d'une annonce a un joueur : il
+# passe par _AN.vue_publique(), qui ne revele le numero que si l'auteur
+# a coche "inclure mon numero". Seule la vue ADMIN porte l'auteur.
+
+
+def _annonces_chefs_par_numero():
+    """{numero: role} des chefs en place. {} si indisponible.
+
+    Lu a CHAQUE envoi et non stocke dans l'annonce : un chef destitue
+    doit perdre son badge tout de suite, pas a l'expiration de ses
+    annonces sept jours plus tard.
+    """
+    if not (_ACCOUNTS_ENABLED and _accounts_ctx is not None):
+        return {}
+    try:
+        return {str(f.get("numero")): role
+                for role, f in _accounts_ctx.store.chefs().items()
+                if f.get("numero") is not None}
+    except Exception:
+        return {}
+
+
+def _annonces_libelles_chef():
+    if _URGENCE_ENABLED:
+        try:
+            return dict(_UR.LIBELLES_CHEF)
+        except Exception:
+            pass
+    return {"medecin": "Chef médical", "securite": "Chef de la sécurité"}
+
+
+def _annonces_vues(numero, chefs=None, libelles=None):
+    """Toutes les annonces en cours, au format joueur, pour ce numero."""
+    chefs = _annonces_chefs_par_numero() if chefs is None else chefs
+    libelles = _annonces_libelles_chef() if libelles is None else libelles
+    out = []
+    for a in _annonces_store.toutes():
+        off = _AN.badge_officiel(a, chefs.get(str(a.get("auteur"))),
+                                 libelles)
+        out.append(_AN.vue_publique(a, numero, off))
+    return out
+
+
+async def _annonces_envoyer_etat(ws, numero, erreur="", reponse=True,
+                                 chefs=None, libelles=None):
+    """Envoie a un joueur TOUT ce que son ecran doit afficher.
+
+    `reponse` distingue la reponse a SA demande d'une poussee causee par
+    un autre joueur. Le client s'en sert pour ne pas reconstruire un
+    formulaire en cours de saisie sous les doigts du joueur -- c'est le
+    defaut constate sur l'app Travail, ou un rafraichissement efface ce
+    qui etait tape.
+    """
+    try:
+        await ws.send(json.dumps({
+            "type": "annonces_etat",
+            "annonces": (_annonces_vues(numero, chefs, libelles)
+                         if numero else []),
+            "erreur": erreur,
+            "reponse": bool(reponse),
+        }))
+    except Exception:
+        pass
+
+
+async def _annonces_pousser_tous(sauf_ws=None):
+    """Pousse la liste a jour a TOUS les joueurs connectes.
+
+    Tableau public : toute publication ou tout retrait concerne tout le
+    monde. Le cout est d'un message par joueur connecte, a chaque
+    changement -- c'est l'intervalle de publication qui borne la
+    frequence.
+
+    Les chefs sont lus UNE fois pour toute la tournee, pas par joueur.
+    Les joueurs sans numero (compte non relie) sont ignores.
+    """
+    chefs = _annonces_chefs_par_numero()
+    libelles = _annonces_libelles_chef()
+    for ws_m, info in list(clients.items()):
+        if ws_m is sauf_ws:
+            continue
+        num = info.get("numero")
+        if num is None:
+            continue
+        await _annonces_envoyer_etat(ws_m, str(num), reponse=False,
+                                     chefs=chefs, libelles=libelles)
+
+
+def _annonces_liste_admin():
+    """Vue ADMIN : l'auteur et son pseudo en plus. Jamais aux joueurs."""
+    out = []
+    for a in _annonces_store.toutes():
+        d = dict(a)
+        d["pseudo"] = _numero_to_pseudo(a.get("auteur")) or ""
+        out.append(d)
+    return out
+
+
+async def _annonces_pousser_admins():
+    """Repousse la liste de moderation a tous les admins connectes."""
+    if not admins or not _ANNONCES_ENABLED:
+        return
+    try:
+        await _broadcast_admins(json.dumps({
+            "type": "annonces_admin",
+            "annonces": _annonces_liste_admin(),
+        }))
+    except Exception:
+        pass
+
+
+async def _annonces_handle(ws, msg_type, data):
+    """Point d'entree unique des trames annonces_*.
+
+    Meme raison que pour travail_* : une action ajoutee plus tard dans
+    une branche a part oublierait la verification du numero ou le renvoi
+    de l'etat.
+    """
+    if not _ANNONCES_ENABLED:
+        try:
+            await ws.send(json.dumps({
+                "type": "annonces_etat", "annonces": [], "reponse": True,
+                "erreur": "Les annonces sont indisponibles sur ce "
+                          "serveur."}))
+        except Exception:
+            pass
+        return
+
+    numero = clients[ws].get("numero")
+    if numero is None:
+        await _annonces_envoyer_etat(
+            ws, "", "Compte non relié : reliez votre compte Discord.")
+        return
+    numero = str(numero)
+    aid = str(data.get("id") or "")
+    erreur = ""
+    change = None
+
+    try:
+        if msg_type == "annonces_liste":
+            pass
+        elif msg_type == "annonces_publier":
+            change = _annonces_store.publier(
+                numero, data.get("categorie"), data.get("description"),
+                bool(data.get("avec_numero", True)))
+        elif msg_type == "annonces_retirer":
+            change = _annonces_store.retirer(aid, numero)
+        else:
+            erreur = "Action inconnue."
+    except _AN.AnnonceError as e:
+        erreur = str(e)
+    except Exception as e:
+        _log(f"[ANNONCES] {msg_type} KO ({numero}) : {e!r}", ORANGE)
+        erreur = "Action impossible pour le moment."
+
+    await _annonces_envoyer_etat(ws, numero, erreur)
+
+    if erreur:
+        _log(f"[ANNONCES] {msg_type} refuse ({numero}) : {erreur}", ORANGE)
+    elif change is not None:
+        if msg_type == "annonces_publier":
+            _log(f"[ANNONCES] {numero} publie {change.get('id')} "
+                 f"({change.get('categorie')}"
+                 f"{', sans numero' if not change.get('avec_numero') else ''})",
+                 BLUE)
+        else:
+            _log(f"[ANNONCES] {numero} retire {change.get('id')}", BLUE)
+
+    # Hors du try et apres la reponse : une poussee ratee ne doit pas
+    # transformer une action reussie en erreur affichee.
+    if change is not None:
+        try:
+            await _annonces_pousser_tous(sauf_ws=ws)
+            await _annonces_pousser_admins()
+        except Exception as e:
+            _log(f"[ANNONCES] poussee d'etat KO : {e!r}", ORANGE)
 
 
 async def _groupes_envoyer_etat(ws, numero, erreur=""):
@@ -2193,6 +2691,84 @@ async def _groupes_router_message(groupe_id, emetteur_numero, texte):
                 "ts": ts}):
             envoyes += 1
     return envoyes
+
+
+def _journal_joueur_ecrire(pseudo, nom_fichier, donnees_b64) -> str:
+    """Ecrit le journal remonte par un joueur. Rend le chemin, ou "".
+
+    Synchrone et courte : appelee depuis la boucle asyncio, elle ne doit
+    pas la bloquer. 26 Ko decompresses en memoire, c'est negligeable --
+    inutile de sortir un thread pour ca.
+
+    Rend "" sur refus, avec un motif journalise cote serveur uniquement :
+    le client n'a pas a savoir POURQUOI c'est refuse, il n'y peut rien et
+    le detail renseignerait un client modifie sur les limites a contourner.
+    """
+    import base64 as _b64, gzip as _gz, re as _re
+
+    # Le nom vient du CLIENT : il ne doit jamais servir tel quel a
+    # construire un chemin. "../../etc/cron.d/x" ecrirait hors du dossier.
+    # On ne garde que des caracteres inoffensifs et on impose le prefixe.
+    nom_sur = _re.sub(r"[^A-Za-z0-9._-]", "_", str(nom_fichier or ""))
+    # Les points consecutifs sont ecrases APRES la substitution : les "/"
+    # sont deja devenus "_", donc le fichier ne peut plus sortir du
+    # dossier, mais "../../x" laisserait ".._.._x" -- un nom que certains
+    # outils d'archivage ou de synchronisation traitent encore de travers.
+    nom_sur = _re.sub(r"\.{2,}", ".", nom_sur)[:80]
+    if not nom_sur:
+        nom_sur = "sans_nom.log"
+    pseudo_sur = _re.sub(r"[^A-Za-z0-9._-]", "_", str(pseudo or "?"))[:40]
+
+    try:
+        brut = _b64.b64decode(donnees_b64 or "", validate=True)
+    except Exception as e:
+        print(f"[LOGS JOUEURS] {pseudo_sur} : base64 invalide ({e})",
+              flush=True)
+        return ""
+    if not brut:
+        return ""
+    if len(brut) > _JOUEUR_LOG_MAX_OCTETS:
+        print(f"[LOGS JOUEURS] {pseudo_sur} : {len(brut)} octets > plafond, "
+              f"refuse", flush=True)
+        return ""
+
+    # Verifier que c'est bien du gzip AVANT d'ecrire : un fichier
+    # d'extension .gz qui n'en est pas se decouvrirait des mois plus tard,
+    # au moment ou on en a besoin.
+    try:
+        _gz.decompress(brut)
+    except Exception as e:
+        print(f"[LOGS JOUEURS] {pseudo_sur} : gzip invalide ({e})",
+              flush=True)
+        return ""
+
+    try:
+        _JOUEUR_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        chemin = _JOUEUR_LOG_DIR / f"{pseudo_sur}_{ts}_{nom_sur}.gz"
+        # Collision a la SECONDE : un joueur qui se reconnecte vite peut
+        # deposer deux fois dans la meme seconde. Sans ce suffixe, le
+        # second ecraserait le premier -- et c'est justement la session
+        # ecourtee, souvent la plus interessante, qui disparaitrait.
+        _n = 1
+        while chemin.exists() and _n < 100:
+            chemin = (_JOUEUR_LOG_DIR
+                      / f"{pseudo_sur}_{ts}_{_n}_{nom_sur}.gz")
+            _n += 1
+        chemin.write_bytes(brut)
+        # Lisible par le seul proprietaire : ces fichiers portent les
+        # positions en jeu du joueur.
+        try:
+            # Path.chmod plutot que os.chmod : `os` n'est pas importe en
+            # tete de ce fichier, et l'ajouter pour une ligne creerait un
+            # import global de plus a maintenir.
+            chemin.chmod(0o600)
+        except Exception:
+            pass
+        return str(chemin)
+    except Exception as e:
+        print(f"[LOGS JOUEURS] ecriture KO : {e!r}", flush=True)
+        return ""
 
 
 async def _groupes_annoncer(groupe_id, sujet_numero, destinataires, texte):
@@ -2553,11 +3129,14 @@ async def _urgence_handle(ws, msg_type, data):
                 if chef:
                     raise _UR.UrgenceError(
                         "Un chef est de service dès qu'il est connecté.")
-                sig_relaches = [
-                    s.get("auteur") for s in
-                    _urgence_store.visibles(role, numero) if s.get("mien")]
-                _urgence_store.quitter_service(numero)
-                a_prevenir += [n for n in sig_relaches if n]
+                # [28/08/2026] Les victimes viennent de quitter_service,
+                # qui est le seul a savoir quels signaux il relache.
+                # Avant, la liste etait reconstituee depuis visibles() et
+                # une cle "auteur" que cette vue ne rend pas : elle ne
+                # contenait que des None, et aucune victime n'etait
+                # prevenue -- son ecran continuait d'annoncer que
+                # quelqu'un venait.
+                a_prevenir += _urgence_store.quitter_service(numero)
             # Les collegues voient la liste des presents changer.
             a_prevenir += _urgence_collegues(role, numero)
 
@@ -2577,8 +3156,9 @@ async def _urgence_handle(ws, msg_type, data):
             a_prevenir += list(sig.get("preneurs") or [])
 
         elif msg_type == "urgence_attribuer":
-            _urgence_attribuer(numero, role, chef, data.get("numero"),
-                               retirer=bool(data.get("retirer")))
+            a_prevenir += _urgence_attribuer(
+                numero, role, chef, data.get("numero"),
+                retirer=bool(data.get("retirer")))
             a_prevenir.append(str(data.get("numero") or ""))
 
         else:
@@ -2630,12 +3210,16 @@ def _urgence_attribuer(numero_chef, role, chef, numero_cible, retirer=False):
             raise _UR.UrgenceError("Un chef ne peut pas être retiré ici.")
         _accounts_ctx.store.set_role(acc["discord_id"], None)
         if _URGENCE_ENABLED:
-            _urgence_store.quitter_service(cible)
+            # Les victimes dont il relachait le signal doivent etre
+            # prevenues : sans ca, leur ecran annonce encore que
+            # quelqu'un vient alors que plus personne n'est en route.
+            return _urgence_store.quitter_service(cible)
     else:
         _UR.valide_attribution(role, chef, actuel)
         acc_chef = _urgence_fiche(numero_chef) or {}
         _accounts_ctx.store.set_role(
             acc["discord_id"], role, par=acc_chef.get("discord_id"))
+    return []
 
 
 async def _phone_declare_missed(call_id, caller, callee, cause):
@@ -2742,9 +3326,24 @@ async def _admin_session(ws):
                 "prox_short": info.get("prox_short", False),
                 "sc_online": info.get("sc_online", True),
             })
-        # [P5] On NE pousse PLUS le token serveur dans admin_welcome.
-        # L'admin peut le lire via la commande get_server_token (a ajouter
-        # explicitement si besoin) ou directement dans l'UI serveur.
+        # [P5 / 07/09/2026] Le token serveur est de nouveau envoye ici.
+        #
+        # Il avait ete retire pour ne pas le faire circuler dans chaque
+        # poussee admin, et le commentaire renvoyait a une commande
+        # `get_server_token` "a ajouter si besoin" -- jamais ecrite.
+        # Resultat : l'interface affichait "(non recu)" en permanence,
+        # ce qui ressemblait a une panne de transmission alors que
+        # c'etait un choix.
+        #
+        # Le risque etait surestime. L'admin est deja authentifie par son
+        # propre jeton, il peut deja MODIFIER ce mot de passe (donc en
+        # imposer un qu'il connait), et le canal est le meme wss:// qui
+        # transporte son jeton a la connexion. Le lire ne lui donne rien
+        # de plus que ce qu'il pouvait deja faire.
+        #
+        # Ce qui reste vrai de l'intention : le secret n'a pas a
+        # s'afficher en clair par defaut. C'est traite cote admin, par le
+        # meme oeil que l'IP et le jeton -- pas en amputant la donnee.
         await ws.send(json.dumps({
             "type": "admin_welcome",
             "channels": list(_channels),
@@ -2753,8 +3352,7 @@ async def _admin_session(ws):
             "profiles": [dict(p) for p in _profiles if isinstance(p, dict)],
             "players": players_state,
             "anonymous_mode": _anonymous_mode,
-            # "server_token" volontairement retire pour ne pas l'exposer
-            # dans tous les push admin.
+            "server_token": SERVER_TOKEN,
         }))
 
         # Boucle commandes
@@ -2781,7 +3379,145 @@ async def _admin_session(ws):
         pass
     finally:
         admins.pop(ws, None)
+        _logs_verrous.pop(ws, None)
         _log(f"ADMIN : deconnexion ({len(admins)} admin(s) connecte(s))", ORANGE)
+
+
+# ======================================================================
+#  [LOGS ADMIN 21/09/2026] Telechargement des journaux depuis l'admin
+# ======================================================================
+#
+# Remplace le va-et-vient scp / recuperer_logs_joueurs.ps1 : l'admin liste
+# les fichiers de trois dossiers et les rapatrie par sa propre connexion.
+# Utile surtout a un hebergeur tiers, qui n'a ni scp ni le script.
+#
+# Securite : l'admin designe un fichier par (source, nom). Le nom n'est
+# JAMAIS utilise pour construire un chemin arbitraire : il doit figurer
+# tel quel dans le listing du dossier de cette source. Pas de "..", pas
+# de sous-dossier, pas de lien qui sortirait du dossier.
+
+# Taille d'un morceau, en octets BRUTS. Encode en base64 (+33 %) dans du
+# JSON, il doit tenir sous le max_size par defaut de websockets (1 Mio)
+# cote admin. 256 Kio laissent une marge confortable.
+_LOGS_MORCEAU = 256 * 1024
+# Au-dela, on ne liste plus : l'admin veut les journaux RECENTS, et un
+# dossier de plusieurs mois ferait une liste illisible.
+_LOGS_MAX_PAR_SOURCE = 150
+
+
+def _logs_sources() -> dict:
+    """{source: (dossier, motif)}. Recalcule a chaque appel.
+
+    Le dossier des journaux positions est celui ou CE processus ecrit
+    reellement : /var/log/... sur le VPS, le repli local chez un
+    hebergeur Windows qui n'a pas de /var/log.
+    """
+    pos_dir = _POS_LOG_DIR
+    try:
+        if _debug_log_actual_path is not None:
+            pos_dir = Path(_debug_log_actual_path).parent
+    except Exception:
+        pass
+    return {
+        "joueurs":   (_JOUEUR_LOG_DIR, "*.gz"),
+        "positions": (pos_dir, "*.log"),
+        "audio":     (Path("/var/log/circusvoip-audio"), "*.log"),
+    }
+
+
+def _logs_lister() -> list:
+    """Fichiers disponibles, du plus recent au plus ancien, par source."""
+    out = []
+    for source, (dossier, motif) in _logs_sources().items():
+        try:
+            fichiers = [f for f in dossier.glob(motif) if f.is_file()]
+        except Exception:
+            fichiers = []
+        fichiers.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        for f in fichiers[:_LOGS_MAX_PAR_SOURCE]:
+            try:
+                st = f.stat()
+                out.append({"source": source, "nom": f.name,
+                            "taille": st.st_size, "mtime": st.st_mtime})
+            except Exception:
+                pass
+    return out
+
+
+def _logs_resoudre(source, nom):
+    """Chemin du fichier demande, ou None s'il n'est pas legitime."""
+    src = _logs_sources().get(str(source or ""))
+    nom = str(nom or "")
+    if src is None or not nom or "/" in nom or "\\" in nom or nom in (".", ".."):
+        return None
+    dossier, motif = src
+    chemin = dossier / nom
+    try:
+        if (chemin.is_file() and not chemin.is_symlink()
+                and chemin.resolve().parent == dossier.resolve()
+                and chemin.match(motif)):
+            return chemin
+    except Exception:
+        pass
+    return None
+
+
+def _logs_lire_morceau(chemin, debut, taille):
+    with open(chemin, "rb") as f:
+        f.seek(debut)
+        return f.read(taille)
+
+
+async def _logs_envoyer(ws, req, source, nom):
+    """Envoie un fichier par morceaux. Tache de fond : l'admin garde la
+    main pendant le transfert, et la boucle n'est jamais bloquee -- la
+    lecture disque passe par un thread.
+
+    Un verrou par admin serialise ses telechargements : demander dix
+    fichiers d'un coup ne lance pas dix lectures paralleles qui se
+    disputeraient le disque et la bande passante de la VOIP.
+    """
+    import base64 as _b64
+    verrou = _logs_verrous.setdefault(ws, asyncio.Lock())
+    async with verrou:
+        chemin = _logs_resoudre(source, nom)
+        if chemin is None:
+            try:
+                await ws.send(json.dumps({
+                    "type": "logs_fin", "req": req, "ok": False,
+                    "raison": "fichier introuvable ou refuse"}))
+            except Exception:
+                pass
+            return
+        try:
+            # Taille FIGEE au depart : le journal positions en cours
+            # d'ecriture grossit pendant le transfert, et un total qui
+            # bouge ferait une barre de progression fausse.
+            taille = chemin.stat().st_size
+            total = max(1, -(-taille // _LOGS_MORCEAU))
+            for i in range(total):
+                data = await asyncio.to_thread(
+                    _logs_lire_morceau, chemin, i * _LOGS_MORCEAU,
+                    min(_LOGS_MORCEAU, taille - i * _LOGS_MORCEAU))
+                await ws.send(json.dumps({
+                    "type": "logs_morceau", "req": req, "index": i,
+                    "total": total,
+                    "data": _b64.b64encode(data).decode("ascii")}))
+            await ws.send(json.dumps({
+                "type": "logs_fin", "req": req, "ok": True,
+                "taille": taille}))
+            _log(f"ADMIN : journal telecharge {source}/{nom} "
+                 f"({taille // 1024} Ko)", BLUE)
+        except Exception as e:
+            try:
+                await ws.send(json.dumps({
+                    "type": "logs_fin", "req": req, "ok": False,
+                    "raison": f"{type(e).__name__}"}))
+            except Exception:
+                pass
+
+
+_logs_verrous: dict = {}
 
 
 async def _admin_handle_cmd(ws, cmd: str, data: dict) -> tuple:
@@ -2827,6 +3563,133 @@ async def _admin_handle_cmd(ws, cmd: str, data: dict) -> tuple:
                 }))
             except Exception:
                 pass
+            return (True, "")
+
+        # --- Bannissements (compte Discord) --------------------------
+        #
+        # [BANS 22/09/2026] Le ban est porte par AccountStore (persiste,
+        # survit a la suppression de la fiche) et verifie a la liaison ET
+        # a chaque connexion (circusvoip_accounts_ws). Ici : poser, lever,
+        # lister -- et expulser tout de suite un banni connecte, sinon il
+        # resterait en jeu jusqu'a sa prochaine deconnexion.
+        if cmd == "bans_list":
+            if not _ACCOUNTS_ENABLED:
+                return (False, "comptes desactives sur ce serveur")
+            await ws.send(json.dumps({"type": "bans_list",
+                                      "bans": _accounts_ctx.store.bans()}))
+            return (True, "")
+
+        if cmd == "ban_account":
+            if not _ACCOUNTS_ENABLED:
+                return (False, "comptes desactives sur ce serveur")
+            did = str(data.get("discord_id", ""))
+            if not did:
+                return (False, "identifiant manquant")
+            entree = _accounts_ctx.store.ban(did, data.get("raison", ""))
+            if entree is None:
+                return (False, "compte introuvable")
+            _log(f"ADMIN : ban {entree.get('pseudo') or '?'} "
+                 f"({entree.get('numero')}, discord {did})"
+                 + (f" motif : {entree['raison']}" if entree.get("raison")
+                    else ""), ORANGE)
+            num = entree.get("numero")
+            for ws_c, info in list(clients.items()):
+                if num is not None and info.get("numero") == num:
+                    try:
+                        from circusvoip_accounts_ws import _message_ban
+                        await ws_c.send(json.dumps({
+                            "type": "account_error", "reason": "account_banned",
+                            "message": _message_ban(entree)}))
+                    except Exception:
+                        pass
+                    try:
+                        await ws_c.close(code=1008, reason="account_banned")
+                    except Exception:
+                        pass
+                    _log(f"ADMIN : {info.get('name')} expulse (banni)",
+                         ORANGE)
+            await _broadcast_admins(json.dumps({
+                "type": "bans_list", "bans": _accounts_ctx.store.bans()}))
+            return (True, "")
+
+        if cmd == "unban_account":
+            if not _ACCOUNTS_ENABLED:
+                return (False, "comptes desactives sur ce serveur")
+            did = str(data.get("discord_id", ""))
+            if not _accounts_ctx.store.unban(did):
+                return (False, "ce compte n'est pas banni")
+            _log(f"ADMIN : ban leve (discord {did})", ORANGE)
+            await _broadcast_admins(json.dumps({
+                "type": "bans_list", "bans": _accounts_ctx.store.bans()}))
+            return (True, "")
+
+        # --- Travail : moderation -----------------------------------
+        #
+        # [MODERATION 21/09/2026] Meme dispositif que les annonces. Une
+        # mission PRISE peut aussi etre retiree : l'executant perd son
+        # bandeau de mission en cours a la poussee d'etat qui suit.
+        if cmd == "travail_admin_list":
+            if not _TRAVAIL_ENABLED:
+                return (False, "app Travail desactivee sur ce serveur")
+            await ws.send(json.dumps({
+                "type": "travail_admin",
+                "missions": _travail_liste_admin(),
+            }))
+            return (True, "")
+
+        if cmd == "travail_admin_retirer":
+            if not _TRAVAIL_ENABLED:
+                return (False, "app Travail desactivee sur ce serveur")
+            mid = str(data.get("id", ""))
+            if not mid:
+                return (False, "identifiant manquant")
+            m = _travail_retirer_admin(mid)
+            if m is None:
+                return (False, "mission introuvable (deja retiree ?)")
+            _log(f"ADMIN : mission {mid} retiree (auteur {m.get('auteur')}"
+                 + (f", prise par {m.get('executant')}"
+                    if m.get("executant") else "") + ")", ORANGE)
+            # Tous ceux dont l'ecran montrait la mission : le metier
+            # recherche, l'auteur, et l'executant s'il y en avait un.
+            cibles = _travail_destinataires_de(m)
+            if m.get("executant"):
+                cibles.append(m["executant"])
+            try:
+                await _travail_pousser_etat(cibles)
+            except Exception as e:
+                _log(f"[TRAVAIL] poussee d'etat KO : {e!r}", ORANGE)
+            await _travail_pousser_admins()
+            return (True, "")
+
+        # --- Annonces : moderation ----------------------------------
+        #
+        # [ANNONCES 21/09/2026] Premier espace public en texte libre du
+        # projet : il faut pouvoir retirer une annonce sans attendre son
+        # expiration. L'admin voit l'AUTEUR (numero + pseudo), y compris
+        # d'une annonce publiee sans numero -- c'est tout l'objet de la
+        # moderation.
+        if cmd == "annonces_admin_list":
+            if not _ANNONCES_ENABLED:
+                return (False, "annonces desactivees sur ce serveur")
+            await ws.send(json.dumps({
+                "type": "annonces_admin",
+                "annonces": _annonces_liste_admin(),
+            }))
+            return (True, "")
+
+        if cmd == "annonces_admin_retirer":
+            if not _ANNONCES_ENABLED:
+                return (False, "annonces desactivees sur ce serveur")
+            aid = str(data.get("id", ""))
+            if not aid:
+                return (False, "identifiant manquant")
+            a = _annonces_store.retirer_admin(aid)
+            if a is None:
+                return (False, "annonce introuvable (deja retiree ?)")
+            _log(f"ADMIN : annonce {aid} retiree (auteur {a.get('auteur')})",
+                 ORANGE)
+            await _annonces_pousser_tous()
+            await _annonces_pousser_admins()
             return (True, "")
 
         # --- Urgence : designation des chefs -------------------------
@@ -2880,9 +3743,48 @@ async def _admin_handle_cmd(ws, cmd: str, data: dict) -> tuple:
             except Exception as e:
                 return (False, str(e))
             try:
-                _accounts_ctx.store.set_chef(did, role)
+                _res_chef = _accounts_ctx.store.set_chef(did, role)
             except Exception as e:
                 return (False, f"designation : {e}")
+
+            # [28/08/2026] L'ANCIEN chef quitte le service.
+            #
+            # set_chef lui a deja retire son role dans l'annuaire, qui est
+            # sur disque. Mais le registre de service vit en RAM : sans ce
+            # retrait, il resterait compte parmi les disponibles, et
+            # quelqu_un_dispo() autoriserait une victime a declencher une
+            # balise que plus personne ne recevrait.
+            #
+            # Trois populations sont a prevenir, pas une :
+            #   - l'ancien chef, dont l'ecran garde ses onglets de chef
+            #     jusqu'a ce qu'un etat lui arrive ;
+            #   - les victimes dont il relachait le signal, sinon leur
+            #     ecran annonce encore que quelqu'un vient ;
+            #   - rien pour un ancien chef DECONNECTE : il n'est ni en
+            #     service ni joignable, et il reviendra sans role ni
+            #     drapeau puisque l'annuaire est deja a jour.
+            try:
+                if _URGENCE_ENABLED:
+                    _a_prevenir_chef = []
+                    for _anc in (_res_chef or {}).get("_anciens") or []:
+                        _num_anc = _anc.get("numero")
+                        if not _num_anc:
+                            continue
+                        _a_prevenir_chef += _urgence_store.quitter_service(
+                            _num_anc)
+                        _a_prevenir_chef.append(str(_num_anc))
+                        # Les collegues restes en service, sinon la
+                        # demande que l'ancien chef vient de relacher
+                        # resterait affichee comme PRISE dans leur liste
+                        # et personne ne la reprendrait. Meme raison que
+                        # dans le chemin "je quitte mon service".
+                        _a_prevenir_chef += _urgence_collegues(
+                            role, _num_anc)
+                    if _a_prevenir_chef:
+                        await _urgence_pousser_etat(_a_prevenir_chef)
+            except Exception as e:
+                _log(f"[URGENCE] retrait de l'ancien chef KO : {e!r}",
+                     ORANGE)
 
             # Le nouveau chef est en service DE FAIT, mais seulement s'il
             # est connecte : le registre de service vit en RAM et suit la
@@ -3002,6 +3904,68 @@ async def _admin_handle_cmd(ws, cmd: str, data: dict) -> tuple:
                 pass
             _log(f"ADMIN : kick {pname}", ORANGE)
             return (True, "")
+        # --- Journaux : liste et telechargement ----------------------
+        if cmd == "logs_list":
+            await ws.send(json.dumps({"type": "logs_list",
+                                      "fichiers": _logs_lister()}))
+            return (True, "")
+
+        if cmd == "logs_get":
+            req = str(data.get("req") or "")
+            if not req:
+                return (False, "identifiant de demande manquant")
+            asyncio.create_task(_logs_envoyer(
+                ws, req, data.get("source"), data.get("nom")))
+            return (True, "")
+
+        if cmd == "restart_server":
+            # [ADMIN 07/09/2026] Redemarrage demande depuis l'interface.
+            #
+            # Le serveur ne se relance pas lui-meme : il SORT, et
+            # systemd le relance -- l'unite porte Restart=always et
+            # RestartSec=5 (cf. INSTALL_SERVEUR.md). C'est ce qui permet
+            # d'offrir "redemarrer" sans agent supplementaire sur le VPS,
+            # sans regle sudoers et sans port ouvert de plus.
+            #
+            # Consequence a assumer : on ne peut PAS offrir "arreter"
+            # par ce chemin, systemd relancerait aussitot. Et
+            # "demarrer" est impossible par construction -- l'admin
+            # parle au serveur VIA le serveur.
+            #
+            # Delai avant la sortie : le temps que l'avis parvienne aux
+            # joueurs ET que la reponse admin parte. Couper d'abord
+            # laisserait tout le monde devant une deconnexion sans
+            # explication.
+            if not _loop:
+                return (False, "boucle indisponible")
+            _log("ADMIN : redemarrage demande", ORANGE)
+            try:
+                await _broadcast_all(json.dumps({
+                    "type": "server_restart",
+                    "delai": _RESTART_DELAI_S,
+                }))
+            except Exception:
+                pass
+
+            async def _sortir():
+                await asyncio.sleep(_RESTART_DELAI_S)
+                _log("ADMIN : redemarrage, sortie du processus", ORANGE)
+                try:
+                    global _debug_log_fp
+                    if _debug_log_fp:
+                        _debug_log_fp.flush()
+                        _debug_log_fp.close()
+                        _debug_log_fp = None
+                except Exception:
+                    pass
+                # os._exit et non sys.exit : on veut sortir MEME si un
+                # thread non-daemon traine, sinon systemd attendrait son
+                # timeout avant de relancer. Le journal est deja ferme
+                # au-dessus, rien n'est perdu.
+                os._exit(0)
+
+            asyncio.ensure_future(_sortir())
+            return (True, "")
         if cmd == "set_server_token":
             new_t = data.get("token", "").strip()
             if not new_t:
@@ -3010,8 +3974,34 @@ async def _admin_handle_cmd(ws, cmd: str, data: dict) -> tuple:
             try:
                 set_password(new_t)
                 SERVER_TOKEN = new_t
+                # [CORRECTIF 08/09/2026] _AccountsContext garde SA PROPRE
+                # copie du token, recue une fois a la construction. Sans
+                # cette ligne, changer le mot de passe depuis l'admin
+                # laissait la liaison Discord comparer a l'ANCIENNE
+                # valeur : le nouveau mot de passe etait refuse avec
+                # "Token serveur invalide", et l'ancien -- qu'on croyait
+                # revoque -- continuait de marcher.
+                #
+                # Une donnee en double dont une seule copie bougeait. La
+                # remettre a jour ici est le minimum ; a terme, le
+                # contexte devrait lire le token plutot que le copier.
+                try:
+                    if _accounts_ctx is not None:
+                        _accounts_ctx.server_token = new_t
+                except Exception as e:
+                    _log(f"ADMIN : contexte comptes non synchronise : {e!r}",
+                         ORANGE)
                 # [P5] On log uniquement le fait qu'il a change, pas la valeur.
                 _log(f"ADMIN : token serveur change ({_masked(new_t)})", BLUE)
+                # [08/09/2026] Repousser la NOUVELLE valeur aux admins.
+                # Sans ca, le token n'etait envoye que dans admin_welcome :
+                # apres une modification, l'interface continuait d'afficher
+                # l'ancienne valeur jusqu'a la reconnexion -- on croyait la
+                # modification perdue alors qu'elle avait bien eu lieu.
+                await _broadcast_admins(json.dumps({
+                    "type": "server_token",
+                    "server_token": SERVER_TOKEN,
+                }))
                 return (True, "")
             except Exception as e:
                 return (False, f"echec : {e}")
@@ -3824,6 +4814,33 @@ async def handler(ws):
                             "ts":     ts,
                         })
 
+            elif msg_type == "debug_log":
+                # [LOGS JOUEURS 24/08/2026] Journal remonte a la fermeture
+                # du client, ou envoye a la demande (bouton, 22/09/2026).
+                # Nombre et cadence bornes : cf. _JOUEUR_LOG_RECU.
+                #
+                # Pas d'accuse de reception : le client ferme, il n'ecoute
+                # deja plus. Lui repondre ferait une trame perdue et
+                # laisserait croire, en lisant le code, qu'il attend
+                # quelque chose.
+                _n_lg = _JOUEUR_LOG_RECU.get(ws, 0)
+                _ok_lg = (ws in clients
+                          and _n_lg < _JOUEUR_LOG_MAX_PAR_CONNEXION)
+                if ws in clients and not _ok_lg:
+                    _log(f"[LOGS JOUEURS] {clients[ws].get('name') or '?'} : "
+                         f"envoi refuse ({_n_lg} deja recu(s) sur cette "
+                         f"connexion)", ORANGE)
+                if _ok_lg:
+                    _JOUEUR_LOG_RECU[ws] = _n_lg + 1
+                    _pseudo_lg = clients[ws].get("name") or "?"
+                    _chemin_lg = _journal_joueur_ecrire(
+                        _pseudo_lg,
+                        data.get("fichier"),
+                        data.get("donnees"))
+                    if _chemin_lg:
+                        _log(f"[LOGS JOUEURS] {_pseudo_lg} -> "
+                             f"{_chemin_lg}", BLUE)
+
             elif msg_type and msg_type.startswith("groupe_"):
                 # [GROUPES 19/08/2026] Point d'entree unique, meme raison
                 # que pour travail_* et urgence_*.
@@ -3838,6 +4855,12 @@ async def handler(ws):
                 # ecran perime sans que rien ne casse de visible.
                 if ws in clients:
                     await _urgence_handle(ws, msg_type, data)
+
+            elif msg_type and msg_type.startswith("annonces_"):
+                # [ANNONCES 21/09/2026] Point d'entree unique, meme raison
+                # que pour travail_*.
+                if ws in clients:
+                    await _annonces_handle(ws, msg_type, data)
 
             elif msg_type and msg_type.startswith("travail_"):
                 # [TRAVAIL 10/08/2026] Toutes les trames de l'app Travail
@@ -4175,6 +5198,7 @@ async def handler(ws):
             if _leaving and _leaving.get("audio_ticket"):
                 _auth_registry.revoke(_leaving["audio_ticket"])
             clients.pop(ws)
+            _JOUEUR_LOG_RECU.pop(ws, None)   # [LOGS JOUEURS 24/08/2026]
             _log(f"LEAVE : {name}  ({len(clients)} connecté(s))", ORANGE)
             if _ui:
                 _ui.remove_player(name)

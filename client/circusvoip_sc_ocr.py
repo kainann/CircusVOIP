@@ -650,6 +650,23 @@ _KNOWN_ZONES_SHIPS = [
     # chez Kainan : "drak_tronclad" (i<->t, rattrapee a distance 0 avec
     # l'equivalence l/t/i existante).
     "drak_ironclad",
+    # Drake Ironclad Assault — variante distincte, observee 28/08/2026 en
+    # Pyro ("DRAK_Ironclad_Assault_793865919501", 2728 lectures sur trois
+    # joueurs). Entree PROPRE et non alias de "drak_ironclad" : ce sont
+    # deux vaisseaux differents, au meme titre que les variantes de
+    # Cutlass. Le fuzzy ne pouvait pas rattraper -- 21 chars donnent un
+    # seuil de 3 et l'ecart avec "drak_ironclad" vaut 8 insertions.
+    #
+    # Sans cette entree, les 14 graphies observees (a5sault, assaglt,
+    # assaule, assaultu, orak_, rak_, dfsk_...) repartaient BRUTES au
+    # serveur, chacune avec son propre cid name:. Consequence mesuree le
+    # 28/08 : deux joueurs du meme vaisseau ne partageaient aucun
+    # container, distance_detail() ne trouvait pas de repere commun et
+    # l'app Urgence affichait "Pas de distance" -- le repli SolarSystem
+    # etant bloque a dessein en orbite de Pyro 4.
+    #
+    # Verifie apres ajout : 10 des 14 graphies se canonicalisent.
+    "drak_ironclad_assault",
     "drak_vulture",
     # DRAK ships vus en test 09/05/2026 (showroom A18)
     "drak_mule",             # Mule (cargo leger, hover)
@@ -1375,6 +1392,65 @@ _RE_LAGRANGE_BRUT = re.compile(
     re.IGNORECASE)
 
 
+_FAMILLES_NUMEROTEES = (
+    # (mots attendus, motif de decoupe)
+    #
+    # bunker_013_cave_int_001 : avant-postes souterrains de Pyro. Deux
+    # numeros variables, trois mots fixes.
+    (("bunker", "cave", "int"),
+     re.compile(r"^([a-z]{4,8})[_-](\d{1,4})[_-]([a-z]{3,6})"
+                r"[_-]([a-z]{2,5})[_-]?(\d{1,4})?$")),
+)
+
+
+def _reparer_famille_numerotee(nom: str):
+    """Reconstruit un nom de la forme "mot_NNN_mot_mot_NNN".
+
+    [31/08/2026] Les bunkers ne peuvent pas entrer dans la whitelist : il
+    y en a des dizaines, numerotes, et lister chaque combinaison serait
+    intenable. Mais leur SQUELETTE est fixe -- "bunker", "cave", "int" --
+    et c'est lui que l'OCR abime.
+
+    Observe le 31/08 dans un seul bunker, sur 26 lectures : la forme
+    correcte 20 fois, et SIX graphies parasites (buiker_, _nt_, _iht_,
+    tronquee, et deux chiffres faux). Chacune produisait son propre
+    container : deux joueurs dans le meme bunker ne se voyaient pas au
+    meme endroit.
+
+    On repare les MOTS, jamais les CHIFFRES. "018" au lieu de "013" est
+    un numero de bunker parfaitement plausible : le corriger reviendrait
+    a deplacer le joueur dans un autre lieu reel. Le bruit sur les
+    chiffres est laisse a la zone collante, qui rattache une lecture
+    inconnue proche de la precedente -- et qui continue de s'appliquer
+    ici, puisqu'un nom reconstruit par motif n'entre pas dans
+    _KNOWN_ZONES.
+
+    Rend None si le nom ne ressemble a aucune famille connue : on ne
+    fabrique jamais un nom a partir de rien.
+    """
+    if not nom:
+        return None
+    for mots, motif in _FAMILLES_NUMEROTEES:
+        m = motif.match(nom)
+        if not m:
+            continue
+        groupes = m.groups()
+        lus = (groupes[0], groupes[2], groupes[3])
+        # Chaque mot doit etre RECONNAISSABLE. Le seuil suit la longueur :
+        # une erreur sur "int" (3 lettres) est deja beaucoup, trois sur
+        # "bunker" ne le sont pas -- c'est ce qui laisse "ouflke" dehors,
+        # et c'est voulu : a ce niveau de degradation on devinerait.
+        for lu, attendu in zip(lus, mots):
+            seuil = 1 if len(attendu) <= 4 else 2
+            if _ocr_distance(lu, attendu) > seuil:
+                break
+        else:
+            num1, num2 = groupes[1], groupes[4]
+            base = f"{mots[0]}_{num1}_{mots[1]}_{mots[2]}"
+            return f"{base}_{num2}" if num2 else base
+    return None
+
+
 def _correct_ocr_zone_impl(name: str) -> str:
     """Implementation sans cache (voir _correct_ocr_zone)."""
     # Match exact direct (cas le plus frequent : zone deja canonique)
@@ -1487,6 +1563,11 @@ def _correct_ocr_zone_impl(name: str) -> str:
                         best_zone = z
     if best_zone is not None:
         return best_zone
+
+    # --- Step 3 : reconstruction par MOTIF (familles numerotees) ---
+    famille = _reparer_famille_numerotee(normalized or name)
+    if famille:
+        return famille
 
     # Aucun match fuzzy : retourner le nom NORMALISE (separateurs uniformises)
     # plutot que le nom brut. Ainsi "Hangar MediumFront Rest Nyx" devient
@@ -3408,6 +3489,27 @@ def _normalize_numbers(text: str) -> str:
     text = re.sub(r"(?<=\d)[oQ](?=\d)", "0", text)
     # Q en debut de nombre apres espace (ex: "0 Q0m" -> "0 00m")
     text = re.sub(r"(?<=\s)Q(?=\d)", "0", text)
+    # [CORRECTIF 24/08/2026] O/o/Q ISOLE devant l'unite, precede d'une
+    # ESPACE : "5 Om" -> "5 0m".
+    #
+    # La regle (?<=\d)[oOQ](?=m|k) ci-dessus exige un chiffre COLLE a
+    # gauche. Or EasyOCR coupe frequemment "50m" en "5 Om" -- le zero
+    # devient un O ET un espace s'insere. Le O n'a alors plus de chiffre
+    # a sa gauche immediate et la regle ne mordait pas.
+    #
+    # Consequence observee le 24/08/2026 : "-1 1 5 Om 6 1 24m -113 75m"
+    # au lieu de "-1 1 52m 6 1 24m -113 1 75m". Le parser prend les trois
+    # premiers nombres et rend x=-1 y=1 z=5 au lieu de z=-113,175.
+    #
+    # C'est le pire mode de panne possible pour la garde anti-saut : la
+    # valeur fausse est TOUJOURS LA MEME (-1,1,5), donc trois lectures
+    # consecutives "convergent" et [AXIS JUMP CONVERGE] finit par
+    # basculer dessus -- la proximite verticale s'effondre et la voix
+    # passe pendant quelques secondes, jusqu'a ce qu'il rebascule.
+    #
+    # La garde exige un CHIFFRE avant l'espace : "Zone: Orison" n'est
+    # jamais touche, le O n'y est precede que de lettres ou d'espaces.
+    text = re.sub(r"(?<=\d)\s+[oOQ](?=m|k)", "0", text)
     # l   1 dans les nombres (ex: 546.268lkm   546.2681km, "5lm" -> "51m")
     text = re.sub(r"(?<=\d)l(?=\d|k|m)", "1", text)
     text = re.sub(r"(?<=\d)l(?=\b)", "1", text)
@@ -3478,6 +3580,26 @@ def _normalize_numbers(text: str) -> str:
     # a la casse selon le rendu du HUD). Sans cette extension, "18 76M" reste
     # tel quel et le parser interprete "18" et "76" comme 2 nombres separes
     # -> bug "x=18 y=76 z=-18" au lieu de "x=18.76 y=-18.46 z=-114".
+    # [28/08/2026] Separateur decimal lu comme un CHIFFRE, en km.
+    #
+    # "-236 3 4621km" vaut -236.4621 km, pas -236 puis 3.4621. La virgule
+    # du HUD est un trait fin que l'OCR rend en chiffre : '1' dans 1002
+    # cas sur 1097, puis '3', '0', '7'. Confirme par 363 correspondances
+    # avec une lecture voisine propre portant les MEMES quatre decimales
+    # ("-17 1 7997" <-> "-17.7997", "-38 1 0660" <-> "-38.0660").
+    #
+    # Sans cette regle, la ligne suivante recolle "3 4621km" en
+    # "3.4621km" et laisse "-236" seul : le triplet se decale d'un cran
+    # et la troisieme coordonnee est jetee. C'etait 716 des 814 lectures
+    # encore fausses apres la reparation des decimales, soit la cause
+    # DOMINANTE une fois les lettres traitees.
+    #
+    # Verrouille sur trois conditions simultanees, sinon elle avalerait
+    # des coordonnees legitimes : exactement UN chiffre isole, exactement
+    # QUATRE decimales derriere, et le suffixe km. L'affichage planetaire
+    # de SC n'en donne jamais cinq, et les coordonnees en metres des
+    # interieurs n'ont pas ce format.
+    text = re.sub(r"(-?\d+)\s+\d\s+(\d{4})\s*(k[mM])\b", r"\1.\2\3", text)
     text = re.sub(r"(\d+)\s+(\d)\s+(\d)\s+(\d{1,2})(m|M|km|kM)\b", r"\1.\2\3\4\5", text)
     text = re.sub(r"(\d+)\s+(\d{1,2})\s+(\d{1,2})(m|M|km|kM)\b",  r"\1.\2\3\4",   text)
     text = re.sub(r"(\d+)\s+(\d{1,4})(m|M|km|kM)\b",              r"\1.\2\3",     text)
@@ -3525,6 +3647,78 @@ def _normalize_numbers(text: str) -> str:
         s = m.group(0)
         return s.translate(str.maketrans("oOQlI", "00011"))
     text = re.sub(r"\b[\d.oOQlI]*\d[\d.oOQlI]*(?:km|m)\b", _fix_mixed_number, text)
+
+    # ============================================================
+    # ETAPE 2 ter : decimales de km abimees  (Pyro, 28/08/2026)
+    # ============================================================
+    # En Pyro, l'affichage passe en km avec QUATRE decimales
+    # ("-97.4531km"). Ces chiffres sont les plus petits glyphes du HUD, et
+    # EasyOCR y depose regulierement une lettre. Sur 7601 lectures reelles
+    # du 28/08, 314 nombres etaient touches.
+    #
+    # Le degat ne vient pas de la lettre elle-meme : il vient de ce qu'elle
+    # COUPE le nombre en deux. Le morceau de gauche perd son suffixe km et
+    # repart en metres, le morceau de droite devient un nombre de plus, et
+    # le triplet se decale.
+    #
+    #   "194,65g0km"  -> z = 195 m       au lieu de 194 650 m
+    #   "-97 450gkm"  -> y = -97, z = 450  (la 4e valeur est jetee)
+    #
+    # Deux traitements, selon ce que le caractere vaut vraiment. Verifie en
+    # comparant chaque lecture abimee aux lectures voisines immediates, ou
+    # les autres decimales concordent :
+    #
+    #   '#' -> '4'  dans 100 % des cas (15 correspondances)
+    #   'S' -> '5'  dans  89 % (19)
+    #   'o' -> '0'  dans  88 % (66)  -- deja traite juste au-dessus
+    #
+    #   'g' -> '9'  dans 24 % SEULEMENT (208 correspondances, reparties sur
+    #               les dix chiffres). Ce n'est pas une confusion de forme :
+    #               c'est le marqueur d'un glyphe illisible. Le substituer
+    #               serait faux trois fois sur quatre.
+    #
+    # Pour tout ce qui n'est pas fiable, on TRONQUE au premier caractere
+    # illisible au lieu de deviner. Une decimale de km vaut 100 m, la
+    # deuxieme 10 m, la troisieme 1 m : 82 % des atteintes tombent en 3e ou
+    # 4e position, ou la troncature coute au plus 10 m. A comparer aux
+    # 194 480 m d'erreur que produit le decoupage actuel.
+    #
+    # En dessous de deux decimales sures, on ne tronque PAS : on efface le
+    # nombre. Le parser ne trouve alors que deux coordonnees et rejette la
+    # lecture entiere -- un rejet coute un cycle d'un demi-tour, une
+    # position fausse contamine la proximite audio et les balises.
+    _DEC_FIABLES = str.maketrans("#SoO", "4500")
+
+    def _reparer_decimales_km(m):
+        entier, dec = m.group(1), m.group(2)
+        dec = dec.translate(_DEC_FIABLES)
+        if dec.isdigit():
+            return f"{entier}.{dec}km"
+        sures = re.match(r"\d*", dec).group(0)
+        if len(sures) >= 2:
+            return f"{entier}.{sures}km"
+        # Effacement : aucun chiffre ne doit subsister, sinon le parser
+        # le prendrait pour une coordonnee et decalerait le triplet.
+        return "?"
+
+    # Le separateur peut etre un point, une virgule, un ESPACE, ou deux
+    # d'affilee ("-97,.4536km") : quand les decimales contiennent une
+    # lettre, les regles de reconstitution plus haut ne s'appliquent pas
+    # -- elles exigent toutes des chiffres. C'est pour ca que le motif
+    # accepte ici ce qu'elles auraient normalise.
+    #
+    # L'unite est acceptee dans TOUTES ses variantes OCR (kM, kI, k0, ki,
+    # kU...) et reecrite en "km". La normalisation d'unite plus haut ne
+    # peut pas s'en charger : elle exige des chiffres propres juste avant
+    # le "k", ce qui n'est jamais le cas quand la derniere decimale est
+    # abimee. Chacune attendait l'autre, et "194.665gkM" passait entre les
+    # deux.
+    text = re.sub(r"(\d)\s*[.,]\s*[.,]\s*(\d)", r"\1.\2", text)
+    text = re.sub(
+        r"(-?\d+)[.,\s]{1,3}(\d[0-9a-zA-Z_#/*]{0,5}?)"
+        r"k[mMNuUiIlLjJDd0-9]{0,3}(?![0-9a-zA-Z])",
+        _reparer_decimales_km, text)
+
     # Corriger "808 , 4524km"   "808.4524km" (espace + virgule OCR)
     text = re.sub(r"(\d)\s*,\s*(\d{4}k)", r"\1.\2", text)
     # Corriger "808 . 4524km"   "808.4524km" (espace + point OCR)
@@ -3537,9 +3731,27 @@ def _normalize_numbers(text: str) -> str:
     # en points. Les cas d'espaces entre coords sont deja geres par la regle
     # "(\d+)\s+(\d{1,3})(m|km)\b" plus haut qui requiert l'unite m/km derriere.
     text = re.sub(r'(\d)["\u00b0\u00ae\u00a9|!]{1,3}(\d)', r'\1.\2', text)
-    text = re.sub(r"(\d)-(\d{3,})", r"\1.\2", text)
+    # [NOMS 03/09/2026] Les deux regles ci-dessous s'appliquaient a TOUTE
+    # la ligne, nom de zone compris, sans garde d'unite. Un nom comme
+    # "glaciemring_segment_mission_genrl_002-007" devenait "..._002.007" ;
+    # le groupe <n> de _PAT_FIRST_CONTAINER n'accepte pas le point, le
+    # motif n'atteignait plus "Pos:" et le container N'ETAIT JAMAIS LU --
+    # ni par la boucle principale (proximite audio), ni par la capture de
+    # hierarchie (balise). Constate le 03/09 sur une mission Nyx : balise
+    # partie sans container, "Position inconnue", HUD pourtant net.
+    #
+    # Le commentaire de la regle des parasites, plus haut, dit deja qu'il
+    # ne faut pas toucher aux chiffres a l'interieur d'un nom de zone ;
+    # ces deux regles avaient ete ajoutees sans le meme garde. On exige
+    # maintenant une unite (m/km) juste derriere, comme les autres regles
+    # de reconstitution decimale : un tiret ou un underscore entre
+    # chiffres n'est un separateur decimal perdu que dans une coordonnee.
+    # Le second groupe s'arrete a l'unite : "002-007 Pos" n'a pas d'unite,
+    # "808-4524km" en a une. "M" majuscule accepte : les regles des
+    # decimales eclatees, plus haut, le tolerent encore a ce stade.
+    text = re.sub(r"(\d)-(\d{3,})(?=\s*k?[mM]\b)", r"\1.\2", text)
     # Underscore parasite OCR entre 2 nombres (ex: "97 _ 72m" -> "97.72m")
-    text = re.sub(r"(\d)\s*_\s*(\d)", r"\1.\2", text)
+    text = re.sub(r"(\d)\s*_\s*(\d+)(?=\s*k?[mM]\b)", r"\1.\2", text)
     # Supprimer les espaces dans les grands nombres (km, solar system coords)
     # IMPORTANT : on ne touche PAS aux coords en m pour eviter "1085 1.47m" -> "10851.47m"
     # Applique uniquement aux nombres qui finissent par "km" (coordonnees solar system).
@@ -5187,6 +5399,7 @@ def _hier_lire_une_fois(region: dict, lignes: int) -> dict:
     text = "\n".join(r.get("texts") or [])
 
     chaine, systeme, rates = [], None, 0
+    systeme_illisible = False
     for seg in _hier_decouper(text):
         # [URGENCE 12/08/2026] Le systeme est reconnu sur le TEXTE du
         # segment, avant tout parsing. Sans ca, une ligne SolarSystem
@@ -5200,10 +5413,28 @@ def _hier_lire_une_fois(region: dict, lignes: int) -> dict:
         d = _hier_parser_segment(seg)
         if d is None:
             if texte_systeme:
-                # Sans coordonnees systeme il n'y a pas de referentiel
-                # commun, donc pas de distance : inutile de continuer.
+                # [28/08/2026] N'est plus compte dans `unparsed`.
+                #
+                # Les deux illisibilites n'ont pas la meme gravite. Un
+                # niveau INTERMEDIAIRE manquant ampute la chaine en
+                # silence : la position devient fausse sans que rien ne
+                # le dise. La ligne SolarSystem, elle, ne sert qu'au
+                # repli orbital -- si un container commun a ete lu, la
+                # distance se calcule sans elle.
+                #
+                # Les confondre coutait cher : le 28/08, un joueur a
+                # enchaine ONZE echecs de balise alors que sa ligne
+                # "pyro4" etait lue correctement a chaque essai. Seule
+                # la ligne SolarSystem echouait, sur un ecran ou le
+                # chiffre 1 des grands nombres sort en tiret
+                # ("-3704-01.3527" pour "-3704101.3527"), ce qui
+                # declenche la garde du separateur decimal double.
+                #
+                # On note l'echec et on s'arrete la -- SolarSystem est le
+                # dernier niveau utile -- mais la chaine deja lue reste
+                # valable.
                 _logger("[HIERARCHIE] ligne SolarSystem illisible")
-                rates += 1
+                systeme_illisible = True
                 break
             # Un niveau illisible n'est PAS ignore en silence : il
             # changerait la chaine sans que rien ne le signale. On le
@@ -5227,7 +5458,32 @@ def _hier_lire_une_fois(region: dict, lignes: int) -> dict:
         chaine.append(d)
 
     return {"chain": chaine, "system": systeme,
-            "unparsed": rates, "raw": text}
+            "unparsed": rates, "systeme_illisible": systeme_illisible,
+            "raw": text}
+
+
+def _hier_repere_utilisable(a: dict) -> bool:
+    """Cette lecture porte-t-elle DE QUOI calculer une distance ?
+
+    [28/08/2026] Remplace l'exigence « SolarSystem obligatoire ».
+
+    Deux situations donnent un repere exploitable, et il faut les deux :
+
+      - un CONTAINER commun : deux joueurs dans le meme vaisseau, la
+        meme station, ou en orbite de la meme planete se comparent sur
+        ce niveau, avec ses coordonnees locales. C'est le cas courant au
+        sol, et il n'a aucun besoin du systeme.
+
+      - les coordonnees SYSTEME seules : une balise en plein vide, sans
+        planete ni vaisseau autour, n'a que ce referentiel. Exiger un
+        container la refuserait.
+
+    Une lecture sans ni l'un ni l'autre ne permet aucune comparaison :
+    elle est refusee, comme avant.
+    """
+    if not a:
+        return False
+    return bool(a.get("system")) or bool(a.get("chain"))
 
 
 def _hier_proches(a, b, tol) -> bool:
@@ -5272,8 +5528,16 @@ def _hier_concordent(a: dict, b: dict, tol_local: float,
             if not _hier_proches(na.get(axe), nb.get(axe), tol_local):
                 return False
     sa, sb = a.get("system"), b.get("system")
-    if not sa or not sb:
+    # [28/08/2026] L'absence de coordonnees systeme ne disqualifie plus
+    # la concordance, A CONDITION que les deux lectures soient d'accord
+    # sur ce point et qu'il reste un repere.
+    #
+    # Une seule des deux lectures avec systeme signale un OCR instable
+    # sur cette ligne : on refuse, comme pour un nom qui change.
+    if bool(sa) != bool(sb):
         return False
+    if not sa:
+        return _hier_repere_utilisable(a)
     for axe in ("x", "y", "z"):
         if not _hier_proches(sa.get(axe), sb.get(axe), tol_systeme):
             return False
@@ -5378,9 +5642,13 @@ def capture_hierarchy(region: dict, lines: int = 8, attempts: int = 3,
                 continue
         else:
             # Lecture unique : on verifie seulement qu'elle est COMPLETE.
-            # Un niveau illisible amputerait la chaine sans que rien ne le
-            # signale, et l'absence de SolarSystem interdit tout repli.
-            if a.get("unparsed") or not a.get("system"):
+            # Un niveau intermediaire illisible amputerait la chaine sans
+            # que rien ne le signale -- d'ou le refus sur `unparsed`.
+            #
+            # [28/08/2026] En revanche l'absence de SolarSystem ne suffit
+            # plus a refuser : un container commun est un repere valable
+            # a lui seul. Seule une lecture SANS aucun repere est jetee.
+            if a.get("unparsed") or not _hier_repere_utilisable(a):
                 _logger(f"[HIERARCHIE] essai {essai} : lecture incomplete, "
                         f"on refait")
                 continue

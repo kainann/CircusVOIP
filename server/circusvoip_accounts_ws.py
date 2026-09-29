@@ -209,6 +209,17 @@ def handle(msg_type: str, data: dict, ctx: AccountsContext,
                 # une usurpation de compte de service.
                 return _err("discord_failed", "Identifiant Discord invalide.")
 
+            # [BANS 22/09/2026] Refus des la liaison, avant de creer ou
+            # de reemettre un jeton. Sinon un banni recevrait un jeton
+            # neuf, puis un refus a la connexion -- deux messages pour
+            # une seule decision, et le premier laisserait croire que
+            # c'est reparti.
+            _ban = ctx.store.is_banned(did)
+            if _ban:
+                ctx.log(f"[BANS] liaison refusee : {did} "
+                        f"({_ban.get('pseudo') or '?'}) ({peer_ip})")
+                return _err("account_banned", _message_ban(_ban))
+
             # Constate AVANT la creation : deduire "le compte existait"
             # d'une comparaison de timestamps serait fragile (deux appels
             # a time.time() a la creation ne rendent pas la meme valeur).
@@ -244,6 +255,22 @@ def handle(msg_type: str, data: dict, ctx: AccountsContext,
     return None
 
 
+def _message_ban(entree: dict) -> str:
+    """Texte montre au joueur banni. Le motif n'est donne que s'il a ete
+    saisi : un « Motif : » vide ferait croire a un oubli.
+
+    La raison technique est « account_banned », PAS « banned » : ce
+    dernier est deja le motif de fermeture du verrouillage anti-force-
+    brute (IP bloquee quelques minutes), et le client le traduit par
+    « temporairement bloque ». Constate au premier test du 22/09 : un
+    ban definitif affiche comme temporaire."""
+    raison = str((entree or {}).get("raison") or "").strip()
+    msg = "Vous avez été banni de ce serveur."
+    if raison:
+        msg += f" Motif : {raison}"
+    return msg
+
+
 def _validate(pseudo: str) -> str:
     from circusvoip_accounts import validate_pseudo
     return validate_pseudo(pseudo)
@@ -276,6 +303,13 @@ def authenticate_join(data: dict, ctx: AccountsContext) -> tuple[dict | None, di
         return None, _err(
             "account_unknown",
             "Compte inconnu ou jeton perime. Reliez votre compte Discord.")
+
+    # [BANS 22/09/2026] Avant TOUT le reste -- rotation de jeton,
+    # renommage, attribution de numero : un banni n'obtient rien, pas
+    # meme un jeton frais.
+    _ban = ctx.store.is_banned(acc.get("discord_id"))
+    if _ban:
+        return None, _err("account_banned", _message_ban(_ban))
 
     # [ROTATION 05/08/2026] Journal OBLIGATOIRE de la tolerance. Accepter
     # un ancien jeton sans le dire serait un repli silencieux (§5 ter,
@@ -359,6 +393,19 @@ def _join_ok(acc: dict, ctx: AccountsContext) -> dict:
     copie, mais la convention rend l'intention lisible pour la suite.
     """
     acc = _with_numero(acc, ctx)
+
+    # [ANNUAIRE 07/09/2026] Horodatage de la connexion. Ici pour la meme
+    # raison que la rotation ci-dessous : c'est le seul point par lequel
+    # passent les trois chemins de succes de authenticate_join.
+    #
+    # Best-effort : une fiche qu'on n'arrive pas a horodater ne doit pas
+    # empecher le joueur d'entrer. L'annuaire est un confort
+    # d'administration, la connexion est le service.
+    try:
+        ctx.store.marquer_connexion(acc["discord_id"])
+    except Exception as e:
+        print(f"[ANNUAIRE] Horodatage de connexion impossible pour "
+              f"discord_id={acc.get('discord_id')} : {e!r}", flush=True)
 
     # [ROTATION 11/08/2026] ROTATION NEUTRALISEE.
     #

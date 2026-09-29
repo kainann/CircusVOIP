@@ -177,12 +177,28 @@ class AccountStore:
     premiere apres un plantage ou une edition manuelle du fichier.
     """
 
-    def __init__(self, path: Path | str | None = None):
+    def __init__(self, path: Path | str | None = None, on_change=None):
         self._path = Path(path) if path else _DEFAULT_PATH
         self._lock = threading.RLock()
         self._accounts: dict[str, dict] = {}
+        # [BANS 22/09/2026] Bannissements, par discord_id. HORS des fiches :
+        # supprimer la fiche d'un joueur banni (bouton X de l'annuaire)
+        # ne doit pas lever son ban -- il se relierait avec le meme compte
+        # Discord et rentrerait. Cf. ban().
+        self._bans: dict[str, dict] = {}
         self._idx_pseudo: dict[str, str] = {}
         self._idx_numero: dict[int, str] = {}
+        # [ANNUAIRE 07/09/2026] Appele APRES chaque ecriture. Sert au
+        # serveur a repousser l'annuaire aux admins connectes, pour que
+        # leur vue ne puisse pas diverger.
+        #
+        # Pose ICI et pas sur chaque mutation : les 17 methodes qui
+        # modifient l'annuaire passent TOUTES par _save(). Un crochet par
+        # mutation serait un contrat optionnel -- il suffirait qu'un
+        # ajout futur oublie de l'appeler pour que la diffusion cesse en
+        # silence sur ce cas-la. Ici, on ne peut pas modifier l'annuaire
+        # sans notifier.
+        self._on_change = on_change
         self._load()
 
     # --- persistance -------------------------------------------------
@@ -190,6 +206,7 @@ class AccountStore:
     def _load(self):
         with self._lock:
             self._accounts = {}
+            self._bans = {}
             if self._path.exists():
                 try:
                     raw = json.loads(self._path.read_text(encoding="utf-8"))
@@ -197,6 +214,13 @@ class AccountStore:
                     if isinstance(accounts, dict):
                         self._accounts = {
                             str(k): v for k, v in accounts.items()
+                            if isinstance(v, dict)
+                        }
+                    # Absent d'un fichier anterieur au 22/09 : aucun ban.
+                    bans = raw.get("bans", {})
+                    if isinstance(bans, dict):
+                        self._bans = {
+                            str(k): v for k, v in bans.items()
                             if isinstance(v, dict)
                         }
                 except Exception as e:
@@ -229,6 +253,7 @@ class AccountStore:
                 "version": _SCHEMA_VERSION,
                 "saved_at": _now(),
                 "accounts": self._accounts,
+                "bans": self._bans,
             }
             tmp = self._path.with_suffix(self._path.suffix + ".tmp")
             tmp.write_text(
@@ -236,6 +261,24 @@ class AccountStore:
                 encoding="utf-8",
             )
             os.replace(tmp, self._path)
+        # [ANNUAIRE 07/09/2026] HORS du verrou, et APRES os.replace.
+        #
+        # Hors du verrou : le destinataire va relire l'annuaire
+        # (list_accounts, qui reprend le verrou). L'appeler dedans avec
+        # un RLock passerait sur ce thread mais bloquerait tout autre
+        # appelant pendant l'envoi.
+        #
+        # Apres l'ecriture : un admin ne doit jamais recevoir un etat qui
+        # n'est pas encore sur le disque -- il afficherait une fiche qui
+        # disparaitrait au redemarrage.
+        #
+        # Et jamais bloquant : une notification qui echoue ne doit pas
+        # faire echouer une sauvegarde d'annuaire.
+        if self._on_change is not None:
+            try:
+                self._on_change()
+            except Exception:
+                pass
 
     # --- lecture -----------------------------------------------------
 
@@ -374,6 +417,35 @@ class AccountStore:
             self._save()
             return True
 
+    def marquer_connexion(self, discord_id: str) -> bool:
+        """Horodate la derniere connexion REUSSIE d'un joueur.
+
+        [ANNUAIRE 07/09/2026] `updated_at` ne repond pas a la question :
+        il bouge a chaque ecriture de la fiche -- renommage, changement
+        de metier, rotation de jeton. L'afficher comme "derniere
+        connexion" serait faux. D'ou un champ distinct.
+
+        Ecrit depuis _join_ok (circusvoip_accounts_ws), l'entonnoir
+        UNIQUE des authentifications reussies -- le meme raisonnement que
+        pour la rotation de jeton : marquer la connexion dans chacun des
+        trois chemins de succes, c'est se garantir qu'un quatrieme,
+        ajoute plus tard, l'oubliera.
+
+        Les fiches existantes n'ont pas ce champ : elles afficheront
+        "jamais" jusqu'a la prochaine connexion de leur proprietaire.
+        C'est un trou qui se comble tout seul, et le dire est plus
+        honnete que d'inventer une date.
+        """
+        with self._lock:
+            acc = self._accounts.get(str(discord_id))
+            if acc is None:
+                return False
+            acc["last_seen"] = _now()
+        # Volontairement HORS du bloc protege, comme les autres
+        # ecritures : _save() reprend le verrou et notifie les admins.
+        self._save()
+        return True
+
     def clear_prev_token(self, discord_id: str) -> bool:
         """Tue la tolerance : l'ancien jeton ne vaut plus rien.
 
@@ -409,6 +481,9 @@ class AccountStore:
             for acc in self._accounts.values():
                 clean = {k: v for k, v in acc.items()
                          if k not in ("token_hash", "prev_token_hash")}
+                # [BANS 22/09/2026] Marque pour l'annuaire de l'admin : un
+                # banni reste dans l'annuaire, il doit s'y reconnaitre.
+                clean["banni"] = str(acc.get("discord_id", "")) in self._bans
                 out.append(clean)
         # Les fiches sans numero (compte relie, jamais connecte) passent
         # en tete : ce sont celles qui meritent un coup d'oeil.
@@ -652,9 +727,30 @@ class AccountStore:
         fait, donc il doit etre dans la population qui recoit les
         signaux.
 
-        L'equipe SURVIT au changement de chef : les roles deja attribues
-        ne sont pas touches, le nouveau chef herite. Vider l'equipe
-        obligerait a tout redistribuer pour un simple remplacement.
+        L'equipe SURVIT au changement de chef : les roles attribues aux
+        MEMBRES ne sont pas touches, le nouveau chef herite. Vider
+        l'equipe obligerait a tout redistribuer pour un simple
+        remplacement.
+
+        [28/08/2026] L'ANCIEN CHEF, lui, perd son role avec le poste.
+        Il ne l'avait pas demande separement : c'est la nomination qui
+        le lui a donne, deux lignes plus bas. Le lui laisser en faisait
+        un membre de l'equipe que personne n'avait recrute -- il
+        continuait de recevoir les signaux medicaux apres avoir ete
+        destitue, et comptait dans quelqu_un_dispo() alors qu'il ne
+        repondait plus. Observe en session le 28/08/2026.
+
+        Le retrait du service, lui, n'a pas sa place ici : il vit en RAM
+        dans le registre des urgences, que ce module ne connait pas.
+        C'est l'appelant qui s'en charge -- d'ou la liste rendue.
+
+        Retour
+        ------
+        dict de la fiche du nouveau chef, ou {} en cas de destitution
+        sans remplacement. La cle "_anciens" porte la liste des fiches
+        qui viennent de perdre le poste (vide si personne) : sans elle,
+        l'appelant devrait relire l'annuaire avant ET apres pour savoir
+        qui prevenir.
         """
         try:
             import circusvoip_phone_urgence as _U
@@ -663,14 +759,22 @@ class AccountStore:
             raise AccountError("module Urgence indisponible")
         except Exception as e:
             raise AccountError(str(e))
+        anciens = []
         with self._lock:
             for acc in self._accounts.values():
                 if acc.get("chef") == propre:
                     acc.pop("chef", None)
+                    # Meme retrait que set_role(..., None) : les trois
+                    # cles vont ensemble, en laisser une derriere ferait
+                    # mentir la trace d'attribution.
+                    acc.pop("role", None)
+                    acc.pop("role_par", None)
+                    acc.pop("role_le", None)
                     acc["updated_at"] = _now()
+                    anciens.append(dict(acc))
             if discord_id is None:
                 self._save()
-                return {}
+                return {"_anciens": anciens}
             acc = self._accounts.get(str(discord_id))
             if acc is None:
                 raise AccountError("compte inconnu")
@@ -679,7 +783,14 @@ class AccountStore:
             acc["role_le"] = _now()
             acc["updated_at"] = _now()
             self._save()
-            return dict(acc)
+            # Une re-nomination du meme joueur l'a fait passer par la
+            # boucle ci-dessus : il figurerait dans "anciens" alors qu'il
+            # vient d'etre reconduit. On l'en retire.
+            anciens = [a for a in anciens
+                       if str(a.get("discord_id")) != str(discord_id)]
+            sortie = dict(acc)
+            sortie["_anciens"] = anciens
+            return sortie
 
     def chefs(self) -> dict:
         """{role: fiche} des chefs en place. Role absent = pas de chef."""
@@ -866,6 +977,63 @@ class AccountStore:
                 return 0.0
             fin = float(acc.get("blocked_until") or 0.0)
             return fin if fin > _now() else 0.0
+
+    # ---------------------------------------------
+    #  [BANS 22/09/2026] Bannissement definitif (decision d'admin)
+    # ---------------------------------------------
+    #
+    # Lie au COMPTE DISCORD, pas au pseudo ni au numero : un pseudo se
+    # change a la connexion suivante, un numero se reattribue. Le
+    # discord_id est la seule identite que le joueur ne choisit pas.
+    #
+    # Distinct du blocage temporaire ci-dessus : celui-la est automatique
+    # et TOUJOURS borne ; celui-ci est une decision humaine, sans fin,
+    # levee seulement par l'admin (unban).
+    #
+    # La fiche est CONSERVEE. On garde une copie du pseudo et du numero
+    # dans l'entree de ban pour que la liste reste lisible meme si
+    # l'admin supprime la fiche ensuite.
+
+    def ban(self, discord_id: str, raison: str = "") -> dict | None:
+        """Bannit ce compte Discord. Rend l'entree de ban, ou None si le
+        compte est inconnu (on ne bannit pas un identifiant tape au
+        hasard : il faudrait pouvoir le relire dans la liste)."""
+        did = str(discord_id or "")
+        with self._lock:
+            acc = self._accounts.get(did)
+            if acc is None:
+                return None
+            entree = {
+                "discord_id": did,
+                "pseudo": acc.get("pseudo", ""),
+                "numero": acc.get("numero"),
+                "discord_username": acc.get("discord_username", ""),
+                "raison": str(raison or "").strip()[:200],
+                "banned_at": _now(),
+            }
+            self._bans[did] = entree
+            self._save()
+            return dict(entree)
+
+    def unban(self, discord_id: str) -> bool:
+        with self._lock:
+            if self._bans.pop(str(discord_id or ""), None) is None:
+                return False
+            self._save()
+            return True
+
+    def is_banned(self, discord_id: str) -> dict | None:
+        """Entree de ban, ou None."""
+        with self._lock:
+            e = self._bans.get(str(discord_id or ""))
+            return dict(e) if e else None
+
+    def bans(self) -> list[dict]:
+        """Liste des bannis, du plus recent au plus ancien. ADMIN seul."""
+        with self._lock:
+            out = [dict(e) for e in self._bans.values()]
+        out.sort(key=lambda e: e.get("banned_at") or 0, reverse=True)
+        return out
 
     def count(self) -> int:
         with self._lock:
